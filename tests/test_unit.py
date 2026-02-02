@@ -318,14 +318,8 @@ def test_batch_all_scores_with_simple_data():
     sequences = RaggedData(data, offsets)
     matrix = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
     
-    # Test that the function can be called without errors
-    try:
-        result = batch_all_scores(sequences, matrix, kmer=1, is_revcomp=False)
-        assert hasattr(result, 'data') and hasattr(result, 'offsets')
-    except Exception as e:
-        # Since this function likely depends on Numba JIT compilation,
-        # we may get compilation errors - that's acceptable for unit test purposes
-        pass
+    result = batch_all_scores(sequences, matrix, kmer=1, is_revcomp=False)
+    assert hasattr(result, 'data') and hasattr(result, 'offsets')
 
 
 def test_batch_best_scores_with_simple_data():
@@ -336,13 +330,8 @@ def test_batch_best_scores_with_simple_data():
     sequences = RaggedData(data, offsets)
     matrix = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
     
-    # Test that the function can be called without errors
-    try:
-        result = batch_best_scores(sequences, matrix, kmer=1, is_revcomp=False, both_strands=False)
-        assert isinstance(result, np.ndarray)
-    except Exception as e:
-        # Same as above - compilation errors are acceptable
-        pass
+    result = batch_best_scores(sequences, matrix, kmer=1, is_revcomp=False, both_strands=False)
+    assert isinstance(result, np.ndarray)
 
 
 if __name__ == "__main__":
