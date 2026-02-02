@@ -32,8 +32,7 @@ jobs:
           CIBW_ARCHS_MACOS: auto
           CIBW_ARCHS_WINDOWS: AMD64
           CIBW_TEST_REQUIRES: pytest
-          CIBW_TEST_COMMAND: "cd {project}/tests && pytest ."
-
+          CIBW_TEST_COMMAND: "pytest {project}/tests"
         run: uvx cibuildwheel --output-dir wheelhouse
 
       - uses: actions/upload-artifact@v4
@@ -54,6 +53,14 @@ jobs:
 
       - name: Build sdist
         run: uv build --sdist
+
+      - name: Test sdist installation
+        run: |
+          uv venv test_env
+          source test_env/bin/activate
+          uv pip install dist/*.tar.gz
+          uv pip install pytest numpy numba scipy pandas joblib
+          pytest tests
 
       - uses: actions/upload-artifact@v4
         with:

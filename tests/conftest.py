@@ -2,10 +2,17 @@
 Pytest configuration and common fixtures for unimotifcomparator tests.
 """
 import os
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
+
+# Force testing the installed package, not the local source
+# This is necessary for cibuildwheel to test the actual built wheel
+project_root = str(Path(__file__).parent.parent.absolute())
+if project_root in sys.path:
+    sys.path.remove(project_root)
 
 
 @pytest.fixture
