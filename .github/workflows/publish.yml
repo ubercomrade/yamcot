@@ -1,39 +1,52 @@
-name: Release
+name: Build & Publish to PyPI
 
 on:
-  push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
+  release:
+    types: [published]
 
 jobs:
-  # 1. Сборка бинарных колес (wheels) для всех ОС
-  build_wheels:
-    name: Build wheels on ${{ matrix.os }}
+  build:
+    name: Build wheels (${{ matrix.os }} / py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
+
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-13, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.10", "3.11", "3.12"]
 
     steps:
       - uses: actions/checkout@v6
 
-      - name: Build wheels
-        uses: pypa/cibuildwheel@v2.21.3
-        env:
-          CIBW_BUILD_FRONTEND: "build[uv]"
-          CIBW_SKIP: "*-win32 pp*"
-          CIBW_TEST_REQUIRES: pytest numpy numba scipy pandas joblib
-          CIBW_TEST_COMMAND: pytest {project}/tests/test_unit.py
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
 
-      - uses: actions/upload-artifact@v4
+      - name: Set up Python
+        run: uv python install ${{ matrix.python }}
+
+      - name: Install cibuildwheel
+        run: uv pip install cibuildwheel
+
+      - name: Build wheels + run tests
+        env:
+          # выбираем нужные CPython ABI
+          CIBW_BUILD: cp${{ matrix.python }}-*
+          CIBW_SKIP: "*-musllinux_*"
+
+          # pytest внутри wheel-окружения
+          CIBW_TEST_REQUIRES: pytest
+          CIBW_TEST_COMMAND: pytest {project}/tests
+
+        run: uv run cibuildwheel --output-dir dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}
-          path: ./wheelhouse/*.whl
+          name: dist-${{ matrix.os }}-py${{ matrix.python }}
+          path: dist/*
 
   publish:
     name: Publish to PyPI
-    needs: [build_wheels]
     runs-on: ubuntu-latest
     environment:
       name: pypi
