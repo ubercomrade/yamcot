@@ -981,7 +981,7 @@ class MotaliComparator(GeneralMotifComparator):
     between Position Frequency Matrices (PFMs).
     """
 
-    def __init__(self, fasta_path: str, threshold: float = 0.95, tmp_directory: str = '/tmp') -> None:
+    def __init__(self, fasta_path: str, threshold: float = 0.95, tmp_directory: str = '.') -> None:
         """
         Initialize the MotaliComparator.
         
@@ -992,7 +992,7 @@ class MotaliComparator(GeneralMotifComparator):
         threshold : float, optional
             Minimum score threshold for filtering results (default is 0.95).
         tmp_directory : str, optional
-            Directory for temporary files (default is '/tmp').
+            Directory for temporary files (default is '.', the current working directory).
         """
         super().__init__(name="motali")
         self.threshold = threshold
@@ -1021,7 +1021,7 @@ class MotaliComparator(GeneralMotifComparator):
             - score: similarity score computed by Motali
             Returns None if the score is below the threshold.
         """
-        with tempfile.TemporaryDirectory(dir=self.tmp_directory, delete=True) as tmp:
+        with tempfile.TemporaryDirectory(dir=self.tmp_directory, ignore_cleanup_errors=True) as tmp:
             # Determine file extensions based on model types
             type_1 = motif_1.model_type
             type_2 = motif_2.model_type
