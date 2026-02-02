@@ -2,9 +2,9 @@
 Unit tests for key computational functions in yamcot.
 
 These tests validate the correctness of individual functions from:
-- src/yamcot/functions.py
-- src/yamcot/comparison.py
-- src/yamcot/models.py
+- yamcot/functions.py
+- yamcot/comparison.py
+- yamcot/models.py
 """
 
 import numpy as np

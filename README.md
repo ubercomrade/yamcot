@@ -45,43 +45,49 @@ This methodology ensures that the null distribution reflects realistic backgroun
 
 ## Installation
 
-Requires Python 3.12 or higher and a C++ compiler with C++17 support.
+YAMCOT requires **Python 3.12 or higher**.
+
+### From PyPI (Recommended)
+
+The easiest way to install YAMCOT is via `pip` or `uv`. This will automatically download and install all required dependencies.
 
 ```bash
-# Using uv (Recommended)
-uv pip install -e .
+# Using uv (Fastest)
+uv pip install yamcot
 
 # Using pip
+pip install yamcot
+```
+
+### From Source
+
+If you want to contribute to development or build the latest version from the repository, you will need a C++ compiler with **C++17 support** (e.g., GCC, Clang, or MSVC).
+
+```bash
+# Clone the repository
+git clone https://github.com/ubercomrade/yamcot.git
+cd yamcot
+
+# Install in editable mode
 pip install -e .
 ```
 
 ### Dependencies
 
-The following Python packages are required:
+When installing via `pip`, the following dependencies are resolved automatically:
 
 * `numpy` (>= 1.26, < 2.0)
-* `numba` (~= 0.63)
+* `numba` (>= 0.60.0)
 * `scipy` (>= 1.14.1)
 * `pandas` (>= 2.2.3)
 * `joblib` (>= 1.5.3)
 
-### Build Requirements
+### Build Requirements (Source only)
 
-The project includes a C++ extension for high-performance computations. To build from source, you need:
+To build the C++ extension from source, the following tools are used:
 
 * `scikit-build-core` (>= 0.10)
 * `nanobind` (>= 2.0)
-* A C++17 compatible compiler (e.g., GCC, Clang, or MSVC)
-
-### To build from source
-
-To install the package in development mode:
-
-```bash
-git clone https://github.com/yamcot/yamcot.git
-cd yamcot
-pip install -e .
-```
 
 ## CLI Reference
 
@@ -224,11 +230,11 @@ yamcot tomtom-like pif4.pfm pif4.meme \
 
 ## Library Usage
 
-YAMCOT is designed as an extensible framework. You can implement your own motif models by inheriting from the base abstractions provided in [`src/yamcot/`](src/yamcot/).
+YAMCOT is designed as an extensible framework. You can implement your own motif models by inheriting from the base abstractions provided in [`yamcot/`](yamcot/).
 
 ### Implementing a Custom Model
 
-To create a new model, inherit from the [`MotifModel`](src/yamcot/models.py) class and implement the required methods. Below is a simplified example of a dinucleotide-based motif model implemented in pure Python/NumPy.
+To create a new model, inherit from the [`MotifModel`](yamcot/models.py) class and implement the required methods. Below is a simplified example of a dinucleotide-based motif model implemented in pure Python/NumPy.
 
 ```python
 import numpy as np
@@ -296,7 +302,7 @@ MotifModel.register_subclass('dinucleotide', SimpleDinucleotideMotif)
 
 ### Key Methods to Override
 
-To ensure compatibility with the internal comparison [`Pipeline`](src/yamcot/pipeline.py), you must override the following methods:
+To ensure compatibility with the internal comparison [`Pipeline`](yamcot/pipeline.py), you must override the following methods:
 
 | Method | Description |
 | :--- | :--- |
