@@ -42,7 +42,7 @@ def create_arg_parser() -> argparse.ArgumentParser:
    # Motali comparison with SiteGA models
    unimotifcomparator motali model1.mat model2.meme --model1-type sitega --model2-type pwm \\
      --fasta sequences.fa --promoters promoters.fa \\
-     --tmp-dir ./temp_dir --num-sequences 5000 --seq-length 150
+     --tmp-dir . --num-sequences 5000 --seq-length 150
 
    # TomTom-like comparison with PWM models
    unimotifcomparator tomtom-like model1.meme model2.pfm --model1-type pwm --model2-type pwm \\
@@ -317,7 +317,7 @@ def create_arg_parser() -> argparse.ArgumentParser:
 
     motali_io_group.add_argument(
         "--tmp-dir",
-        default="/tmp",
+        default=".",
         help=(
             "Directory path for storing temporary intermediate files generated "
             "during Motali execution. (default: %(default)s)"
@@ -494,7 +494,7 @@ def map_args_to_pipeline_kwargs(args) -> Dict[str, Any]:
             }
         )
     elif args.mode == "motali":
-        kwargs.update({"fasta_path": getattr(args, "fasta", None), "tmp_directory": getattr(args, "tmp_dir", "/tmp")})
+        kwargs.update({"fasta_path": getattr(args, "fasta", None), "tmp_directory": getattr(args, "tmp_dir", ".")})
     elif args.mode == "motif":
         kwargs.update(
             {

@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-13, macos-14]
+        os: [ubuntu-latest, windows-latest, macos-latest, macos-15-intel]
 
     steps:
       - uses: actions/checkout@v6
@@ -31,7 +31,7 @@ jobs:
           CIBW_ARCHS_LINUX: auto64
           CIBW_ARCHS_MACOS: auto
           CIBW_ARCHS_WINDOWS: AMD64
-          CIBW_TEST_REQUIRES: pytest
+          CIBW_TEST_REQUIRES: pytest numpy scipy pandas joblib numba
           CIBW_TEST_COMMAND: "pytest {project}/tests"
         run: uvx cibuildwheel --output-dir wheelhouse
 
