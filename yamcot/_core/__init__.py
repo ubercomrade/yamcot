@@ -1,9 +1,10 @@
 # Import the C++ extension functionality
 try:
     # Try to import from the compiled C++ extension
-    from yamcot import _core
+    # We use absolute import to get the binary module
+    import _core
     run_motali_cpp = _core.run_motali_cpp
-except ImportError as e:
+except (ImportError, AttributeError) as e:
     _import_error = e
     # Fallback when the compiled extension is not available
     def run_motali_cpp(*args, **kwargs):
