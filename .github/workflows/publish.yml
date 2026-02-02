@@ -31,7 +31,7 @@ jobs:
           CIBW_ARCHS_LINUX: auto64
           CIBW_ARCHS_MACOS: auto
           CIBW_ARCHS_WINDOWS: AMD64
-          CIBW_TEST_REQUIRES: pytest numpy scipy pandas joblib numba
+          CIBW_TEST_REQUIRES: pytest
           CIBW_TEST_COMMAND: "pytest {project}/tests"
           CIBW_BEFORE_TEST: "rm -rf {project}/yamcot"
         run: uvx cibuildwheel --output-dir wheelhouse
