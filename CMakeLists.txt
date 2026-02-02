@@ -8,8 +8,8 @@ find_package(nanobind CONFIG REQUIRED)
 # Define the extension module
 # Note: Paths are relative to the project root where CMakeLists.txt resides
 nanobind_add_module(_core
-    ${CMAKE_CURRENT_SOURCE_DIR}/yamcot/_core/bindings.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/yamcot/_core/mco_prc.cpp
+    yamcot/_core/bindings.cpp
+    yamcot/_core/mco_prc.cpp
 )
 
 # Include directories
