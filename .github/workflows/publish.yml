@@ -4,50 +4,63 @@ on:
   push:
     tags:
       - v*
+  workflow_dispatch:
 
 jobs:
-  build:
-    name: Build wheels (${{ matrix.os }} / py${{ matrix.python }})
+  build_wheels:
+    name: Build wheels on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        python: ["3.9", "3.10", "3.11", "3.12"]
+        os: [ubuntu-latest, windows-latest, macos-13, macos-14]
 
     steps:
       - uses: actions/checkout@v6
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
-
-      - name: Set up Python
-        run: uv python install ${{ matrix.python }}
-
-      - name: Install cibuildwheel
-        run: uv pip install cibuildwheel
-
-      - name: Build wheels + run tests
-        env:
-          # выбираем нужные CPython ABI
-          CIBW_BUILD: cp${{ matrix.python }}-*
-          CIBW_SKIP: "*-musllinux_*"
-
-          # pytest внутри wheel-окружения
-          CIBW_TEST_REQUIRES: pytest
-          CIBW_TEST_COMMAND: pytest {project}/tests
-
-        run: uv run cibuildwheel --output-dir dist
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
         with:
-          name: dist-${{ matrix.os }}-py${{ matrix.python }}
-          path: dist/*
+          enable-cache: true
+
+      - name: Build wheels
+        env:
+          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_SKIP: "*-musllinux_i686 *-manylinux_i686"
+          CIBW_ARCHS_LINUX: auto64
+          CIBW_ARCHS_MACOS: auto
+          CIBW_ARCHS_WINDOWS: AMD64
+          CIBW_TEST_REQUIRES: pytest
+          CIBW_TEST_COMMAND: "pytest {project}/tests"
+        run: uvx cibuildwheel --output-dir wheelhouse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cibw-wheels-${{ matrix.os }}-${{ strategy.job-index }}
+          path: ./wheelhouse/*.whl
+
+  build_sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Build sdist
+        run: uv build --sdist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cibw-sdist
+          path: dist/*.tar.gz
 
   publish:
     name: Publish to PyPI
+    needs: [build_wheels, build_sdist]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -55,25 +68,20 @@ jobs:
     permissions:
       id-token: write
       contents: read
-
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-
-      - name: Download wheels
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: wheels-*
           path: dist
           merge-multiple: true
 
-      - name: Build sdist
-        run: uv build --sdist
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
 
-      - name: Check build output
-        run: ls -lh dist
+      - name: Check artifacts
+        run: uvx twine check dist/*
 
-      - name: Publish
+      - name: Publish to PyPI
         run: uv publish
