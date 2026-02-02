@@ -33,6 +33,7 @@ jobs:
           CIBW_ARCHS_WINDOWS: AMD64
           CIBW_TEST_REQUIRES: pytest numpy scipy pandas joblib numba
           CIBW_TEST_COMMAND: "pytest {project}/tests"
+          CIBW_BEFORE_TEST: "rm -rf {project}/yamcot"
         run: uvx cibuildwheel --output-dir wheelhouse
 
       - uses: actions/upload-artifact@v4
