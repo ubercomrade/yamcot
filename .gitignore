@@ -136,6 +136,7 @@ logs/
 .mypy_cache/
 .tox/
 .cache/
+.ruff_cache
 *.pyc
 *.pyo
 *.pyd

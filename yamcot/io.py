@@ -6,8 +6,8 @@ from typing import Iterable, List, Tuple, Union
 
 import numpy as np
 
-from .functions import pfm_to_pwm
-from .ragged import RaggedData
+from yamcot.functions import pfm_to_pwm
+from yamcot.ragged import RaggedData
 
 
 def read_fasta(path: str) -> RaggedData:

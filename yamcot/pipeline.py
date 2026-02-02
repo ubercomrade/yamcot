@@ -10,11 +10,11 @@ from typing import Any, Optional, Union
 
 import numpy as np
 
-from .comparison import DataComparator, MotaliComparator, TomtomComparator, UniversalMotifComparator
-from .functions import scores_to_frequencies
-from .io import read_fasta
-from .models import MotifModel
-from .ragged import RaggedData, ragged_from_list
+from yamcot.comparison import DataComparator, MotaliComparator, TomtomComparator, UniversalMotifComparator
+from yamcot.functions import scores_to_frequencies
+from yamcot.io import read_fasta
+from yamcot.models import MotifModel
+from yamcot.ragged import RaggedData, ragged_from_list
 
 
 class Pipeline:

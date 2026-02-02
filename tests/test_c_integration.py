@@ -1,8 +1,5 @@
 import os
 import tempfile
-from pathlib import Path
-
-import pytest
 
 
 def test_c_module_import():
@@ -14,7 +11,7 @@ def test_c_module_import():
 
 def test_c_function_signature():
     """Test that C function has correct signature."""
-    from yamcot._core import _core
+    import yamcot._core as _core
     
     # Check function documentation
     doc = _core.run_motali_cpp.__doc__
@@ -27,7 +24,7 @@ def test_c_function_signature():
 
 def test_c_function_call_with_invalid_params():
     """Test that C function handles invalid parameters gracefully."""
-    from yamcot._core import _core
+    import yamcot._core as _core
     
     # Test with non-existent files to verify function can be called
     # and returns appropriate error codes
@@ -46,7 +43,7 @@ def test_c_function_call_with_invalid_params():
             file_table_1="/nonexistent/table1.txt", 
             file_table_2="/nonexistent/table2.txt",
             shift=10,
-            pvalue=0.01,
+            threshold=0.01,
             file_hist="/tmp/hist.txt",
             yes_out_hist=0,
             file_prc="/tmp/prc.txt", 
@@ -66,7 +63,7 @@ def test_c_function_call_with_invalid_params():
 
 def test_c_function_return_type():
     """Test that C function returns integer as expected."""
-    from yamcot._core import _core
+    import yamcot._core as _core
     
     # Instead of checking signature (which doesn't work with nanobind),
     # just verify the function exists and is callable

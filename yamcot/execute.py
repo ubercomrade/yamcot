@@ -6,7 +6,7 @@ from io import StringIO
 import pandas as pd
 
 # Import the C++ extension
-from ._core import run_motali_cpp
+from yamcot._core import run_motali_cpp
 
 
 def run_prosampler(foreground_path, background_path, output_dir, motif_length, number_of_motifs):
@@ -62,7 +62,7 @@ def run_motali(fasta_path, motif_1, motif_2, type_1, type_2, dist_1, dist_2,
         file_table_1=dist_1,
         file_table_2=dist_2,
         shift=50,  # Default shift value
-        pvalue=0.002,  # Default p-value threshold
+        threshold=0.002,  # Default threshold
         file_hist=hist_path,
         yes_out_hist=1,
         file_prc=prc_path,

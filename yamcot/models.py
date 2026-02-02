@@ -23,9 +23,9 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from .functions import batch_all_scores, batch_best_scores, pfm_to_pwm, scores_to_frequencies
-from .io import parse_file_content, read_bamm, read_meme, read_pfm, read_sitega, write_sitega
-from .ragged import RaggedData
+from yamcot.functions import batch_all_scores, batch_best_scores, pfm_to_pwm, scores_to_frequencies
+from yamcot.io import parse_file_content, read_bamm, read_meme, read_pfm, read_sitega, write_sitega
+from yamcot.ragged import RaggedData
 
 StrandMode = Literal["best", "+", "-", "both"]
 
