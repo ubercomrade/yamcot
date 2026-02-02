@@ -1,0 +1,160 @@
+################################################################################
+# Git Ignore File for Modern Development Project
+#
+# This file contains rules to exclude common files and directories that should
+# not be tracked by Git. It includes sections for OS-specific files, IDE files,
+# dependencies, sensitive data, build artifacts, logs, and language-specific
+# temporary files.
+################################################################################
+
+
+################################################################################
+# Operating System Generated Files
+################################################################################
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+################################################################################
+# IDE Generated Files
+################################################################################
+# PyCharm/IntelliJ IDEA
+.idea/
+
+# Visual Studio Code
+.vscode/
+
+# Visual Studio
+.vs/
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+
+# Eclipse
+.project
+.settings/
+.metadata
+
+# Sublime Text
+.sublime-workspace
+.sublime-project
+
+################################################################################
+# Package Manager Folders & Dependencies
+################################################################################
+# Node.js
+node_modules/
+
+# PHP
+vendor/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+.ENV
+.env
+.env.local
+.env.*.local
+*.egg-info/
+dist/
+build/
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+.cover
+coverage.xml
+*.cover
+.hypothesis/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+################################################################################
+# Sensitive Data & Configuration
+################################################################################
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Certificate and security files
+*.key
+*.pem
+*.p12
+*.pfx
+secrets.yml
+credentials.json
+*.secret
+
+################################################################################
+# Build Artifacts & Output Directories
+################################################################################
+# General build outputs
+build/
+dist/
+target/
+out/
+bin/
+obj/
+
+# Compiled files
+*.o
+*.so
+*.dylib
+*.dll
+*.exe
+
+################################################################################
+# Logs & Cache Files
+################################################################################
+# Log files
+*.log
+logs/
+
+# Python caches
+.pytest_cache/
+.mypy_cache/
+.tox/
+.cache/
+*.pyc
+*.pyo
+*.pyd
+
+# Coverage reports
+.coverage
+htmlcov/
+
+################################################################################
+# C/C++ Specific Files
+################################################################################
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+# Important: Don't ignore the main CMakeLists.txt file
+!CMakeLists.txt
+
+################################################################################
+# End of .gitignore
+################################################################################

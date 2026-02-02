@@ -1,0 +1,16 @@
+include README.md
+include LICENSE
+include CHANGELOG.md
+include CONTRIBUTING.md
+include pyproject.toml
+include CMakeLists.txt
+
+recursive-include yamcot *.py
+recursive-include yamcot/_core *.h
+recursive-include yamcot/_core *.cpp
+recursive-include examples *
+
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *~
+global-exclude .DS_Store

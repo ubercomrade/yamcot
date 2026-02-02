@@ -1,0 +1,1 @@
+{'query': 'MA0036.2', 'target': 'sitega_gata2', 'score': 0.66065}

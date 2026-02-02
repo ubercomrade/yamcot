@@ -1,0 +1,15 @@
+MEME version 4
+
+ALPHABET= ACGT
+
+strands: + -
+
+Background letter frequencies
+A 0.25 C 0.25 G 0.25 T 0.25
+
+MOTIF simple_pwm Description: A simple test PWM
+letter-probability matrix: alength= 4 w= 6 nsites= 10 E= 1e-10
+0.25	0.25	0.25	0.25	0.50	0.50
+0.25	0.25	0.25	0.25	0.25	0.25
+0.25	0.25	0.05	0.25	0.25	0.25
+0.25	0.25	0.25	0.25	0.00	0.00

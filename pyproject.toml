@@ -1,0 +1,61 @@
+[project]
+name = "yamcot"
+version = "1.0.0"
+description = "Universal motif comparison tool"
+authors = [{name = "Anton Tsukanov", email = "tsukanov@bionet.nsc.ru"}]
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Software Development :: Libraries :: Python Modules"
+]
+dependencies = [
+    "numpy>=1.26,<2.0",
+    "numba>=0.60.0",
+    "scipy>=1.14.1",
+    "pandas>=2.2.3",
+    "joblib>=1.5.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/ubercomrade/yamcot"
+Repository = "https://github.com/ubercomrade/yamcot"
+Documentation = "https://github.com/ubercomrade/yamcot#readme"
+
+
+[project.scripts]
+yamcot = "yamcot.cli:main_cli"
+
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+wheel.expand-macos-universal-tags = true
+wheel.packages = ["yamcot"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.3.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+ignore = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v"
