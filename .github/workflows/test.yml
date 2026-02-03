@@ -14,9 +14,9 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - name: Lint with ruff
         run: |
-          uv pip install ruff
-          ruff check .
-          ruff format --check .
+          uv sync --group dev
+          uv run ruff check .
+          uv run ruff format --check .
 
   test:
     name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
