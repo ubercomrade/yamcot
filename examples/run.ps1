@@ -1,20 +1,20 @@
 yamcot motif ./bamm ./pif4.meme `
 --model1-type bamm `
 --model2-type pwm `
---motif-perm 500 `
---motif-metric co
+--perm 500 `
+--metric co
 
 yamcot motif ./gata2 ./gata4 `
 --model1-type bamm `
 --model2-type bamm `
---motif-perm 1000 `
---motif-metric cj
+--perm 1000 `
+--metric cj
 
 yamcot motif ./sitega_stat6.mat ./pif4.meme `
 --model1-type sitega `
 --model2-type pwm `
---motif-perm 500 `
---motif-metric co
+--perm 500 `
+--metric co
 
 yamcot tomtom-like ./sitega_gata2.mat ./pif4.meme `
 --model1-type sitega `

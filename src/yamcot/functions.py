@@ -80,204 +80,123 @@ def score_seq(num_site, kmer, model):
     return score
 
 
-@njit(parallel=False)
-def all_scores(num_seq, model, kmer):
+@njit(inline='always')
+def _fill_rc_buffer(data, start, length, buffer):
     """
-    Standard scanning function for fixed-width motifs (PWM, simple K-mer).
-    Model width matches the scoring window.
+    Заполняет буфер обратным комплементом без аллокаций.
     """
-    length_of_site = model.shape[-1]
-    number_of_scores = num_seq.shape[0] - length_of_site + 1
-    scores = np.zeros((2, number_of_scores), dtype=np.float32)
-
-    for i in range(number_of_scores):
-        # 1. Forward
-        num_site = num_seq[i : i + length_of_site]
-        scores[0, i] = score_seq(num_site, kmer, model)
-
-        # 2. Reverse Complement
-        # Reverse view + Lookup
-        rc_site = RC_TABLE[num_site[::-1]]
-        scores[1, i] = score_seq(rc_site, kmer, model)
-
-    return scores
+    for j in range(length):
+        val = data[start + length - 1 - j]
+        buffer[j] = RC_TABLE[val]
 
 
-#@njit(parallel=True)
-def _batch_all_scores_jit(data, offsets, matrix, kmer, is_revcomp, is_bamm=False):
+@njit(parallel=True, fastmath=True, cache=True)
+def _batch_all_scores_jit(data, offsets, matrix, kmer, is_revcomp):
     """
-    Universal JIT kernel for PWM and BaMM models in batch mode.
-    For BaMM, extended window and 'N' padding are used.
-    
-    Parameters
-    ----------
-    data : np.ndarray
-        Flattened sequence data array.
-    offsets : np.ndarray
-        Offsets indicating sequence boundaries in the data array.
-    matrix : np.ndarray
-        Scoring matrix for motif evaluation.
-    kmer : int
-        K-mer length parameter for scoring.
-    is_revcomp : bool
-        Whether to consider reverse complement strand.
-    is_bamm : bool, optional
-        Whether to use BaMM-specific scoring (default is False).
-        
-    Returns
-    -------
-    tuple
-        Tuple containing the results array and new offsets array.
+    Специализированное ядро для PWM (без логики BaMM).
+    Максимальная скорость за счет отсутствия лишних проверок и буферов (для forward).
     """
     n_seq = len(offsets) - 1
     m = matrix.shape[-1]
-    context_len = kmer - 1 if is_bamm else 0
-    window_size = m + context_len
-
-    # 1. Calculate new offsets (still N - L + 1)
+    
+    # 1. Расчет новых смещений
     new_offsets = np.zeros(n_seq + 1, dtype=np.int64)
     for i in range(n_seq):
         seq_len = offsets[i+1] - offsets[i]
         if seq_len >= m:
             new_offsets[i+1] = seq_len - m + 1
-    
-    # Cumulative sum
+            
     for i in range(n_seq):
         new_offsets[i+1] += new_offsets[i]
         
     total_scores = new_offsets[n_seq]
     results = np.zeros(total_scores, dtype=np.float32)
     
-    # 2. Calculate scores
+    # 2. Основной цикл
+    for i in prange(n_seq):
+        start = offsets[i]
+        out_start = new_offsets[i]
+        n_scores = new_offsets[i+1] - out_start
+        
+        if n_scores > 0:
+            site_buffer = np.empty(m, dtype=data.dtype)
+                
+            for k in range(n_scores):
+                if not is_revcomp:
+                    # Zero-copy view для прямой цепи
+                    num_site = data[start + k : start + k + m]
+                    results[out_start + k] = score_seq(num_site, kmer, matrix)
+                else:
+                    # Заполнение буфера для обратной цепи
+                    _fill_rc_buffer(data, start + k, m, site_buffer)
+                    results[out_start + k] = score_seq(site_buffer, kmer, matrix)
+                    
+    return results, new_offsets
+
+
+@njit(parallel=True, fastmath=True, cache=True)
+def _batch_all_scores_with_context_jit(data, offsets, matrix, kmer, is_revcomp):
+    """
+    Специализированное ядро для BaMM.
+    Обрабатывает контекст и паддинг (N).
+    """
+    n_seq = len(offsets) - 1
+    m = matrix.shape[-1]
+    context_len = kmer - 1
+    window_size = m + context_len
+    
+    # Расчет смещений аналогичен PWM
+    new_offsets = np.zeros(n_seq + 1, dtype=np.int64)
+    for i in range(n_seq):
+        seq_len = offsets[i+1] - offsets[i]
+        if seq_len >= m:
+            new_offsets[i+1] = seq_len - m + 1
+            
+    for i in range(n_seq):
+        new_offsets[i+1] += new_offsets[i]
+        
+    total_scores = new_offsets[n_seq]
+    results = np.zeros(total_scores, dtype=np.float32)
+    
     for i in prange(n_seq):
         start = offsets[i]
         seq_len = offsets[i+1] - start
         out_start = new_offsets[i]
         n_scores = new_offsets[i+1] - out_start
         
+        # Буфер обязателен для BaMM из-за паддинга
+        site_buffer = np.full(window_size, 4, dtype=data.dtype)
+        
         if n_scores > 0:
             for k in range(n_scores):
-                if not is_bamm:
-                    # Standard PWM path
-                    num_site = data[start + k : start + k + m]
-                    if is_revcomp:
-                        num_site = RC_TABLE[num_site[::-1]]
-                else:
-                    # BaMM path with context and padding
-                    if not is_revcomp:
-                        # Forward: [k - context : k + L]
-                        s_idx = k - context_len
-                        e_idx = k + m
-                        num_site = np.full(window_size, 4, dtype=data.dtype)
-                        
-                        actual_start = max(0, s_idx)
-                        actual_end = min(seq_len, e_idx)
-                        dest_start = max(0, -s_idx)
-                        cloop = actual_end - actual_start
-                        if cloop > 0:
-                            num_site[dest_start : dest_start + cloop] = data[start + actual_start : start + actual_end]
-                    else:
-                        # RC: [k : k + L + context]
-                        r_start = k
-                        r_end = k + window_size
-                        raw_segment = np.full(window_size, 4, dtype=data.dtype)
-                        
-                        actual_end = min(seq_len, r_end)
-                        cloop = actual_end - r_start
-                        if cloop > 0:
-                            raw_segment[:cloop] = data[start + r_start : start + actual_end]
-                        num_site = RC_TABLE[raw_segment[::-1]]
-
-                results[out_start + k] = score_seq(num_site, kmer, matrix)
+                # Сброс буфера в 'N' (4)
+                site_buffer[:] = 4
                 
-    return results, new_offsets
-
-
-@njit(parallel=True)
-def batch_best_scores_jit(data, offsets, matrix, kmer, is_revcomp, both_strands, is_bamm=False):
-    """
-    Find the best score for each sequence in RaggedData.
-    
-    Parameters
-    ----------
-    data : np.ndarray
-        Flattened sequence data array.
-    offsets : np.ndarray
-        Offsets indicating sequence boundaries in the data array.
-    matrix : np.ndarray
-        Scoring matrix for motif evaluation.
-    kmer : int
-        K-mer length parameter for scoring.
-    is_revcomp : bool
-        Whether to consider reverse complement strand.
-    both_strands : bool
-        Whether to evaluate both forward and reverse complement strands.
-    is_bamm : bool, optional
-        Whether to use BaMM-specific scoring (default is False).
-        
-    Returns
-    -------
-    np.ndarray
-        Array containing the best score for each sequence.
-    """
-    n_seq = len(offsets) - 1
-    m = matrix.shape[-1]
-    context_len = kmer - 1 if is_bamm else 0
-    window_size = m + context_len
-    best_results = np.full(n_seq, -1e9, dtype=np.float32)
-
-    for i in prange(n_seq):
-        start = offsets[i]
-        seq_len = offsets[i+1] - start
-        
-        if seq_len < m:
-            continue
-
-        n_scores = seq_len - m + 1
-        current_best = -1e9
-
-        for k in range(n_scores):
-            # Forward strand
-            if not is_revcomp or both_strands:
-                if not is_bamm:
-                    num_site = data[start + k : start + k + m]
-                else:
+                if not is_revcomp:
+                    # Forward: копируем с учетом границ
                     s_idx = k - context_len
                     e_idx = k + m
-                    num_site = np.full(window_size, 4, dtype=data.dtype)
+                    
                     actual_start = max(0, s_idx)
                     actual_end = min(seq_len, e_idx)
                     dest_start = max(0, -s_idx)
-                    cloop = actual_end - actual_start
-                    if cloop > 0:
-                        num_site[dest_start : dest_start + cloop] = data[start + actual_start : start + actual_end]
-                
-                s_fwd = score_seq(num_site, kmer, matrix)
-                if s_fwd > current_best:
-                    current_best = s_fwd
-
-            # Reverse strand
-            if is_revcomp or both_strands:
-                if not is_bamm:
-                    num_site = data[start + k : start + k + m]
-                    rc_site = RC_TABLE[num_site[::-1]]
+                    
+                    copy_len = actual_end - actual_start
+                    if copy_len > 0:
+                        site_buffer[dest_start : dest_start + copy_len] = \
+                            data[start + actual_start : start + actual_end]
                 else:
+                    # Reverse: сложная логика RC с паддингом
                     r_start = k
-                    r_end = k + window_size
-                    raw_segment = np.full(window_size, 4, dtype=data.dtype)
-                    actual_end = min(seq_len, r_end)
-                    cloop = actual_end - r_start
-                    if cloop > 0:
-                        raw_segment[:cloop] = data[start + r_start : start + actual_end]
-                    rc_site = RC_TABLE[raw_segment[::-1]]
+                    # Заполняем буфер RC значениями
+                    for t in range(window_size):
+                        data_idx = start + r_start + (window_size - 1 - t)
+                        if start <= data_idx < start + seq_len:
+                            site_buffer[t] = RC_TABLE[data[data_idx]]
+                            
+                results[out_start + k] = score_seq(site_buffer, kmer, matrix)
 
-                s_rev = score_seq(rc_site, kmer, matrix)
-                if s_rev > current_best:
-                    current_best = s_rev
-        
-        best_results[i] = current_best
-            
-    return best_results
+    return results, new_offsets
 
 
 def batch_all_scores(
@@ -285,11 +204,11 @@ def batch_all_scores(
     matrix: np.ndarray,
     kmer: int = 1,
     is_revcomp: bool = False,
-    is_bamm: bool = False
+    with_context: bool = False
 ) -> RaggedData:
     """
     Compute scores for all sequences in RaggedData.
-    Supports both PWM (is_bamm=False) and BaMM models.
+    Supports both PWM (with_context=False) and BaMM models.
     
     Parameters
     ----------
@@ -301,58 +220,30 @@ def batch_all_scores(
         K-mer length parameter for scoring (default is 1).
     is_revcomp : bool, optional
         Whether to consider reverse complement strand (default is False).
-    is_bamm : bool, optional
-        Whether to use BaMM-specific scoring (default is False).
+    with_context : bool, optional
+        Whether to use extending site ((kmer - 1) + length of site) (default is False).
         
     Returns
     -------
     RaggedData
         RaggedData object containing computed scores.
     """
-    data, offsets = _batch_all_scores_jit(sequences.data, sequences.offsets, matrix, kmer, is_revcomp, is_bamm=is_bamm)
+    if with_context:
+        data, offsets = _batch_all_scores_with_context_jit(
+            sequences.data, sequences.offsets, matrix, kmer, is_revcomp
+        )
+    else:
+        data, offsets = _batch_all_scores_jit(
+            sequences.data, sequences.offsets, matrix, kmer, is_revcomp
+        )
     return RaggedData(data, offsets)
-
-
-def batch_best_scores(
-    sequences: RaggedData,
-    matrix: np.ndarray,
-    kmer: int = 1,
-    is_revcomp: bool = False,
-    both_strands: bool = False,
-    is_bamm: bool = False
-) -> np.ndarray:
-    """
-    Return best scores for each sequence.
-    
-    Parameters
-    ----------
-    sequences : RaggedData
-        Input sequences in RaggedData format.
-    matrix : np.ndarray
-        Scoring matrix for motif evaluation.
-    kmer : int, optional
-        K-mer length parameter for scoring (default is 1).
-    is_revcomp : bool, optional
-        Whether to consider reverse complement strand (default is False).
-    both_strands : bool, optional
-        Whether to evaluate both forward and reverse complement strands (default is False).
-    is_bamm : bool, optional
-        Whether to use BaMM-specific scoring (default is False).
-        
-    Returns
-    -------
-    np.ndarray
-        Array containing the best score for each sequence.
-    """
-    return batch_best_scores_jit(
-        sequences.data, sequences.offsets, matrix, kmer, is_revcomp, both_strands, is_bamm=is_bamm
-    )
 
 
 @njit
 def precision_recall_curve(classification, scores):
     """Compute precision-recall curve (JIT-compiled)."""
-    if len(scores) == 0:
+    n = len(scores)
+    if n == 0:
         return np.array([1.0]), np.array([0.0]), np.array([np.inf])
 
     # Get indices for sorting scores in descending order
@@ -361,8 +252,7 @@ def precision_recall_curve(classification, scores):
     sorted_classification = classification[indexes]
 
     # Initialize arrays (with +1 buffer for initial point)
-    number_of_uniq_scores = np.unique(scores).shape[0]
-    max_size = number_of_uniq_scores + 1
+    max_size = n
 
     precision = np.zeros(max_size)
     recall = np.zeros(max_size)
@@ -419,7 +309,8 @@ def precision_recall_curve(classification, scores):
 @njit
 def roc_curve(classification, scores):
     """Compute ROC curve (JIT-compiled)."""
-    if len(scores) == 0:
+    n = len(scores)
+    if n == 0:
         return np.array([0.0]), np.array([0.0]), np.array([np.inf])
 
     # Get indices for sorting scores in descending order
@@ -428,8 +319,7 @@ def roc_curve(classification, scores):
     sorted_classification = classification[indexes]
 
     # Initialize arrays
-    number_of_uniq_scores = np.unique(scores).shape[0]
-    max_size = number_of_uniq_scores + 1
+    max_size = n + 1
 
     tpr = np.zeros(max_size)
     fpr = np.zeros(max_size)

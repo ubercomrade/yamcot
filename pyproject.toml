@@ -21,7 +21,7 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=2.0,<2.4",
-    "numba>=0.62.0,<=0.63.1",
+    "numba>=0.62.0",
     "scipy>=1.14.1",
     "pandas>=2.2.3",
     "joblib>=1.5.3",
@@ -44,6 +44,9 @@ build-backend = "scikit_build_core.build"
 wheel.expand-macos-universal-tags = true
 wheel.packages = ["src/yamcot"]
 sdist.include = ["src/yamcot/_core/*.cpp", "src/yamcot/_core/*.h", "CMakeLists.txt"]
+
+[tool.scikit-build.cmake.define]
+CMAKE_OSX_DEPLOYMENT_TARGET = "10.13"
 
 [dependency-groups]
 dev = [

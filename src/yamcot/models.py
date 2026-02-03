@@ -23,7 +23,7 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from yamcot.functions import batch_all_scores, batch_best_scores, pfm_to_pwm, scores_to_frequencies
+from yamcot.functions import batch_all_scores, pfm_to_pwm, scores_to_frequencies
 from yamcot.io import parse_file_content, read_bamm, read_meme, read_pfm, read_sitega, write_sitega
 from yamcot.ragged import RaggedData
 
@@ -660,9 +660,6 @@ class MotifModel:
 
         return pfm
 
-    # ------------------------------------------------------------------
-    # Helper methods for strand modes
-    # ------------------------------------------------------------------
     @staticmethod
     def _reduce_strand(seq_scores: np.ndarray, strand: StrandMode) -> np.ndarray:
         """Transform (2, N) → (N,) depending on strand mode.
@@ -687,9 +684,6 @@ class MotifModel:
             return seq_scores[1]
         raise ValueError(f"Unknown strand={strand!r}. Use '+', '-', or 'best'.")
 
-    # ------------------------------------------------------------------
-    # Scores
-    # ------------------------------------------------------------------
     def get_scores(self, sequences: RaggedData, strand: Optional[StrandMode] = None) -> RaggedData:
         """Calculate motif scores for each position in the sequences using batch processing.
 
@@ -707,9 +701,6 @@ class MotifModel:
         """
         return self.scan(sequences, strand=strand)
 
-    # ------------------------------------------------------------------
-    # Frequencies
-    # ------------------------------------------------------------------
     def get_frequencies(self, sequences: RaggedData, strand: Optional[StrandMode] = None) -> RaggedData:
         """Calculate per-position hit frequencies (probability maps) using batch processing.
 
@@ -728,35 +719,6 @@ class MotifModel:
 
         return scores_to_frequencies(self.scan(sequences, strand))
 
-    # ------------------------------------------------------------------
-    # Best score
-    # ------------------------------------------------------------------
-    def best_scores(self, sequences: RaggedData, strand: StrandMode = "best") -> np.ndarray:
-        """Return the maximum raw score using batch processing.
-        
-        Parameters
-        ----------
-        sequences : RaggedData
-            Encoded sequences to score.
-        strand : {"best", "+", "-"}, optional
-            Strand mode for scoring (default "best").
-
-        Returns
-        -------
-        np.ndarray
-            Maximum scores for each sequence.
-        """
-        kmer = getattr(self, 'kmer', 1)
-        matrix = self.matrix.astype(np.float32)
-
-        is_revcomp = (strand == "-")
-        both_strands = (strand == "best")
-
-        return batch_best_scores(sequences, matrix, kmer=kmer, is_revcomp=is_revcomp, both_strands=both_strands)
-
-    # ------------------------------------------------------------------
-    # Cache management
-    # ------------------------------------------------------------------
     def clear_cache(self) -> None:
         """Clear all cached scores, frequencies and normalization range."""
         self._freq_cache.clear()
@@ -764,9 +726,6 @@ class MotifModel:
         if not getattr(self, '_pfm_is_required', False):
             self._pfm = None
 
-    # ------------------------------------------------------------------
-    # Serialization (Joblib)
-    # ------------------------------------------------------------------
     def save(self, filepath: str, clear_cache: bool = True) -> None:
         """Save the motif model to a file using joblib.
 
@@ -805,9 +764,6 @@ class MotifModel:
         model = joblib.load(filepath)
         return model
 
-    # ------------------------------------------------------------------
-    # Polymorphism support
-    # ------------------------------------------------------------------
     @property
     def model_type(self) -> str:
         """Abstract property to return the type of model."""
@@ -1013,12 +969,12 @@ class BammMotif(MotifModel):
         matrix = self.matrix.astype(np.float32)
 
         if strand == "+":
-            return batch_all_scores(sequences, matrix, kmer=self.kmer, is_revcomp=False, is_bamm=True)
+            return batch_all_scores(sequences, matrix, kmer=self.kmer, is_revcomp=False, with_context=True)
         elif strand == "-":
-            return batch_all_scores(sequences, matrix, kmer=self.kmer, is_revcomp=True, is_bamm=True)
+            return batch_all_scores(sequences, matrix, kmer=self.kmer, is_revcomp=True, with_context=True)
         elif strand == "best":
-            sf = batch_all_scores(sequences, matrix, kmer=self.kmer, is_revcomp=False, is_bamm=True)
-            sr = batch_all_scores(sequences, matrix, kmer=self.kmer, is_revcomp=True, is_bamm=True)
+            sf = batch_all_scores(sequences, matrix, kmer=self.kmer, is_revcomp=False, with_context=True)
+            sr = batch_all_scores(sequences, matrix, kmer=self.kmer, is_revcomp=True, with_context=True)
             return RaggedData(np.maximum(sf.data, sr.data), sf.offsets)
         else:
             logger = logging.getLogger(__name__)
@@ -1073,14 +1029,9 @@ class BammMotif(MotifModel):
         if bg_path is None:
             raise ValueError(f"Background file not found for {path}. Please provide bg_path parameter.")
         
-        # If order is not provided, try to determine it from the file (like in pipeline.py)
-        if 'order' not in kwargs and order == 2:
-             _, max_order, num_positions = parse_file_content(path)
+        _, max_order, length = parse_file_content(path)
+        if order > max_order:
              order = max_order
-             length = num_positions
-        else:
-             matrix_tmp = read_bamm(path, bg_path, order)
-             length = matrix_tmp.shape[-1]
 
         # Read the BaMM motif and background files
         matrix = read_bamm(path, bg_path, order)

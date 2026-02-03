@@ -413,7 +413,7 @@ def read_bamm(motif_path: str, bg_path: str, target_order: int) -> np.ndarray:
     final_tensor[tuple(slice_objs)] = acgt_tensor
 
     # Return as contiguous array for Numba
-    return np.ascontiguousarray(final_tensor)
+    return np.array(final_tensor, dtype=np.float32)
 
 
 def write_sitega(motif, path: str) -> None:
