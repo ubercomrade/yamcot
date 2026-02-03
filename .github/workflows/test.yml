@@ -24,7 +24,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
@@ -34,8 +34,12 @@ jobs:
         run: uv sync --group dev
       - name: Run pytest
         run: uv run pytest
-      - name: Run examples (Linux/macOS only)
-        if: runner.os != 'Windows'
+      - name: Run examples
+        working-directory: examples
+        shell: bash
         run: |
-          cd examples
-          bash run.sh
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            uv run pwsh ./run.ps1
+          else
+            uv run bash run.sh
+          fi

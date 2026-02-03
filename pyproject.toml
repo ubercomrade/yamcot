@@ -5,21 +5,23 @@ description = "Universal motif comparison tool"
 authors = [{name = "Anton Tsukanov", email = "tsukanov@bionet.nsc.ru"}]
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
-    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
     "Topic :: Software Development :: Libraries :: Python Modules"
 ]
 dependencies = [
     "numpy>=2.0,<2.4",
-    "numba>=0.62.0,<0.63.0",
+    "numba>=0.62.0,<=0.63.1",
     "scipy>=1.14.1",
     "pandas>=2.2.3",
     "joblib>=1.5.3",

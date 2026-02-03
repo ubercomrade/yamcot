@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.15)
 project(unimotifcomparator_core LANGUAGES CXX)
 
 # Find Python components first
-find_package(Python 3.12 COMPONENTS Interpreter Development.Module REQUIRED)
+find_package(Python 3.10 COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(nanobind CONFIG REQUIRED)
 
 # Define the extension module
