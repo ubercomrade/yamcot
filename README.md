@@ -45,7 +45,7 @@ This methodology ensures that the null distribution reflects realistic backgroun
 
 ## Installation
 
-MIMOSA requires **Python 3.12 or higher**.
+MIMOSA requires **Python 3.10 or higher**.
 
 ### From PyPI (Recommended)
 
@@ -76,8 +76,8 @@ pip install -e .
 
 When installing via `pip`, the following dependencies are resolved automatically:
 
-* `numpy` (>= 1.26, < 2.0)
-* `numba` (>= 0.60.0)
+* `numpy` (>= 2.0, < 2.4)
+* `numba` (>= 0.62.0)
 * `scipy` (>= 1.14.1)
 * `pandas` (>= 2.2.3)
 * `joblib` (>= 1.5.3)
