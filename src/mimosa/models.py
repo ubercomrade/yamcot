@@ -872,9 +872,8 @@ class PwmMotif(MotifModel):
             name, length = info
         elif ext == ".pfm":
             # PFM format
-            pwm, length, _minimum, _maximum = read_pfm(path)
+            pfm, length = read_pfm(path)
             # Extract PFM from PWM (first 4 rows, excluding the 5th row of minimums)
-            pfm = pwm[:4, :]  # Get the original PFM from the extended PWM
             name = os.path.splitext(os.path.basename(path))[0]
         else:
             logger = logging.getLogger(__name__)

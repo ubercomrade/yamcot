@@ -52,6 +52,9 @@ desktop.ini
 .sublime-workspace
 .sublime-project
 
+# Jupyter
+*.ipynb
+
 ################################################################################
 # Package Manager Folders & Dependencies
 ################################################################################

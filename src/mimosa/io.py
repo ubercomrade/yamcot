@@ -495,7 +495,7 @@ def write_pfm(pfm: np.ndarray, name: str, length: int, path: str) -> None:
         np.savetxt(f, pfm.T, fmt="%.6f", delimiter="\t")
 
 
-def read_pfm(path: str) -> tuple[np.ndarray, int, float, float]:
+def read_pfm(path: str) -> tuple[np.ndarray, int]:
     """Read a Position Frequency Matrix (PFM) from a file and convert to PWM.
 
     Parameters
@@ -505,18 +505,11 @@ def read_pfm(path: str) -> tuple[np.ndarray, int, float, float]:
 
     Returns
     -------
-    tuple[np.ndarray, int, float, float]
+    tuple[np.ndarray, int]
         A tuple containing:
-        - PWM matrix with shape (5, L) where the 5th row contains column minima
+        - PFM matrix with shape (4, L)
         - Length of the motif
-        - Minimum possible score
-        - Maximum possible score
     """
     pfm = np.loadtxt(path, comments=">").T
     length = pfm.shape[1]
-    pwm = pfm_to_pwm(pfm)
-    minimum = np.sum(pwm.min(axis=0))
-    maximum = np.sum(pwm.max(axis=0))
-    pwm = np.concatenate((pwm, np.min(pwm, axis=0).reshape(1, pwm.shape[1])), axis=0)
-    pwm = np.array(pwm, dtype=np.float32)
-    return pwm, length, minimum, maximum
+    return pfm, length

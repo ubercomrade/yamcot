@@ -4,12 +4,6 @@ from scipy.stats import pearsonr
 
 from mimosa.ragged import RaggedData
 
-RC_TABLE = np.array([3, 2, 1, 0, 4], dtype=np.int8)
-BACKGROUND_FREQ = 0.25  # Background frequency for PWM calculation
-PFM_TO_PWM_PSEUDOCOUNT = 0.0001  # Pseudocount added to PFM values
-PCM_TO_PFM_NUCLEOTIDE_PSEUDOCOUNT = 0.25  # Pseudocount for nucleotide frequency
-PCM_TO_PFM_DENOMINATOR_CONSTANT = 1  # Constant added to denominator in PCM to PFM conversion
-
 
 def pfm_to_pwm(pfm):
     """
@@ -25,8 +19,8 @@ def pfm_to_pwm(pfm):
     np.ndarray
         Position Weight Matrix computed as log(PFM + pseudo_count) / background.
     """
-    background = BACKGROUND_FREQ
-    pwm = np.log((pfm + PFM_TO_PWM_PSEUDOCOUNT) / background)
+
+    pwm = np.log((pfm + 0.0001) / 0.25)
     return pwm
 
 
@@ -45,8 +39,8 @@ def pcm_to_pfm(pcm):
         Position Frequency Matrix with pseudo-counts added.
     """
     number_of_sites = pcm.sum(axis=0)
-    nuc_pseudo = PCM_TO_PFM_NUCLEOTIDE_PSEUDOCOUNT
-    pfm = (pcm + nuc_pseudo) / (number_of_sites + PCM_TO_PFM_DENOMINATOR_CONSTANT)
+    nuc_pseudo = 0.25
+    pfm = (pcm + nuc_pseudo) / (number_of_sites + 1)
     return pfm
 
 
@@ -85,9 +79,10 @@ def _fill_rc_buffer(data, start, length, buffer):
     """
     Заполняет буфер обратным комплементом без аллокаций.
     """
+    rc_table = np.array([3, 2, 1, 0, 4], dtype=np.int8)
     for j in range(length):
         val = data[start + length - 1 - j]
-        buffer[j] = RC_TABLE[val]
+        buffer[j] = rc_table[val]
 
 
 @njit(parallel=True, fastmath=True, cache=True)
@@ -144,7 +139,7 @@ def _batch_all_scores_with_context_jit(data, offsets, matrix, kmer, is_revcomp):
     m = matrix.shape[-1]
     context_len = kmer - 1
     window_size = m + context_len
-
+    rc_table = np.array([3, 2, 1, 0, 4], dtype=np.int8)
     # Расчет смещений аналогичен PWM
     new_offsets = np.zeros(n_seq + 1, dtype=np.int64)
     for i in range(n_seq):
@@ -193,7 +188,7 @@ def _batch_all_scores_with_context_jit(data, offsets, matrix, kmer, is_revcomp):
                     for t in range(window_size):
                         data_idx = start + r_start + (window_size - 1 - t)
                         if start <= data_idx < start + seq_len:
-                            site_buffer[t] = RC_TABLE[data[data_idx]]
+                            site_buffer[t] = rc_table[data[data_idx]]
 
                 results[out_start + k] = score_seq(site_buffer, kmer, matrix)
 
