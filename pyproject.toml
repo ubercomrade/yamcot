@@ -1,5 +1,5 @@
 [project]
-name = "yamcot"
+name = "mimosa"
 version = "1.0.0"
 description = "Universal motif comparison tool"
 authors = [{name = "Anton Tsukanov", email = "tsukanov@bionet.nsc.ru"}]
@@ -28,13 +28,13 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ubercomrade/yamcot"
-Repository = "https://github.com/ubercomrade/yamcot"
-Documentation = "https://github.com/ubercomrade/yamcot#readme"
+Homepage = "https://github.com/ubercomrade/mimosa"
+Repository = "https://github.com/ubercomrade/mimosa"
+Documentation = "https://github.com/ubercomrade/mimosa#readme"
 
 
 [project.scripts]
-yamcot = "yamcot.cli:main_cli"
+mimosa = "mimosa.cli:main_cli"
 
 [build-system]
 requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
@@ -42,8 +42,8 @@ build-backend = "scikit_build_core.build"
 
 [tool.scikit-build]
 wheel.expand-macos-universal-tags = true
-wheel.packages = ["src/yamcot"]
-sdist.include = ["src/yamcot/_core/*.cpp", "src/yamcot/_core/*.h", "CMakeLists.txt"]
+wheel.packages = ["src/mimosa"]
+sdist.include = ["src/mimosa/_core/*.cpp", "src/mimosa/_core/*.h", "CMakeLists.txt"]
 
 [tool.scikit-build.cmake.define]
 CMAKE_OSX_DEPLOYMENT_TARGET = "10.13"

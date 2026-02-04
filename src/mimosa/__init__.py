@@ -1,5 +1,5 @@
 """
-unimotifcomparator
+MIMOSA
 ==================
 
 This package provides a modular and extensible framework for de‑novo motif

@@ -2,7 +2,7 @@ import numpy as np
 from numba import njit, prange
 from scipy.stats import pearsonr
 
-from yamcot.ragged import RaggedData
+from mimosa.ragged import RaggedData
 
 RC_TABLE = np.array([3, 2, 1, 0, 4], dtype=np.int8)
 BACKGROUND_FREQ = 0.25  # Background frequency for PWM calculation

@@ -5,7 +5,7 @@ import os
 import sys
 from typing import Any, Dict
 
-from yamcot.pipeline import run_pipeline
+from mimosa.pipeline import run_pipeline
 
 
 def setup_logging(verbose: bool):
@@ -20,37 +20,37 @@ def create_arg_parser() -> argparse.ArgumentParser:
     """Create and configure argument parser with subcommands."""
     parser = argparse.ArgumentParser(
         description=(
-            "UniMotifComparator: Compare motifs using three distinct approaches - score, sequence, and tomtom-like"
+            "MIMOSA: Compare motifs using three distinct approaches - profile, motif, and tomtom-like"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
  Examples:
    # Profile-based comparison
-   unimotifcomparator profile scores_1.fasta scores_2.fasta \\
-     --metric corr --perm 1000 --distortion 0.5
+   mimosa profile scores_1.fasta scores_2.fasta \\
+     --metric corr --permutations 1000 --distortion 0.5
 
    # Motif-based comparison with PWM models
-   unimotifcomparator motif model1.meme model2.pfm --model1-type pwm --model2-type pwm \\
-     --fasta sequences.fa --metric co --perm 1000 \\
+   mimosa motif model1.meme model2.pfm --model1-type pwm --model2-type pwm \\
+     --fasta sequences.fa --metric co --permutations 1000 \\
      --distortion 0.3
 
    # Motif-based comparison with BAMM models
-   unimotifcomparator motif model1.hbcp model2.ihbcp --model1-type bamm --model2-type bamm \\
+   mimosa motif model1.hbcp model2.ihbcp --model1-type bamm --model2-type bamm \\
      --fasta sequences.fa --promoters promoters.fa --search-range 15 \\
      --min-kernel-size 5 --max-kernel-size 15 --jobs 4 --seed 42
 
    # Motali comparison with SiteGA models
-   unimotifcomparator motali model1.mat model2.meme --model1-type sitega --model2-type pwm \\
+   mimosa motali model1.mat model2.meme --model1-type sitega --model2-type pwm \\
      --fasta sequences.fa --promoters promoters.fa \\
      --tmp-dir . --num-sequences 5000 --seq-length 150
 
    # TomTom-like comparison with PWM models
-   unimotifcomparator tomtom-like model1.meme model2.pfm --model1-type pwm --model2-type pwm \\
+   mimosa tomtom-like model1.meme model2.pfm --model1-type pwm --model2-type pwm \\
      --metric pcc --permutations 1000 --permute-rows \\
      --jobs 8 --seed 123
 
    # TomTom-like comparison with BAMM models using PFM mode
-   unimotifcomparator tomtom-like model1.hbcp model2.ihbcp --model1-type bamm --model2-type bamm \\
+   mimosa tomtom-like model1.hbcp model2.ihbcp --model1-type bamm --model2-type bamm \\
      --pfm-mode --num-sequences 10000 --seq-length 120 --metric ed \\
      --permutations 500 --permute-rows
          """,
@@ -78,7 +78,7 @@ def create_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     profile_group.add_argument(
-        "--perm",
+        "--permutations",
         type=int,
         default=0,
         help="Number of permutations to perform for p-value calculation. (default: %(default)s)",
@@ -201,7 +201,7 @@ def create_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     motif_group.add_argument(
-        "--perm",
+        "--permutations",
         type=int,
         default=0,
         help="Number of permutations to perform for p-value calculation. (default: %(default)s)",
@@ -499,7 +499,7 @@ def map_args_to_pipeline_kwargs(args) -> Dict[str, Any]:
         kwargs.update(
             {
                 "metric": getattr(args, "metric", "cj"),
-                "n_permutations": getattr(args, "perm", 1000),
+                "n_permutations": getattr(args, "permutations", 1000),
                 "distortion_level": getattr(args, "distortion", 0.4),
                 "n_jobs": getattr(args, "jobs", -1),
                 "permute_rows": getattr(args, "permute_rows", False),
@@ -514,7 +514,7 @@ def map_args_to_pipeline_kwargs(args) -> Dict[str, Any]:
         kwargs.update(
             {
                 "metric": getattr(args, "metric", "cj"),
-                "n_permutations": getattr(args, "perm", 1000),
+                "n_permutations": getattr(args, "permutations", 1000),
                 "distortion_level": getattr(args, "distortion", 0.4),
                 "n_jobs": getattr(args, "jobs", -1),
                 "seed": getattr(args, "seed", None),

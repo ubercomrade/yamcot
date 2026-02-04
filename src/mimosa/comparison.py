@@ -20,17 +20,17 @@ import numpy as np
 from joblib import Parallel, delayed
 from scipy.ndimage import convolve1d
 
-from yamcot.execute import run_motali
-from yamcot.functions import (
+from mimosa.execute import run_motali
+from mimosa.functions import (
     _fast_cj_kernel_numba,
     _fast_overlap_kernel_numba,
     _fast_pearson_kernel,
     pfm_to_pwm,
     scores_to_frequencies,
 )
-from yamcot.io import write_fasta
-from yamcot.models import MotifModel, RaggedScores
-from yamcot.ragged import RaggedData, ragged_from_list
+from mimosa.io import write_fasta
+from mimosa.models import MotifModel, RaggedScores
+from mimosa.ragged import RaggedData, ragged_from_list
 
 
 class GeneralMotifComparator(ABC):

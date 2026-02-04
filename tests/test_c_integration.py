@@ -4,7 +4,7 @@ import tempfile
 
 def test_c_module_import():
     """Test that C module can be imported correctly."""
-    from yamcot._core import _core
+    from mimosa._core import _core
 
     assert hasattr(_core, "run_motali_cpp")
     assert callable(_core.run_motali_cpp)
@@ -12,7 +12,7 @@ def test_c_module_import():
 
 def test_c_function_signature():
     """Test that C function has correct signature."""
-    from yamcot._core import run_motali_cpp
+    from mimosa._core import run_motali_cpp
 
     # Check function documentation
     doc = run_motali_cpp.__doc__
@@ -25,7 +25,7 @@ def test_c_function_signature():
 
 def test_c_function_call_with_invalid_params():
     """Test that C function handles invalid parameters gracefully."""
-    from yamcot._core import run_motali_cpp
+    from mimosa._core import run_motali_cpp
 
     # Test with non-existent files to verify function can be called
     # and returns appropriate error codes
@@ -64,7 +64,7 @@ def test_c_function_call_with_invalid_params():
 
 def test_c_function_return_type():
     """Test that C function returns integer as expected."""
-    from yamcot._core import run_motali_cpp
+    from mimosa._core import run_motali_cpp
 
     # Instead of checking signature (which doesn't work with nanobind),
     # just verify the function exists and is callable

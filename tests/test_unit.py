@@ -1,17 +1,17 @@
 """
-Unit tests for key computational functions in yamcot.
+Unit tests for key computational functions in mimosa.
 
 These tests validate the correctness of individual functions from:
-- yamcot/functions.py
-- yamcot/comparison.py
-- yamcot/models.py
+- mimosa/functions.py
+- mimosa/comparison.py
+- mimosa/models.py
 """
 
 import numpy as np
 import pytest
 
-from yamcot.comparison import DataComparator, TomtomComparator, UniversalMotifComparator
-from yamcot.functions import (
+from mimosa.comparison import DataComparator, TomtomComparator, UniversalMotifComparator
+from mimosa.functions import (
     batch_all_scores,
     cut_prc,
     cut_roc,
@@ -24,8 +24,8 @@ from yamcot.functions import (
     scores_to_frequencies,
     standardized_pauc,
 )
-from yamcot.models import BammMotif, PwmMotif, RaggedScores, SitegaMotif
-from yamcot.ragged import RaggedData
+from mimosa.models import BammMotif, PwmMotif, RaggedScores, SitegaMotif
+from mimosa.ragged import RaggedData
 
 
 def test_pfm_to_pwm_basic():

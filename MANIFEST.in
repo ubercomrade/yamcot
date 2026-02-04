@@ -5,9 +5,9 @@ include CONTRIBUTING.md
 include pyproject.toml
 include CMakeLists.txt
 
-recursive-include src/yamcot *.py
-recursive-include src/yamcot/_core *.h
-recursive-include src/yamcot/_core *.cpp
+recursive-include src/mimosa *.py
+recursive-include src/mimosa/_core *.h
+recursive-include src/mimosa/_core *.cpp
 recursive-include examples *
 
 global-exclude __pycache__

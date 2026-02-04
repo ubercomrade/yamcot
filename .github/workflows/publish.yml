@@ -73,7 +73,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/yamcot
+      url: https://pypi.org/p/mimosa-tool
     permissions:
       id-token: write
       contents: read

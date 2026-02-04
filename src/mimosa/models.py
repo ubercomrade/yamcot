@@ -23,9 +23,9 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from yamcot.functions import batch_all_scores, pfm_to_pwm, scores_to_frequencies
-from yamcot.io import parse_file_content, read_bamm, read_meme, read_pfm, read_sitega, write_sitega
-from yamcot.ragged import RaggedData
+from mimosa.functions import batch_all_scores, pfm_to_pwm, scores_to_frequencies
+from mimosa.io import parse_file_content, read_bamm, read_meme, read_pfm, read_sitega, write_sitega
+from mimosa.ragged import RaggedData
 
 StrandMode = Literal["best", "+", "-", "both"]
 
@@ -771,7 +771,7 @@ class PwmMotif(MotifModel):
     """Position Weight Matrix motif model.
 
     This class wraps a PWM (log odds scores) and provides efficient
-    scoring using the precompiled :func:`yamcot.functions.batch_all_scores`
+    scoring using the precompiled :func:`mimosa.functions.batch_all_scores`
     Numba kernel. The input matrix is expected to have shape (5, L)
     where the final row contains column minima. The scoring logic
     treats any encoded nucleotide equal to 4 as an ambiguous 'N' and

@@ -6,7 +6,7 @@ from io import StringIO
 import pandas as pd
 
 # Import the C++ extension
-from yamcot._core import run_motali_cpp
+from mimosa._core import run_motali_cpp
 
 
 def run_prosampler(foreground_path, background_path, output_dir, motif_length, number_of_motifs):

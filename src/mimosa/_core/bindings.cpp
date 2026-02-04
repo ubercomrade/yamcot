@@ -6,7 +6,7 @@
 namespace nb = nanobind;
 
 NB_MODULE(_core, m) {
-    m.doc() = "C++ backend for yamcot";
+    m.doc() = "C++ backend for mimosa";
     
     m.def("run_motali_cpp", &run_motali_cpp,
           nb::arg("file_fasta"),
