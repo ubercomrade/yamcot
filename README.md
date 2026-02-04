@@ -53,10 +53,10 @@ The easiest way to install MIMOSA is via `pip` or `uv`. This will automatically 
 
 ```bash
 # Using uv (Fastest)
-uv pip install mimosa
+uv pip install mimosa-tool
 
 # Using pip
-pip install mimosa
+pip install mimosa-tool
 ```
 
 ### From Source
