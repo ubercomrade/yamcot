@@ -126,9 +126,10 @@ def create_arg_parser() -> argparse.ArgumentParser:
     profile_technical_group.add_argument(
         "--seed",
         type=int,
+        default=127,
         help=(
             "Set a global random seed for reproducible results in stochastic operations "
-            "(e.g., permutations, surrogate generation)."
+            "(e.g., permutations, surrogate generation). (default: %(default)s)"
         ),
     )
     profile_technical_group.add_argument(
@@ -249,9 +250,10 @@ def create_arg_parser() -> argparse.ArgumentParser:
     motif_technical_group.add_argument(
         "--seed",
         type=int,
+        default=127,
         help=(
             "Set a global random seed for reproducible results in stochastic operations "
-            "(e.g., permutations, surrogate generation)."
+            "(e.g., permutations, surrogate generation). (default: %(default)s)"
         ),
     )
     motif_technical_group.add_argument(
@@ -411,9 +413,10 @@ def create_arg_parser() -> argparse.ArgumentParser:
     tomtom_technical_group.add_argument(
         "--seed",
         type=int,
+        default=127,
         help=(
             "Set a global random seed for reproducible results in stochastic operations "
-            "(e.g., permutations, surrogate generation)."
+            "(e.g., permutations, surrogate generation). (default: %(default)s)"
         ),
     )
     tomtom_technical_group.add_argument(

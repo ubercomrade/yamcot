@@ -25,8 +25,9 @@ class Pipeline:
     supporting various model types (BAMM, PWM, Sitega) and comparison methods.
     """
 
-    def __init__(self):
+    def __init__(self, seed: int = 127):
         self.logger = logging.getLogger(__name__)
+        self.seed = seed
 
     def load_scores(self, profile_path: Union[str, Path]) -> RaggedData:
         """
@@ -115,7 +116,6 @@ class Pipeline:
             "n_permutations",
             "distortion_level",
             "n_jobs",
-            "seed",
             "filter_type",
             "filter_threshold",
             "search_range",
@@ -124,6 +124,7 @@ class Pipeline:
         ]:
             if param in kwargs:
                 data_kwargs[param] = kwargs[param]
+        data_kwargs['seed'] = self.seed
         comparator = DataComparator(**data_kwargs)
         return comparator.compare(freq1, freq2)
 
@@ -147,8 +148,10 @@ class Pipeline:
         else:
             # Generate random sequences
             sequences = []
+            # Use the provided seed or fall back to the instance seed
+            rng = random.Random(self.seed)
             for _ in range(num_sequences):
-                seq = self._generate_random_sequence(seq_length)
+                seq = self._generate_random_sequence(seq_length, rng=rng)
                 sequences.append(self._encode_sequence(seq))
 
             return ragged_from_list(sequences, dtype=np.int8)
@@ -158,10 +161,10 @@ class Pipeline:
         base_map = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 4}
         return np.array([base_map.get(base.upper(), 4) for base in seq], dtype=np.int8)
 
-    def _generate_random_sequence(self, length: int) -> str:
+    def _generate_random_sequence(self, length: int, rng: random.Random) -> str:
         """Generate a random DNA sequence of specified length."""
         bases = ["A", "C", "G", "T"]
-        return "".join(random.choice(bases) for _ in range(length))
+        return "".join(rng.choice(bases) for _ in range(length))
 
     def execute_tomtom_comparison(
         self, model1: MotifModel, model2: MotifModel, sequences: Optional[RaggedData], **kwargs
@@ -180,9 +183,10 @@ class Pipeline:
         """
         # Sanitize kwargs for TomtomComparator - remove unsupported parameters
         tom_kwargs = {}
-        for param in ["metric", "n_permutations", "permute_rows", "n_jobs", "seed", "pfm_mode"]:
+        for param in ["metric", "n_permutations", "permute_rows", "n_jobs", "pfm_mode"]:
             if param in kwargs:
                 tom_kwargs[param] = kwargs[param]
+        tom_kwargs['seed'] = self.seed
         comparator = TomtomComparator(**tom_kwargs)
         return comparator.compare(model1, model2, sequences)
 
@@ -218,7 +222,6 @@ class Pipeline:
                 "n_permutations",
                 "distortion_level",
                 "n_jobs",
-                "seed",
                 "filter_type",
                 "filter_threshold",
                 "search_range",
@@ -227,7 +230,7 @@ class Pipeline:
             ]:
                 if param in kwargs:
                     motif_kwargs[param] = kwargs[param]
-
+            motif_kwargs["seed"] = self.seed
             comparator = UniversalMotifComparator(**motif_kwargs)
             return comparator.compare(model1, model2, sequences)
 
@@ -367,6 +370,7 @@ def run_pipeline(
     seq_source2: Optional[Union[str, Path]] = None,
     num_sequences: int = 1000,
     seq_length: int = 200,
+    seed: int = 127,
     **kwargs,
 ) -> Any:
     """
@@ -387,7 +391,7 @@ def run_pipeline(
     Returns:
         Comparison results
     """
-    pipeline = Pipeline()
+    pipeline = Pipeline(seed)
     return pipeline.run_pipeline(
         model1_path=model1_path,
         model2_path=model2_path,
