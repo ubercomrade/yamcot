@@ -14,8 +14,6 @@ Key Features:
 
 from __future__ import annotations
 
-import functools
-import logging
 import os
 import tempfile
 from dataclasses import dataclass
@@ -34,11 +32,7 @@ from mimosa.functions import (
 )
 from mimosa.io import write_dist, write_fasta
 from mimosa.models import GenericModel, calculate_threshold_table, get_pfm, get_score_bounds, scan_model, write_model
-from mimosa.ragged import RaggedData, ragged_from_list
-
-# ------------------------------------------------------------------
-# 1. Immutable Configuration (Dependency Injection)
-# ------------------------------------------------------------------
+from mimosa.ragged import RaggedData
 
 
 @dataclass(frozen=True)
@@ -55,44 +49,25 @@ class ComparatorConfig:
     seed: Optional[int] = None
     n_jobs: int = -1
 
-    # Tomtom specific
     permute_rows: bool = False
     pfm_mode: bool = False
 
-    # Universal/Data specific
     distortion_level: float = 0.4
     search_range: int = 10
     min_kernel_size: int = 3
     max_kernel_size: int = 11
 
-    # Motali specific
     motali_threshold: float = 0.95
     tmp_directory: str = "."
     fasta_path: Optional[str] = None
 
 
 def create_comparator_config(**kwargs) -> ComparatorConfig:
-    """
-    Factory function for creating ComparatorConfig with backward compatibility.
+    """Factory function for creating ComparatorConfig with backward compatibility."""
 
-    This function provides a convenient way to create ComparatorConfig instances
-    with sensible defaults while allowing override of any parameter.
-
-    Parameters
-    ----------
-    **kwargs
-        Configuration parameters to override defaults
-
-    Returns
-    -------
-    ComparatorConfig
-        Configured comparison settings
-    """
-    # Backward compatibility for older key name.
     if "motali_tmp_dir" in kwargs and "tmp_directory" not in kwargs:
         kwargs["tmp_directory"] = kwargs.pop("motali_tmp_dir")
 
-    # Set defaults based on common use cases
     defaults = {
         "metric": "pcc",
         "n_permutations": 0,
@@ -108,29 +83,17 @@ def create_comparator_config(**kwargs) -> ComparatorConfig:
         "tmp_directory": ".",
     }
 
-    # Update defaults with provided kwargs
     config_params = {**defaults, **kwargs}
 
     return ComparatorConfig(**config_params)
 
 
-# ------------------------------------------------------------------
-# 2. Shared Utilities (Eliminated Duplication)
-# ------------------------------------------------------------------
-
-
 def _create_surrogate_ragged(frequencies: RaggedData, rng: np.random.Generator, cfg: ComparatorConfig) -> RaggedData:
-    """
-    Unified surrogate generation logic (extracted from Data/Universal comparators).
-    Generates a surrogate frequency profile using convolution with a distorted kernel.
-
-    This is a pure function that takes all dependencies as parameters.
-    """
+    """Unified surrogate generation logic (extracted from Data/Universal comparators)."""
 
     data = frequencies.data
     offsets = frequencies.offsets
 
-    # Generate Distorted Kernel
     kernel_size = int(rng.integers(cfg.min_kernel_size, cfg.max_kernel_size + 1))
     if kernel_size % 2 == 0:
         kernel_size += 1
@@ -175,7 +138,6 @@ def _create_surrogate_ragged(frequencies: RaggedData, rng: np.random.Generator, 
         final_kernel = -final_kernel
     final_kernel /= np.linalg.norm(final_kernel) + 1e-8
 
-    # Convolve each ragged segment independently to preserve sequence boundaries.
     convolved = np.empty_like(data, dtype=np.float32)
     for i in range(len(offsets) - 1):
         start = int(offsets[i])
@@ -198,20 +160,15 @@ def run_montecarlo(
     seed: Optional[int],
     *args,
 ) -> Tuple[np.ndarray, float, float]:
-    """
-    Generic function to run Monte Carlo permutations in parallel.
-    Returns null_scores array, null_mean, null_std.
-
-    This pure function can be reused across different comparison strategies.
-    """
+    """Generic function to run Monte Carlo permutations in parallel."""
     if n_permutations <= 0:
         return np.array([]), 0.0, 0.0
 
     base_rng = np.random.default_rng(seed)
     seeds = base_rng.integers(0, 2**31, size=n_permutations)
 
-    # Worker function
     def worker(seed_val):
+        """Compute one score for a permutation seed."""
         rng = np.random.default_rng(int(seed_val))
         surrogate = surrogate_generator_func(rng, *args)
         return obs_score_func(surrogate)
@@ -223,34 +180,29 @@ def run_montecarlo(
     return (null_scores, float(np.mean(null_scores)), float(np.std(null_scores)))
 
 
-# ------------------------------------------------------------------
-# 3. Strategy Registry
-# ------------------------------------------------------------------
-
-
 class ComparatorRegistry:
     """Registry for comparison strategies using decorator pattern."""
 
     def __init__(self):
+        """Initialize registry state."""
         self._strategies: Dict[str, Callable] = {}
 
     def register(self, name: str):
+        """Register a callable under the given name."""
+
         def decorator(fn):
+            """Store a callable in the registry."""
             self._strategies[name] = fn
             return fn
 
         return decorator
 
     def get(self, name: str):
+        """Return a registered callable by name."""
         return self._strategies.get(name)
 
 
 registry = ComparatorRegistry()
-
-
-# ------------------------------------------------------------------
-# 4. Strategy Implementations (Pure Functions)
-# ------------------------------------------------------------------
 
 
 @registry.register("tomtom")
@@ -260,12 +212,10 @@ def strategy_tomtom(
     sequences: Optional[RaggedData],
     cfg: ComparatorConfig,
 ) -> dict:
-    """Matrix-based comparison strategy (PCC/ED/Cosine).
-
-    This function implements the TomTom comparison algorithm as a pure function.
-    """
+    """Matrix-based comparison strategy (PCC/ED/Cosine)."""
 
     def _is_power_of_four(n: int) -> bool:
+        """Check whether a value is a power of four."""
         if n < 1:
             return False
         while n % 4 == 0:
@@ -281,15 +231,12 @@ def strategy_tomtom(
             rows_like_alphabet = rows in (4, 5) or _is_power_of_four(rows)
             cols_like_alphabet = cols in (4, 5) or _is_power_of_four(cols)
 
-            # Accept both (alphabet x L) and transposed (L x alphabet) inputs.
             if not rows_like_alphabet and cols_like_alphabet:
                 mat = mat.T
 
-            # Drop optional N row for PWM-like matrices (5 x L -> 4 x L).
             if mat.shape[0] == 5:
                 mat = mat[:4, :]
 
-            # For k-mer rows (e.g. 16 x L, 64 x L), restore tensor form for correct RC.
             if mat.shape[0] > 4 and _is_power_of_four(mat.shape[0]):
                 order = int(round(np.log(mat.shape[0]) / np.log(4)))
                 mat = mat.reshape((4,) * order + (mat.shape[1],))
@@ -327,7 +274,6 @@ def strategy_tomtom(
         best_score, best_off = -np.inf, 0
         min_ov = min(L1, L2) / 2
 
-        # Z-normalization for ED
         if cfg.metric == "ed":
             a1 = (a1 - np.mean(a1, axis=0)) / (np.std(a1, axis=0) + 1e-9)
             a2 = (a2 - np.mean(a2, axis=0)) / (np.std(a2, axis=0) + 1e-9)
@@ -350,7 +296,7 @@ def strategy_tomtom(
                 sc = np.sum(_vectorized_pcc(c1, c2)) / l_ov
             elif cfg.metric == "cosine":
                 sc = np.sum(_vectorized_cosine(c1, c2)) / l_ov
-            else:  # ED
+            else:
                 sc = -np.sum(np.sqrt(np.sum((c1 - c2) ** 2, axis=0))) / l_ov
 
             if sc > best_score:
@@ -361,29 +307,23 @@ def strategy_tomtom(
         """
         Shuffle columns and optionally rows (values) in the original multidimensional matrix.
         """
-        # Work with a copy of the full dimensionality
+
         shuffled = matrix.copy()
 
-        # 1. Shuffle columns (positions) along the last axis
-        # Indices for the last axis
         pos_indices = np.arange(shuffled.shape[-1])
         rng.shuffle(pos_indices)
         shuffled = shuffled[..., pos_indices]
 
         if cfg.permute_rows:
-            # 1. Определяем размер алфавита (обычно 4 для A, C, G, T)
             alphabet_size = shuffled.shape[0]
-            # 2. Генерируем одну общую перестановку для всех осей
+
             perm = rng.permutation(alphabet_size)
 
-            # 3. Применяем перестановку ко всем осям, кроме последней (позиции)
-            # Это сохраняет структуру зависимостей (например, AA перейдет в GG)
             for axis in range(shuffled.ndim - 1):
                 shuffled = np.take(shuffled, perm, axis=axis)
 
         return shuffled
 
-    # --- Execution ---
     use_pfm_mode = cfg.pfm_mode or (model1.type_key != model2.type_key)
     if use_pfm_mode:
         if sequences is None:
@@ -414,11 +354,10 @@ def strategy_tomtom(
         "metric": cfg.metric,
     }
 
-    # --- Permutations ---
     if cfg.n_permutations > 0:
 
         def gen_surrogate(rng):
-            # Simplified surrogate generation for TomTom
+            """Generate one surrogate score."""
             rnd = matrix2.copy()
             idx = np.arange(rnd.shape[-1])
             rng.shuffle(idx)
@@ -447,25 +386,20 @@ def strategy_tomtom(
 def strategy_universal(
     model1: GenericModel, model2: GenericModel, sequences: RaggedData, cfg: ComparatorConfig
 ) -> dict:
-    """RaggedData-based comparison strategy (CJ/CO/Corr).
-
-    This function implements the universal motif comparison using frequency profiles.
-    """
+    """RaggedData-based comparison strategy (CJ/CO/Corr)."""
     if sequences is None:
         raise ValueError("Universal strategy requires 'sequences' argument.")
 
-    # Compute Frequencies using pure functions
     freq1_plus = scan_model(model1, sequences, "+")
     freq2_plus = scan_model(model2, sequences, "+")
     freq2_minus = scan_model(model2, sequences, "-")
 
-    # Convert to frequencies
     freq1_plus = scores_to_frequencies(freq1_plus)
     freq2_plus = scores_to_frequencies(freq2_plus)
     freq2_minus = scores_to_frequencies(freq2_minus)
 
-    # Internal metric dispatcher
     def get_score(S1: RaggedData, S2: RaggedData) -> Tuple[float, int]:
+        """Compute score and offset for two profiles."""
         if cfg.metric == "cj":
             sc, off = _fast_cj_kernel_numba(S1.data, S1.offsets, S2.data, S2.offsets, cfg.search_range)
             return sc, off
@@ -478,7 +412,6 @@ def strategy_universal(
         else:
             raise ValueError(f"Unknown metric: {cfg.metric}")
 
-    # Observed Scores
     sc_pp, off_pp = get_score(freq1_plus, freq2_plus)
     sc_pm, off_pm = get_score(freq1_plus, freq2_minus)
 
@@ -496,10 +429,10 @@ def strategy_universal(
         "metric": cfg.metric,
     }
 
-    # Permutations
     if cfg.n_permutations > 0:
 
         def surrogate_gen(rng):
+            """Generate one surrogate score."""
             surr = _create_surrogate_ragged(f_final, rng, cfg)
             sc, _ = get_score(freq1_plus, surr)
             return sc
@@ -518,12 +451,8 @@ def strategy_universal(
 def strategy_motali(
     model1: GenericModel, model2: GenericModel, sequences: Optional[RaggedData], cfg: ComparatorConfig
 ) -> dict:
-    """External Motali tool wrapper.
-
-    This function wraps the external Motali tool for motif comparison.
-    """
+    """External Motali tool wrapper."""
     with tempfile.TemporaryDirectory(dir=cfg.tmp_directory, ignore_cleanup_errors=True) as tmp:
-        # Determine extensions
         ext_1 = ".pfm" if model1.type_key == "pwm" else ".mat"
         ext_2 = ".pfm" if model2.type_key == "pwm" else ".mat"
 
@@ -537,7 +466,6 @@ def strategy_motali(
         d1_path = os.path.join(tmp, "thresholds_1.dist")
         d2_path = os.path.join(tmp, "thresholds_2.dist")
 
-        # Write data using model strategies
         write_model(model1, m1_path)
         write_model(model2, m2_path)
 
@@ -549,17 +477,14 @@ def strategy_motali(
         write_dist(dist1, max_1, min_1, d1_path)
         write_dist(dist2, max_2, min_2, d2_path)
 
-        # Handle FASTA
         fasta_path = cfg.fasta_path
         if fasta_path is None and sequences is not None:
             fasta_path = os.path.join(tmp, "sequences.fa")
             write_fasta(sequences, fasta_path)
 
         if fasta_path is None:
-            # Fallback for dummy run if no fasta provided
             pass
 
-        # Call external tool
         score = run_motali(
             fasta_path,
             m1_path,
@@ -578,11 +503,6 @@ def strategy_motali(
         return {"query": model1.name, "target": model2.name, "score": score}
 
 
-# ------------------------------------------------------------------
-# 5. Public API (Main Entry Point)
-# ------------------------------------------------------------------
-
-
 def compare(
     model1: GenericModel,
     model2: GenericModel,
@@ -591,30 +511,7 @@ def compare(
     sequences: Optional[RaggedData] = None,
     promoters: Optional[RaggedData] = None,
 ) -> dict:
-    """
-    Main entry point for motif comparison.
-
-    This function provides a unified interface to all comparison strategies
-    through the registry pattern.
-
-    Parameters
-    ----------
-    model1, model2 : GenericModel
-        Motifs to compare
-    strategy : str
-        Comparison strategy key ('tomtom', 'universal', 'motali')
-    config : ComparatorConfig
-        Configuration object (metric, n_permutations, etc.)
-    sequences : RaggedData, optional
-        Sequences required for frequency-based comparison
-    promoters : RaggedData, optional
-        Promoters required for frequency-based comparison
-
-    Returns
-    -------
-    dict
-        Comparison results
-    """
+    """Main entry point for motif comparison."""
     strategy_fn = registry.get(strategy)
     if not strategy_fn:
         available = list(registry._strategies.keys())

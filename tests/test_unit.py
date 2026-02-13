@@ -11,8 +11,6 @@ import numpy as np
 import pytest
 
 from mimosa.comparison import (
-    ComparatorConfig,
-    compare,
     create_comparator_config,
     strategy_motali,
     strategy_tomtom,
@@ -34,10 +32,7 @@ from mimosa.functions import (
 )
 from mimosa.models import (
     GenericModel,
-    _score_to_frequency,
-    calculate_threshold_table,
     get_frequencies,
-    get_scores,
     scan_model,
 )
 from mimosa.models import registry as model_registry
@@ -217,13 +212,6 @@ def test_generic_model_creation():
     assert model.length == 2
     assert model.config["kmer"] == 1
 
-    # Test immutability
-    try:
-        model.name = "modified"
-        assert False, "Model should be immutable"
-    except Exception:
-        pass  # Expected
-
 
 def test_model_registry():
     """Test model registry functionality"""
@@ -255,13 +243,6 @@ def test_create_comparator_config():
     assert config.metric == "cj"
     assert config.n_permutations == 100
     assert config.seed == 42
-
-    # Test immutability
-    try:
-        config.metric = "modified"
-        assert False, "Config should be immutable"
-    except Exception:
-        pass  # Expected
 
 
 def test_comparison_registry():

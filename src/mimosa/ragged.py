@@ -13,96 +13,30 @@ class RaggedData:
     """
 
     def __init__(self, data: np.ndarray, offsets: np.ndarray):
-        """
-        Initialize the RaggedData object.
-
-        Parameters
-        ----------
-        data : np.ndarray
-            Flattened array containing all the data elements.
-        offsets : np.ndarray
-            Array of indices indicating the start of each sequence in the data array.
-            The length should be (num_sequences + 1), where the last element
-            indicates the end of the last sequence.
-        """
+        """Initialize the RaggedData object."""
         self.data = data
         self.offsets = offsets
 
     def get_length(self, i: int) -> int:
-        """
-        Return the length of the i-th sequence.
-
-        Parameters
-        ----------
-        i : int
-            Index of the sequence.
-
-        Returns
-        -------
-        int
-            Length of the i-th sequence.
-        """
+        """Return the length of the i-th sequence."""
         return self.offsets[i + 1] - self.offsets[i]
 
     def get_slice(self, i: int) -> np.ndarray:
-        """
-        Return a slice of data for the i-th sequence (view).
-
-        Parameters
-        ----------
-        i : int
-            Index of the sequence.
-
-        Returns
-        -------
-        np.ndarray
-            View of the data array for the i-th sequence.
-        """
+        """Return a slice of data for the i-th sequence (view)."""
         return self.data[self.offsets[i] : self.offsets[i + 1]]
 
     def total_elements(self) -> int:
-        """
-        Return the total number of elements across all sequences.
-
-        Returns
-        -------
-        int
-            Total number of elements in all sequences.
-        """
+        """Return the total number of elements across all sequences."""
         return self.data.size
 
     @property
     def num_sequences(self) -> int:
-        """
-        Return the number of sequences.
-
-        Returns
-        -------
-        int
-            Number of sequences stored in this object.
-        """
+        """Return the number of sequences."""
         return self.offsets.size - 1
 
 
 def ragged_from_list(data_list: List[np.ndarray], dtype=None) -> RaggedData:
-    """
-    Create RaggedData from a list of numpy arrays.
-
-    This function efficiently combines a list of arrays into a single RaggedData
-    object without creating intermediate lists or unnecessary allocations.
-
-    Parameters
-    ----------
-    data_list : List[np.ndarray]
-        List of numpy arrays of potentially different lengths.
-    dtype : data-type, optional
-        Data type for the resulting RaggedData. If None, uses the dtype of the first array.
-
-    Returns
-    -------
-    RaggedData
-        A RaggedData object containing all input arrays.
-    """
+    """Create RaggedData from a list of numpy arrays."""
     if len(data_list) == 0:
         return RaggedData(np.empty(0, dtype=dtype if dtype else np.float32), np.zeros(1, dtype=np.int64))
 

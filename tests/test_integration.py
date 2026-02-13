@@ -5,8 +5,6 @@ These tests cover various command-line scenarios from the example script,
 excluding any tests with .fa and .fasta files as specified.
 """
 
-import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path

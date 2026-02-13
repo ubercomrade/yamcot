@@ -54,10 +54,8 @@ def create_arg_parser() -> argparse.ArgumentParser:
          """,
     )
 
-    # Create subparsers for the three main modes
     subparsers = parser.add_subparsers(dest="mode", help="Operation mode", required=True)
 
-    # Score-based comparison subcommand
     profile_parser = subparsers.add_parser(
         "profile", help="Compare motifs based on pre-calculated score profiles (uses DataComparator engine)."
     )
@@ -139,14 +137,12 @@ def create_arg_parser() -> argparse.ArgumentParser:
         help="Number of parallel jobs to run. Set to -1 to use all available CPU cores. (default: %(default)s)",
     )
 
-    # Motif scan-based comparison subcommand
     motif_parser = subparsers.add_parser(
         "motif", help="Compare motifs by calculating scores derived from scanning sequences with models."
     )
     motif_parser.add_argument("model1", help="Path to the first motif model file.")
     motif_parser.add_argument("model2", help="Path to the second motif model file.")
 
-    # Input/Output Options for sequence parser
     motif_io_group = motif_parser.add_argument_group("Input/Output Options")
     motif_io_group.add_argument(
         "--model1-type",
@@ -187,7 +183,6 @@ def create_arg_parser() -> argparse.ArgumentParser:
         help="Length of each random sequence to generate if --fasta is not provided. (default: %(default)s)",
     )
 
-    # Motif / Data Comparator options
     motif_group = motif_parser.add_argument_group("Motif Comparator Options")
     motif_group.add_argument(
         "--metric",
@@ -263,18 +258,15 @@ def create_arg_parser() -> argparse.ArgumentParser:
         help="Number of parallel jobs to run. Set to -1 to use all available CPU cores. (default: %(default)s)",
     )
 
-    # Motali
     motali_parser = subparsers.add_parser(
         "motali", help="Compare motifs by calculating PRC AUC derived from scanning sequences with models."
     )
 
-    # Motali-specific options
     motali_group = motali_parser.add_argument_group("Motali Options")
 
     motali_group.add_argument("model1", help="Path to the first motif model file.")
     motali_group.add_argument("model2", help="Path to the second motif model file.")
 
-    # Input/Output Options for sequence parser
     motali_io_group = motali_parser.add_argument_group("Input/Output Options")
     motali_io_group.add_argument(
         "--model1-type",
@@ -332,14 +324,12 @@ def create_arg_parser() -> argparse.ArgumentParser:
         help="Enable verbose logging to standard output for detailed execution tracking.",
     )
 
-    # TomTom-like comparison subcommand
     tomtom_parser = subparsers.add_parser(
         "tomtom-like", help="Compare motifs by direct matrix comparison (uses TomTomComparator engine)."
     )
     tomtom_parser.add_argument("model1", help="Path to the first motif model file.")
     tomtom_parser.add_argument("model2", help="Path to the second motif model file.")
 
-    # Input/Output Options for tomtom parser
     tomtom_io_group = tomtom_parser.add_argument_group("Input/Output Options")
     tomtom_io_group.add_argument(
         "--model1-type",
@@ -354,7 +344,6 @@ def create_arg_parser() -> argparse.ArgumentParser:
         help="Format of the second model. Choices: pwm, bamm, sitega.",
     )
 
-    # TomTom-specific options
     tomtom_options_group = tomtom_parser.add_argument_group("TomTom Options")
     tomtom_options_group.add_argument(
         "--metric",
@@ -432,7 +421,7 @@ def create_arg_parser() -> argparse.ArgumentParser:
 def validate_inputs(args) -> None:
     """Validate input files and parameters."""
     logger = logging.getLogger(__name__)
-    # Validate mode-specific inputs
+
     if args.mode == "profile":
         if not os.path.exists(args.profile1):
             logger.error(f"Profile file not found: {args.profile1}")
@@ -537,7 +526,7 @@ def run_pipeline_from_args(args) -> None:
                 comparison_type=args.mode,
                 **map_args_to_pipeline_kwargs(args),
             )
-        
+
         logger.info("Pipeline completed successfully")
         json_string = json.dumps(result)
         print(json_string)
@@ -549,7 +538,7 @@ def run_pipeline_from_args(args) -> None:
 
 def main_cli():
     """Main CLI entry point."""
-    # Parse arguments
+
     parser = create_arg_parser()
 
     if len(sys.argv) == 1:
@@ -558,13 +547,10 @@ def main_cli():
 
     args = parser.parse_args()
 
-    # Setup logging
     setup_logging(args.verbose)
 
-    # Validate inputs
     validate_inputs(args)
 
-    # Run pipeline using the new helper
     run_pipeline_from_args(args)
 
 

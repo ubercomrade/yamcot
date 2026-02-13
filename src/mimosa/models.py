@@ -32,11 +32,6 @@ from mimosa.ragged import RaggedData
 StrandMode = Literal["best", "+", "-"]
 
 
-# ------------------------------------------------------------------
-# 1. Immutable Data Container (Hashable for caching)
-# ------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class GenericModel:
     """Immutable motif model container.
@@ -69,21 +64,18 @@ class GenericModel:
         return hash((self.type_key, self.name, self.length))
 
 
-# ------------------------------------------------------------------
-# 2. Registry & Decorator System
-# ------------------------------------------------------------------
-
-
 class ModelRegistry:
     """Registry for model strategies using decorator pattern."""
 
     def __init__(self):
+        """Initialize registry state."""
         self._strategies: Dict[str, type] = {}
 
     def register(self, key: str):
         """Decorator to register a model strategy class."""
 
         def decorator(strategy_cls):
+            """Store a callable in the registry."""
             self._strategies[key] = strategy_cls
             logging.info(f"Registered model strategy: {key} -> {strategy_cls.__name__}")
             return strategy_cls
@@ -98,82 +90,31 @@ class ModelRegistry:
         return self._strategies[key]
 
 
-# Global registry instance
 registry = ModelRegistry()
 
 
-# ------------------------------------------------------------------
-# 3. Core Polymorphic Functions
-# ------------------------------------------------------------------
-
-
 def scan_model(model: GenericModel, sequences: RaggedData, strand: Optional[StrandMode] = None) -> RaggedData:
-    """
-    Universal scanning function that dispatches to the appropriate strategy.
-
-    Parameters
-    ----------
-    model : GenericModel
-        The motif model to scan with
-    sequences : RaggedData
-        Sequences to scan
-    strand : StrandMode, optional
-        Strand mode for scanning
-
-    Returns
-    -------
-    RaggedData
-        Scanning results
-    """
+    """Universal scanning function that dispatches to the appropriate strategy."""
     strategy_cls = registry.get(model.type_key)
     strand_mode = strand or model.config.get("strand_mode", "best")
     return strategy_cls.scan(model, sequences, strand_mode)
 
 
 def write_model(model: GenericModel, path: str) -> None:
-    """
-    Universal write function that dispatches to the appropriate strategy.
-
-    Parameters
-    ----------
-    model : GenericModel
-        The model to write
-    path : str
-        Output file path
-    """
+    """Universal write function that dispatches to the appropriate strategy."""
     strategy_cls = registry.get(model.type_key)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     strategy_cls.write(model, path)
 
 
 def read_model(path: str, model_type: str, **kwargs) -> GenericModel:
-    """
-    Factory function for creating models from files.
-
-    Parameters
-    ----------
-    path : str
-        Path to the model file
-    model_type : str
-        Type of model to load
-    **kwargs
-        Additional arguments for the loader
-
-    Returns
-    -------
-    GenericModel
-        Loaded model
-    """
+    """Factory function for creating models from files."""
     strategy_cls = registry.get(model_type)
     return strategy_cls.load(path, kwargs)
 
 
 def get_score_bounds(model: GenericModel) -> tuple[float, float]:
-    """
-    Return theoretical minimum and maximum scores for a model.
-
-    This is a polymorphic API dispatched via model strategies.
-    """
+    """Return theoretical minimum and maximum scores for a model."""
     strategy_cls = registry.get(model.type_key)
     if not hasattr(strategy_cls, "score_bounds"):
         raise NotImplementedError(f"Model strategy '{model.type_key}' does not implement score_bounds")
@@ -192,45 +133,26 @@ def _score_bounds_from_representation(representation: np.ndarray) -> tuple[float
 
 @functools.lru_cache(maxsize=32)
 def calculate_threshold_table(model: GenericModel, promoters: RaggedData) -> np.ndarray:
-    """
-    Pure function to calculate threshold table.
+    """Pure function to calculate threshold table."""
 
-    Parameters
-    ----------
-    model : GenericModel
-        The motif model
-    promoters : RaggedData
-        Promoter sequences for threshold calculation
-
-    Returns
-    -------
-    np.ndarray
-        Threshold table with columns [score, -log10(FPR)]
-    """
-    # Get scores for all positions using the scanning function
     ragged_scores = scan_model(model, promoters, strand="best")
 
-    # Flatten scores (no padding in RaggedData)
     flat_scores = ragged_scores.data
 
     if flat_scores.size == 0:
         return np.array([[0.0, 0.0]], dtype=np.float64)
 
-    # Sort in descending order
     scores_sorted = np.sort(flat_scores)[::-1]
     n_total = flat_scores.size
 
-    # Calculate FPR and convert to -log10
     unique_scores, inverse, counts = np.unique(scores_sorted, return_inverse=True, return_counts=True)
-    unique_scores = unique_scores[::-1]  # Descending
+    unique_scores = unique_scores[::-1]
     counts = counts[::-1]
 
-    # Cumulative counts and FPR calculation
     cum_counts = np.cumsum(counts)
     fpr_values = cum_counts / n_total
     log_fpr_values = -np.log10(fpr_values)
 
-    # Create threshold table
     table = np.column_stack([unique_scores, np.abs(log_fpr_values)])
     table = table.astype(np.float64)
     model.config["_threshold_table"] = table
@@ -256,36 +178,7 @@ def get_sites(
     mode: str = "best",
     fpr_threshold: Optional[float] = None,
 ) -> pd.DataFrame:
-    """Find motif binding sites in sequences.
-
-    The method operates in two modes:
-    - "best": finds the single best site in each sequence
-    - "threshold": finds all sites with false positive rate ≤ fpr_threshold
-
-    Parameters
-    ----------
-    model : GenericModel
-        The motif model
-    sequences : RaggedData
-        Encoded sequences to search for motif sites.
-    mode : {"best", "threshold"}, optional
-        Site finding mode (default "best").
-    fpr_threshold : float, optional
-        False positive rate threshold for "threshold" mode (e.g., 0.001).
-        Required for mode="threshold".
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with columns:
-        - seq_index: sequence index
-        - start: start position of site (0-based)
-        - end: end position of site (exclusive)
-        - strand: DNA strand ("+" or "-")
-        - score: recognition function value
-        - frequency: false positive rate (FPR) from threshold_table
-        - site: site as string representation (ACGT)
-    """
+    """Find motif binding sites in sequences."""
     threshold_table = model.config.get("_threshold_table")
     if mode not in ["best", "threshold"]:
         raise ValueError(f"mode must be 'best' or 'threshold', got {mode!r}")
@@ -294,15 +187,13 @@ def get_sites(
     if mode == "threshold" and threshold_table is None:
         raise ValueError("Model has no threshold table")
 
-    # Determine threshold score
     score_threshold = (
         _frequency_to_score(model, fpr_threshold) if mode == "threshold" and fpr_threshold is not None else None
     )
     if score_threshold is not None:
         logger = logging.getLogger(__name__)
-        logger.info(f"FPR threshold: {fpr_threshold} → Score threshold: {score_threshold:.4f}")
+        logger.info(f"FPR threshold: {fpr_threshold} -> score threshold: {score_threshold:.4f}")
 
-    # Helper function to add a single site
     def add_site(seq_idx: int, seq: np.ndarray, pos: int, strand_idx: int, score: float):
         """Add a site to results."""
         if pos + model.length > len(seq):
@@ -311,7 +202,6 @@ def get_sites(
         site_seq = seq[pos : pos + model.length]
         strand = "+" if strand_idx == 0 else "-"
 
-        # Reverse complement for minus strand
         if strand_idx == 1:
             site_seq = _rc_sequence(site_seq)
 
@@ -327,10 +217,8 @@ def get_sites(
             }
         )
 
-    # Collect results
     results = []
 
-    # Batch scanning
     s_fwd_ragged = scan_model(model, sequences, strand="+")
     s_rev_ragged = scan_model(model, sequences, strand="-")
     n_seq = sequences.num_sequences
@@ -353,18 +241,15 @@ def get_sites(
                 best_score = float(r_max)
                 add_site(seq_idx, seq, best_pos, 1, best_score)
 
-        else:  # mode == "threshold"
-            # Forward strand
+        else:
             f_pos = np.where(s_fwd >= score_threshold)[0]
             for pos in f_pos:
                 add_site(seq_idx, seq, int(pos), 0, float(s_fwd[pos]))
 
-            # Reverse strand
             r_pos = np.where(s_rev >= score_threshold)[0]
             for pos in r_pos:
                 add_site(seq_idx, seq, int(pos), 1, float(s_rev[pos]))
 
-    # Create and sort DataFrame
     df = pd.DataFrame(results)
     if len(df) > 0:
         df = df.sort_values(["seq_index", "score"], ascending=[True, False]).reset_index(drop=True)
@@ -383,33 +268,8 @@ def get_pfm(
     pseudocount: float = 0.25,
     force_recompute: bool = False,
 ) -> np.ndarray:
-    """Construct Position Frequency Matrix (PFM) from binding sites.
+    """Construct Position Frequency Matrix (PFM) from binding sites."""
 
-    Result is cached in the _pfm attribute for reuse.
-
-    Parameters
-    ----------
-    model : GenericModel
-        The motif model
-    sequences : RaggedData
-        Encoded sequences to extract binding sites from.
-    mode : {"best", "threshold"}, optional
-        Site finding mode (default "best").
-    fpr_threshold : float, optional
-        Frequency threshold for "threshold" mode.
-    top_fraction : float, optional
-        Selects only top N% of sites by score.
-    pseudocount : float, optional
-        Pseudocount for smoothing (default 0.25).
-    force_recompute : bool, optional
-        If True, recomputes PFM even if it's already cached.
-
-    Returns
-    -------
-    np.ndarray
-        Normalized PFM of shape (4, motif_length).
-    """
-    # Return cached version if available
     cached_pfm = model.config.get("_pfm")
     if cached_pfm is not None and not force_recompute:
         logger = logging.getLogger(__name__)
@@ -419,34 +279,28 @@ def get_pfm(
     logger = logging.getLogger(__name__)
     logger.info(f"Computing PFM for model: {model.name}")
 
-    # Get sites
     sites_df = get_sites(model, sequences, mode=mode, fpr_threshold=fpr_threshold)
     if len(sites_df) == 0:
         raise ValueError("No sites found")
 
     sites_df = sites_df.sort_values(by=["score"], axis=0, ascending=False)
 
-    # Select top N% if specified
     if top_fraction is not None:
         n_keep = max(1, int(len(sites_df) * top_fraction))
         sites_df = sites_df.nlargest(n_keep, "score")
         logger = logging.getLogger(__name__)
         logger.info(f"Selected top {top_fraction * 100:.1f}%: {n_keep} sites")
 
-    # Initialize PFM with pseudocounts
     pfm = np.full((4, model.length), pseudocount, dtype=np.float32)
     nuc_map = {"A": 0, "C": 1, "G": 2, "T": 3}
 
-    # Fill counters
     for site_str in sites_df["site"]:
         for pos, nuc in enumerate(site_str):
             if nuc in nuc_map:
                 pfm[nuc_map[nuc], pos] += 1.0
 
-    # Normalize to probabilities
     pfm = pfm / pfm.sum(axis=0, keepdims=True)
 
-    # Cache the result
     model.config["_pfm"] = pfm
 
     return pfm
@@ -479,16 +333,15 @@ def _frequency_to_score(model: GenericModel, frequency: float) -> float:
         raise ValueError("Model has no threshold table")
 
     if frequency <= 0:
-        return float(threshold_table[0, 0])  # infinitely strict threshold -> maximum score
+        return float(threshold_table[0, 0])
 
     target_logfpr = -np.log10(frequency)
 
     scores_col = threshold_table[:, 0]
-    logfpr_col = threshold_table[:, 1]  # -log10(FPR)
+    logfpr_col = threshold_table[:, 1]
 
     mask = logfpr_col >= target_logfpr
     if not np.any(mask):
-        # even the weakest score doesn't give such FPR
         return float(scores_col[-1])
 
     last_valid = np.where(mask)[0][-1]
@@ -496,43 +349,16 @@ def _frequency_to_score(model: GenericModel, frequency: float) -> float:
 
 
 def _int_to_seq(seq_int: np.ndarray) -> str:
-    """Convert integer-encoded sequence to ACGT string.
-
-    Parameters
-    ----------
-    seq_int : np.ndarray
-        Integer-encoded sequence (0=A, 1=C, 2=G, 3=T, 4=N).
-
-    Returns
-    -------
-    str
-        Sequence as string.
-    """
+    """Convert integer-encoded sequence to ACGT string."""
     decoder = np.array(["A", "C", "G", "T", "N"], dtype="U1")
     safe_seq = np.clip(seq_int, 0, 4)
     return "".join(decoder[safe_seq])
 
 
 def _rc_sequence(seq_int: np.ndarray) -> np.ndarray:
-    """Return reverse complement of sequence.
-
-    Parameters
-    ----------
-    seq_int : np.ndarray
-        Integer-encoded sequence.
-
-    Returns
-    -------
-    np.ndarray
-        Reverse complement of sequence.
-    """
+    """Return reverse complement of sequence."""
     rc_table = np.array([3, 2, 1, 0, 4], dtype=np.int8)
     return rc_table[seq_int[::-1]]
-
-
-# ------------------------------------------------------------------
-# 5. Strategy Implementations using Decorators
-# ------------------------------------------------------------------
 
 
 @registry.register("pwm")
@@ -586,9 +412,8 @@ class PwmStrategy:
         else:
             raise ValueError(f"Unsupported PWM format: {path}")
 
-        # Convert PFM to PWM
         pwm = pfm_to_pwm(pfm)
-        # Add 5th row for 'N' characters (minimum values)
+
         pwm_ext = np.concatenate((pwm, np.min(pwm, axis=0, keepdims=True)), axis=0)
 
         return GenericModel(
@@ -687,7 +512,7 @@ class BammStrategy:
     @staticmethod
     def load(path: str, kwargs: dict) -> GenericModel:
         """Load BaMM model from file."""
-        # Handle path without extension
+
         if not path.endswith(".ihbcp") and not os.path.exists(path):
             ihbcp_path = f"{path}.ihbcp"
             hbcp_path = f"{path}.hbcp"
@@ -699,13 +524,11 @@ class BammStrategy:
         else:
             bg_path = kwargs.get("bg_path")
             if bg_path is None:
-                # Try to find background file
                 base_path = path.replace(".ihbcp", "")
                 hbcp_path = f"{base_path}.hbcp"
                 if os.path.exists(hbcp_path):
                     bg_path = hbcp_path
 
-        # Get target order from kwargs or use default
         target_order = kwargs.get("order", 2)
         _, max_order, length = parse_file_content(path)
         if target_order > max_order:
@@ -721,11 +544,6 @@ class BammStrategy:
             representation=representation,
             config={"kmer": 2},
         )
-
-
-# ------------------------------------------------------------------
-# 7. Profile Strategy Implementation
-# ------------------------------------------------------------------
 
 
 @registry.register("profile")
@@ -757,11 +575,10 @@ class ProfileStrategy:
         profile_data = read_fasta(path)
         name = os.path.splitext(os.path.basename(path))[0]
 
-        # Create a model for profile comparison
         return GenericModel(
             type_key="profile",
             name=name,
-            length=0,  # Not applicable for profiles
-            representation=None,  # No representation for profiles
+            length=0,
+            representation=None,
             config={"profile_data": profile_data},
         )

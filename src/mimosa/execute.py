@@ -5,11 +5,11 @@ from io import StringIO
 
 import pandas as pd
 
-# Import the C++ extension
 from mimosa._core import run_motali_cpp
 
 
 def run_prosampler(foreground_path, background_path, output_dir, motif_length, number_of_motifs):
+    """Run ProSampler and write results to the output directory."""
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     args = [
@@ -41,6 +41,7 @@ def run_prosampler(foreground_path, background_path, output_dir, motif_length, n
 
 
 def run_tomtom(motifs_1, motifs_2):
+    """Run TomTom and return the top match as a dictionary."""
     args = ["tomtom", motifs_1, motifs_2, "-thresh", "1", "-text"]
 
     logger = logging.getLogger(__name__)
@@ -72,7 +73,6 @@ def run_motali(
     if type_2 == "sitega":
         type_2 = "sga"
 
-    # Use the C++ extension directly
     result = run_motali_cpp(
         file_fasta=fasta_path,
         type_model_1=type_1,
@@ -81,8 +81,8 @@ def run_motali(
         file_model_2=motif_2,
         file_table_1=dist_1,
         file_table_2=dist_2,
-        shift=50,  # Default shift value
-        threshold=0.002,  # Default threshold
+        shift=50,
+        threshold=0.002,
         file_hist=hist_path,
         yes_out_hist=1,
         file_prc=prc_path,
@@ -96,7 +96,6 @@ def run_motali(
         logger.error(f"C++ function returned error code: {result}")
         raise RuntimeError(f"C++ function failed with error code: {result}")
 
-    # Read the result from the output file
     with open(all_path) as file:
         score = float(file.readline().strip())
 

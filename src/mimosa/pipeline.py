@@ -8,7 +8,7 @@ replacing class-based pipelines with pure functions and declarative composition.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Optional, Union
+from typing import Optional, Union
 
 import numpy as np
 
@@ -34,26 +34,6 @@ class PipelineConfig:
     num_sequences: int = 1000
     seq_length: int = 200
     seed: int = 127
-
-
-class WorkflowRegistry:
-    """Registry for workflow patterns using decorator pattern."""
-
-    def __init__(self):
-        self._workflows: Dict[str, Callable] = {}
-
-    def register(self, name: str):
-        def decorator(fn):
-            self._workflows[name] = fn
-            return fn
-
-        return decorator
-
-    def get(self, name: str):
-        return self._workflows.get(name)
-
-
-workflow_registry = WorkflowRegistry()
 
 
 def load_sequences(seq_source: Optional[Path], config: PipelineConfig) -> RaggedData:
@@ -151,7 +131,6 @@ def run_pipeline(
     sequences = load_sequences(seq_source1, config)
     promoters = load_sequences(seq_source2, config)
 
-    # Map comparison type to strategy
     strategy_map = {"motif": "universal", "motali": "motali", "tomtom-like": "tomtom", "profile": "universal"}
 
     strategy = strategy_map.get(comparison_type, "universal")
