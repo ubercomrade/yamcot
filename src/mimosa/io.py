@@ -4,6 +4,7 @@ import copy
 import itertools
 import logging
 import os
+from pathlib import Path
 from typing import Iterable, List, Tuple, Union
 
 import numpy as np
@@ -11,7 +12,7 @@ import numpy as np
 from mimosa.ragged import RaggedData
 
 
-def read_fasta(path: str) -> RaggedData:
+def read_fasta(path: str | Path) -> RaggedData:
     """Read a FASTA file and return integer-encoded sequences."""
 
     trans_table = bytearray([4] * 256)

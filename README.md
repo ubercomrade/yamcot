@@ -230,127 +230,172 @@ mimosa tomtom-like pif4.pfm pif4.meme \
 
 ## Library Usage
 
-MIMOSA is designed as an extensible framework. You can implement your own motif models by inheriting from the base abstractions provided in [`mimosa/`](mimosa/).
+MIMOSA exposes a functional API. The core building blocks are:
 
-### Implementing a Custom Model
+- `GenericModel` (`mimosa.models`) as an immutable model container.
+- `read_model(...)`, `scan_model(...)`, `get_sites(...)`, `get_pfm(...)` (`mimosa.models`) for model I/O and scanning.
+- `create_comparator_config(...)` and `compare(...)` (`mimosa.comparison`) for direct strategy execution.
+- `run_pipeline(...)` (`mimosa.pipeline`) as a high-level entry point mirroring CLI behavior.
 
-To create a new model, inherit from the [`MotifModel`](mimosa/models.py) class and implement the required methods. Below is a simplified example of a dinucleotide-based motif model implemented in pure Python/NumPy.
+### Implementing a Custom Model Type
+
+Custom models are added through the model strategy registry (`mimosa.models.registry`), not by subclassing a base model class.
 
 ```python
+import os
+import joblib
 import numpy as np
-from mimosa.models import MotifModel, RaggedData
-from mimosa.pipeline import Pipeline
-from mimosa.ragged import ragged_from_list
 
-class SimpleDinucleotideMotif(MotifModel):
-    """Example of a custom motif model with dinucleotide dependencies."""
-    
-    def __init__(self, matrix, name, length):
-        # matrix shape: (16, length - 1) representing 16 possible dinucleotides
-        super().__init__(matrix=matrix, name=name, length=length)
-        
-    def scan(self, sequences: RaggedData, strand=None) -> RaggedData:
-        """
-        Scan sequences with the custom model.
-        Returns RaggedData containing scores for each position.
-        """
-        all_scores = []
-        for i in range(sequences.num_sequences):
-            seq = sequences.get_slice(i)
-            if len(seq) < self.length:
-                all_scores.append(np.array([], dtype=np.float32))
-                continue
-            
-            n_pos = len(seq) - self.length + 1
-            scores = np.zeros(n_pos, dtype=np.float32)
-            
-            # Simple sliding window scoring logic
-            for j in range(n_pos):
-                subseq = seq[j : j + self.length]
-                pos_score = 0.0
-                for k in range(self.length - 1):
-                    # Calculate dinucleotide index (0-15) for ACGT
-                    # Assuming 0=A, 1=C, 2=G, 3=T
-                    if subseq[k] < 4 and subseq[k+1] < 4:
-                        dinucl_idx = int(subseq[k] * 4 + subseq[k+1])
-                        pos_score += self.matrix[dinucl_idx, k]
-                scores[j] = pos_score
-            all_scores.append(scores)
-            
-        return ragged_from_list(all_scores, dtype=np.float32)
+from mimosa.models import GenericModel
+from mimosa.models import registry as model_registry
+from mimosa.ragged import RaggedData, ragged_from_list
 
-    @classmethod
-    def from_file(cls, path: str, **kwargs) -> SimpleDinucleotideMotif:
-        """Load the model from a file."""
-        # Implementation of your file parsing logic
-        matrix = np.load(path)
-        name = kwargs.get('name', 'custom_motif')
-        return cls(matrix, name, length=matrix.shape[1] + 1)
 
-    @property
-    def model_type(self) -> str:
-        """Unique identifier for the model type."""
-        return 'dinucleotide'
+def scan_dinuc_scores(sequences: RaggedData, matrix: np.ndarray, strand: str) -> RaggedData:
+    """Scan sequences with a dinucleotide matrix of shape (16, motif_length-1)."""
+    motif_len = matrix.shape[1] + 1
+    rc_table = np.array([3, 2, 1, 0, 4], dtype=np.int8)
+    result = []
 
-    def write(self, path: str):
-        """Save the model to a file."""
-        np.save(path, self.matrix)
+    for i in range(sequences.num_sequences):
+        seq = sequences.get_slice(i)
+        if strand == "-":
+            seq = rc_table[seq[::-1]]
 
-# Register the subclass to enable factory methods and CLI support
-MotifModel.register_subclass('dinucleotide', SimpleDinucleotideMotif)
+        if len(seq) < motif_len:
+            result.append(np.array([], dtype=np.float32))
+            continue
+
+        n_pos = len(seq) - motif_len + 1
+        scores = np.zeros(n_pos, dtype=np.float32)
+
+        for pos in range(n_pos):
+            window = seq[pos : pos + motif_len]
+            score = 0.0
+            for k in range(motif_len - 1):
+                a = int(window[k])
+                b = int(window[k + 1])
+                if a < 4 and b < 4:
+                    dinuc_idx = a * 4 + b
+                    score += matrix[dinuc_idx, k]
+            scores[pos] = score
+
+        result.append(scores)
+
+    return ragged_from_list(result, dtype=np.float32)
+
+
+@model_registry.register("dinuc")
+class DinucStrategy:
+    """Example custom strategy for a dinucleotide model."""
+
+    @staticmethod
+    def scan(model: GenericModel, sequences: RaggedData, strand: str) -> RaggedData:
+        representation = model.representation.astype(np.float32)
+        if strand == "+":
+            return scan_dinuc_scores(sequences, representation, "+")
+        if strand == "-":
+            return scan_dinuc_scores(sequences, representation, "-")
+        if strand == "best":
+            sf = scan_dinuc_scores(sequences, representation, "+")
+            sr = scan_dinuc_scores(sequences, representation, "-")
+            return RaggedData(np.maximum(sf.data, sr.data), sf.offsets)
+        raise ValueError(f"Invalid strand mode: {strand}")
+
+    @staticmethod
+    def write(model: GenericModel, path: str) -> None:
+        joblib.dump(model, path)
+
+    @staticmethod
+    def score_bounds(model: GenericModel) -> tuple[float, float]:
+        rep = model.representation
+        min_score = rep.min(axis=0).sum()
+        max_score = rep.max(axis=0).sum()
+        return float(min_score), float(max_score)
+
+    @staticmethod
+    def load(path: str, kwargs: dict) -> GenericModel:
+        if path.endswith(".pkl"):
+            return joblib.load(path)
+        matrix = np.load(path)  # expected shape: (16, motif_length-1)
+        name = kwargs.get("name", os.path.splitext(os.path.basename(path))[0])
+        length = int(matrix.shape[-1] + 1)
+        return GenericModel(
+            type_key="dinuc",
+            name=name,
+            length=length,
+            representation=matrix.astype(np.float32),
+            config={"kmer": 2},
+        )
 ```
 
-### Key Methods to Override
+### Strategy Contract
 
-To ensure compatibility with the internal comparison [`Pipeline`](mimosa/pipeline.py), you must override the following methods:
+A model strategy registered in `mimosa.models.registry` must provide:
 
 | Method | Description |
 | :--- | :--- |
-| `scan(sequences, strand)` | **Required.** Performs motif scanning on a set of sequences. Must accept `RaggedData` and return `RaggedData` containing position-wise scores. |
-| `from_file(path, **kwargs)` | **Required.** Class method to initialize the model from a file path. Enables the use of `MotifModel.create_from_file(path, 'type')`. |
-| `model_type` | **Required.** Property returning a unique string identifier for the model class. |
-| `write(path)` | **Required.** Method to serialize the model to its native format. |
+| `scan(model, sequences, strand)` | Required. Returns `RaggedData` with positional scores. |
+| `write(model, path)` | Required. Serializes model data. |
+| `score_bounds(model)` | Required for threshold table generation. |
+| `load(path, kwargs)` | Required. Builds and returns a `GenericModel`. |
 
-### Example: Running a Comparison
+### Example: Direct API Comparison
 
 ```python
-# 1. Prepare sequences and models
-# Encode sequence: A=0, C=1, G=2, T=3
-seq_list = [np.array([0, 1, 2, 3, 0, 1, 2, 3], dtype=np.int8)]
-sequences = ragged_from_list(seq_list, dtype=np.int8)
+from mimosa.comparison import compare, create_comparator_config
+from mimosa.io import read_fasta
+from mimosa.models import read_model
 
-# Initialize custom models
-# Matrix for 16 dinucleotides across 9 positions (motif length 10)
-m1 = SimpleDinucleotideMotif(np.random.rand(16, 9), "Motif_A", 10)
-m2 = SimpleDinucleotideMotif(np.random.rand(16, 9), "Motif_B", 10)
+# Load models in supported formats (pwm, bamm, sitega, profile, or custom registered type)
+model1 = read_model("examples/pif4.meme", "pwm")
+model2 = read_model("examples/gata2.meme", "pwm")
 
-# 2. Execute comparison using the Pipeline
-pipeline = Pipeline()
-result = pipeline.execute_motif_comparison(
-    model1=m1,
-    model2=m2,
-    sequences=sequences,
-    promoters=sequences, # Used for threshold (FPR) calculation
-    comparison_type='motif',
-    metric='cj',
-    n_permutations=1000
+# Sequences are integer-encoded (A=0, C=1, G=2, T=3, N=4)
+sequences = read_fasta("examples/foreground.fa")
+
+config = create_comparator_config(
+    metric="cj",
+    n_permutations=100,
+    seed=42,
+    search_range=10,
 )
 
-print(f"Similarity (CJ): {result['similarity']:.4f}")
-print(f"P-value: {result['p_value']:.4e}")
+result = compare(
+    model1=model1,
+    model2=model2,
+    strategy="universal",  # "universal", "tomtom", or "motali"
+    config=config,
+    sequences=sequences,
+)
+
+print(result)
+```
+
+### Example: Pipeline Wrapper
+
+```python
+from mimosa.pipeline import run_pipeline
+
+result = run_pipeline(
+    model1_path="examples/pif4.meme",
+    model2_path="examples/gata2.meme",
+    model1_type="pwm",
+    model2_type="pwm",
+    comparison_type="motif",
+    seq_source1="examples/foreground.fa",
+    seq_source2="examples/promoters.fa",
+    metric="co",
+    n_permutations=100,
+    seed=42,
+)
+
+print(result)
 ```
 
 ### Examples
 
-The [`examples/`](examples/) directory contains sample data and [script](examples/run.sh) to demonstrate the tool's capabilities with CLI.
-
-To run a basic comparison:
-
-```bash
-mimosa motif examples/foxa2.meme examples/gata2.meme \
-  --model1-type pwm --model2-type pwm \
-  --fasta examples/foreground.fa --metric cj --perm 100
-```
+The [`examples/`](examples/) directory contains sample data and scripts (`examples/run.sh`, `examples/run.ps1`) for CLI workflows.
 
 ## Bibliography
 
