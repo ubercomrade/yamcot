@@ -1,6 +1,6 @@
 [project]
 name = "mimosa-tool"
-version = "1.0.1"
+version = "1.1.0"
 description = "Model-Independent Motif Similarity Assessment tool"
 authors = [{name = "Anton Tsukanov", email = "tsukanov@bionet.nsc.ru"}]
 readme = "README.md"
