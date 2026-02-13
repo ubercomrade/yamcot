@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import itertools
 import logging
 import os
 from typing import Iterable, List, Tuple, Union
@@ -206,7 +208,7 @@ def write_meme(motifs: List[np.ndarray], info: List[Tuple[str, int]], path: str)
             out.write("\n")
 
 
-def read_sitega(path: str) -> tuple[np.ndarray, int, float, float]:
+def read_sitega(path: str) -> tuple[np.ndarray, str, int, float, float]:
     """Parse SiteGA output file and return the motif matrix with metadata.
 
     Parameters
@@ -225,7 +227,7 @@ def read_sitega(path: str) -> tuple[np.ndarray, int, float, float]:
     """
     converter = {"A": 0, "C": 1, "G": 2, "T": 3}
     with open(path) as file:
-        _name = file.readline().strip()
+        name = file.readline().strip()
         _number_of_lpd = int(file.readline().strip().split()[0])
         length = int(file.readline().strip().split()[0])
         minimum = float(file.readline().strip().split()[0])
@@ -238,7 +240,7 @@ def read_sitega(path: str) -> tuple[np.ndarray, int, float, float]:
             number_of_positions = int(stop) - int(start) + 1
             for index in range(int(start), int(stop) + 1):
                 sitega[nuc_1][nuc_2][index] += float(value) / number_of_positions
-    return np.array(sitega, dtype=np.float32), length, minimum, maximum
+    return np.array(sitega, dtype=np.float32), name, length, minimum, maximum
 
 
 def parse_file_content(filepath: str) -> tuple[dict[int, list[np.ndarray]], int, int]:
@@ -409,7 +411,7 @@ def read_bamm(motif_path: str, bg_path: str, target_order: int) -> np.ndarray:
     return np.array(final_tensor, dtype=np.float32)
 
 
-def write_sitega(motif, path: str) -> None:
+def write_sitega(model, path: str) -> None:
     """Write SiteGA motif to a file in the .mat format understood by mco_prc.exe.
 
     Parameters
@@ -419,9 +421,12 @@ def write_sitega(motif, path: str) -> None:
     path : str
         Path to the output file.
     """
-    sitega_matrix = motif.matrix
-    converter = {0: "A", 1: "C", 2: "G", 3: "T"}
+    from .models import get_score_bounds
 
+    sitega_matrix = model.representation
+    minimum, maximum = get_score_bounds(model)
+    converter = {0: "A", 1: "C", 2: "G", 3: "T"}
+    dinuc_map = {"".join(dinuc): index for index, dinuc in enumerate(itertools.product("acgt", repeat=2))}
     # Список для хранения найденных сегментов (start, stop, value, dinucleotide)
     segments = []
 
@@ -435,12 +440,12 @@ def write_sitega(motif, path: str) -> None:
             dinucleotide = converter[nuc1] + converter[nuc2]
             pos = 0
 
-            while pos < motif.length:
+            while pos < model.length:
                 # Пропускаем нули
-                while pos < motif.length and abs(sitega_matrix[nuc1, nuc2, pos]) <= 1e-9:
+                while pos < model.length and abs(sitega_matrix[nuc1, nuc2, pos]) <= 1e-9:
                     pos += 1
 
-                if pos >= motif.length:
+                if pos >= model.length:
                     break
 
                 # Начало ненулевой последовательности
@@ -448,7 +453,7 @@ def write_sitega(motif, path: str) -> None:
                 current_val = sitega_matrix[nuc1, nuc2, pos]
 
                 # Ищем конец последовательности с одинаковым значением
-                while pos + 1 < motif.length and abs(sitega_matrix[nuc1, nuc2, pos + 1] - current_val) < 1e-9:
+                while pos + 1 < model.length and abs(sitega_matrix[nuc1, nuc2, pos + 1] - current_val) < 1e-9:
                     pos += 1
 
                 # Сохраняем сегмент
@@ -460,18 +465,18 @@ def write_sitega(motif, path: str) -> None:
     lpd_count = len(segments)
 
     with open(path, "w") as f:
-        f.write(f"{motif.name}\n")
+        f.write(f"{model.name}\n")
         f.write(f"{lpd_count}\tLPD count\n")
-        f.write(f"{motif.length}\tModel length\n")
-        f.write(f"{motif.minimum:.12f}\tMinimum\n")
-        f.write(f"{motif.maximum:.12f}\tRazmah\n")
+        f.write(f"{model.length}\tModel length\n")
+        f.write(f"{minimum:.12f}\tMinimum\n")
+        f.write(f"{maximum:.12f}\tRazmah\n")
 
         # Записываем данные из собранного списка
         for seg in segments:
             range_length = seg["stop"] - seg["start"] + 1
             total_value = seg["val"] * range_length
-
-            f.write(f"{seg['start']}\t{seg['stop']}\t{total_value:.12f}\t0\t{seg['dinucl'].lower()}\n")
+            dinuc_index = dinuc_map[seg["dinucl"].lower()]
+            f.write(f"{seg['start']}\t{seg['stop']}\t{total_value:.12f}\t{dinuc_index}\t{seg['dinucl'].lower()}\n")
 
 
 def write_pfm(pfm: np.ndarray, name: str, length: int, path: str) -> None:
@@ -512,3 +517,17 @@ def read_pfm(path: str) -> tuple[np.ndarray, int]:
     pfm = np.loadtxt(path, comments=">").T
     length = pfm.shape[1]
     return pfm, length
+
+
+def write_dist(threshold_table: np.ndarray, max_score, min_score, path: str) -> None:
+    """Write the threshold table of motif to a DIST formatted file.
+
+    Parameters
+    ----------
+    path : str
+        Path of the output file.
+    """
+    table = copy.deepcopy(threshold_table)
+    table[:, 0] = (table[:, 0] - min_score) / (max_score - min_score)
+    with open(path, "w") as fname:
+        np.savetxt(fname, table, fmt="%.18f", delimiter="\t", newline="\n", footer="", comments="", encoding=None)

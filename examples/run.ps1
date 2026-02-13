@@ -4,7 +4,7 @@ mimosa motif ./bamm ./pif4.meme `
 --permutations 500 `
 --metric co
 
-mimosa motif ./gata2 ./gata4 `
+mimosa motif ./gata2.ihbcp ./gata4.ihbcp `
 --model1-type bamm `
 --model2-type bamm `
 --permutations 1000 `
@@ -34,7 +34,7 @@ mimosa tomtom-like ./sitega_stat6.mat ./pif4.meme `
 --model2-type pwm `
 --metric pcc `
 --permutations 1000 `
---pfm-mode 
+--pfm-mode
 
 mimosa sequence ./sitega.mat ./pif4.meme `
 --model1-type sitega `
@@ -73,11 +73,11 @@ mimosa tomtom-like ./gata2.meme ./sitega_gata2.mat `
 --permutations 1000 `
 --pfm-mode
 
-mimosa tomtom-like ./gata2 ./gata4 `
+mimosa tomtom-like ./gata2.ihbcp ./gata4.ihbcp `
 --model1-type bamm `
 --model2-type bamm `
 --permutations 1000 `
---metric ed -v 
+--metric ed -v
 
 mimosa score ./scores_1.fasta ./scores_2.fasta
 

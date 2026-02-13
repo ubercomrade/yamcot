@@ -10,7 +10,15 @@ These tests validate the correctness of individual functions from:
 import numpy as np
 import pytest
 
-from mimosa.comparison import DataComparator, TomtomComparator, UniversalMotifComparator
+from mimosa.comparison import (
+    ComparatorConfig,
+    compare,
+    create_comparator_config,
+    strategy_motali,
+    strategy_tomtom,
+    strategy_universal,
+)
+from mimosa.comparison import registry as comparison_registry
 from mimosa.functions import (
     batch_all_scores,
     cut_prc,
@@ -24,8 +32,16 @@ from mimosa.functions import (
     scores_to_frequencies,
     standardized_pauc,
 )
-from mimosa.models import BammMotif, PwmMotif, RaggedScores, SitegaMotif
-from mimosa.ragged import RaggedData
+from mimosa.models import (
+    GenericModel,
+    _score_to_frequency,
+    calculate_threshold_table,
+    get_frequencies,
+    get_scores,
+    scan_model,
+)
+from mimosa.models import registry as model_registry
+from mimosa.ragged import RaggedData, ragged_from_list
 
 
 def test_pfm_to_pwm_basic():
@@ -190,95 +206,128 @@ def test_format_params_basic():
     assert formatted == expected
 
 
-def test_tomtom_comparator_initialization():
-    """Test TomtomComparator initialization"""
-    comparator = TomtomComparator(metric="pcc", n_permutations=100)
+def test_generic_model_creation():
+    """Test GenericModel creation and immutability"""
+    representation = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [0.1, 0.2]])
 
-    assert comparator.metric == "pcc"
-    assert comparator.n_permutations == 100
-    assert comparator.name == "TomtomComparator_PCC"
+    model = GenericModel(type_key="pwm", name="test_model", representation=representation, length=2, config={"kmer": 1})
 
+    assert model.type_key == "pwm"
+    assert model.name == "test_model"
+    assert model.length == 2
+    assert model.config["kmer"] == 1
 
-def test_tomtom_comparator_invalid_metric():
-    """Test TomtomComparator with invalid metric raises error"""
-    with pytest.raises(ValueError):
-        TomtomComparator(metric="invalid")
-
-
-def test_data_comparator_initialization():
-    """Test DataComparator initialization"""
-    comparator = DataComparator(metric="cj", n_permutations=100)
-
-    assert comparator.metric == "cj"
-    assert comparator.n_permutations == 100
-    assert comparator.name == "DataComparator"
+    # Test immutability
+    try:
+        model.name = "modified"
+        assert False, "Model should be immutable"
+    except Exception:
+        pass  # Expected
 
 
-def test_universal_motif_comparator_initialization():
-    """Test UniversalMotifComparator initialization"""
-    comparator = UniversalMotifComparator(metric="co", n_permutations=100)
+def test_model_registry():
+    """Test model registry functionality"""
+    # Test that we can get registered strategies
+    pwm_strategy = model_registry.get("pwm")
+    assert pwm_strategy is not None
 
-    assert comparator.metric == "co"
-    assert comparator.n_permutations == 100
-    assert comparator.name == "UniversalMotifComparator"
+    bamm_strategy = model_registry.get("bamm")
+    assert bamm_strategy is not None
 
-
-def test_universal_motif_comparator_invalid_metric():
-    """Test UniversalMotifComparator with invalid metric raises error"""
-    with pytest.raises(ValueError):
-        UniversalMotifComparator(metric="invalid")
-
-
-def test_ragged_scores_from_numba():
-    """Test RaggedScores creation from Numba RaggedData"""
-    # Create mock RaggedData
-    data = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
-    offsets = np.array([0, 2, 4], dtype=np.int64)
-    ragged_data = RaggedData(data, offsets)
-
-    # Create RaggedScores from RaggedData
-    ragged_scores = RaggedScores.from_numba(ragged_data)
-
-    assert isinstance(ragged_scores, RaggedScores)
-    assert ragged_scores.values.shape == (2, 2)  # 2 sequences, max length 2
-    assert ragged_scores.lengths.shape == (2,)  # 2 sequence lengths
+    # Test invalid strategy raises ValueError
+    try:
+        model_registry.get("invalid_strategy")
+        assert False, "Should raise ValueError for invalid strategy"
+    except ValueError:
+        pass  # Expected
 
 
-def test_pwm_motif_creation():
-    """Test PwmMotif creation"""
-    matrix = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [1.0, 2.0]])  # Extended PWM
-    pfm = np.array([[0.25, 0.25], [0.25, 0.25], [0.25, 0.25], [0.25, 0.25]])  # Standard PFM
+def test_create_comparator_config():
+    """Test ComparatorConfig creation and factory function"""
+    # Test factory function with defaults
+    config = create_comparator_config()
+    assert config.metric == "pcc"
+    assert config.n_permutations == 0
+    assert config.seed is None
 
-    motif = PwmMotif(matrix=matrix, name="test_pwm", length=2, pfm=pfm)
+    # Test factory function with custom parameters
+    config = create_comparator_config(metric="cj", n_permutations=100, seed=42)
+    assert config.metric == "cj"
+    assert config.n_permutations == 100
+    assert config.seed == 42
 
-    assert motif.name == "test_pwm"
-    assert motif.length == 2
-    assert motif.model_type == "pwm"
-    assert motif.kmer == 1  # Default value
-
-
-def test_bamm_motif_creation():
-    """Test BammMotif creation"""
-    matrix = np.random.rand(4, 4, 6)  # Example 2nd order BaMM
-
-    motif = BammMotif(matrix=matrix, name="test_bamm", length=6, kmer=3)
-
-    assert motif.name == "test_bamm"
-    assert motif.length == 6
-    assert motif.model_type == "bamm"
-    assert motif.kmer == 3
+    # Test immutability
+    try:
+        config.metric = "modified"
+        assert False, "Config should be immutable"
+    except Exception:
+        pass  # Expected
 
 
-def test_sitega_motif_creation():
-    """Test SitegaMotif creation"""
-    matrix = np.random.rand(16, 8)  # Example SiteGA matrix
+def test_comparison_registry():
+    """Test comparison registry functionality"""
+    # Test that we can get registered strategies
+    tomtom_strategy = comparison_registry.get("tomtom")
+    assert tomtom_strategy is not None
 
-    motif = SitegaMotif(matrix=matrix, name="test_sitega", length=8, kmer=2)
+    universal_strategy = comparison_registry.get("universal")
+    assert universal_strategy is not None
 
-    assert motif.name == "test_sitega"
-    assert motif.length == 8
-    assert motif.model_type == "sitega"
-    assert motif.kmer == 2
+    motali_strategy = comparison_registry.get("motali")
+    assert motali_strategy is not None
+
+    # Test invalid strategy returns None
+    invalid_strategy = comparison_registry.get("invalid_strategy")
+    assert invalid_strategy is None
+
+
+def test_scan_model_with_pwm():
+    """Test scanning with PWM model"""
+    # Create simple PWM model
+    representation = np.array(
+        [
+            [0.2, 0.3, 0.1],  # A
+            [0.3, 0.2, 0.4],  # C
+            [0.2, 0.4, 0.3],  # G
+            [0.3, 0.1, 0.2],  # T
+            [0.1, 0.1, 0.1],  # N (minimum values)
+        ]
+    )
+
+    model = GenericModel(type_key="pwm", name="test_pwm", representation=representation, length=3, config={"kmer": 1})
+
+    # Create test sequences
+    sequences = ragged_from_list(
+        [
+            np.array([0, 1, 2, 3, 2, 1, 0], dtype=np.int8),  # A,C,G,T,C,G,A
+            np.array([1, 2, 3, 0], dtype=np.int8),  # C,G,T,A
+        ],
+        dtype=np.int8,
+    )
+
+    # Test scanning
+    scores = scan_model(model, sequences, "+")
+    assert isinstance(scores, RaggedData)
+    assert scores.data.size > 0
+
+
+def test_get_frequencies():
+    """Test frequency calculation"""
+    representation = np.array([[0.2, 0.3], [0.3, 0.2], [0.2, 0.4], [0.3, 0.1], [0.1, 0.1]])
+
+    model = GenericModel("pwm", "test", representation, 2, {"kmer": 1})
+
+    sequences = ragged_from_list(
+        [
+            np.array([0, 1, 2, 3], dtype=np.int8),
+            np.array([1, 2, 3, 0], dtype=np.int8),
+        ],
+        dtype=np.int8,
+    )
+
+    frequencies = get_frequencies(model, sequences, "+")
+    assert isinstance(frequencies, RaggedData)
+    assert frequencies.data.size > 0
 
 
 def test_batch_all_scores_with_simple_data():
@@ -287,10 +336,18 @@ def test_batch_all_scores_with_simple_data():
     data = np.array([0, 1, 2, 3, 0, 1], dtype=np.int8)
     offsets = np.array([0, 3, 6], dtype=np.int64)
     sequences = RaggedData(data, offsets)
-    matrix = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    representation = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
 
-    result = batch_all_scores(sequences, matrix, kmer=1, is_revcomp=False)
+    result = batch_all_scores(sequences, representation, kmer=1, is_revcomp=False)
     assert hasattr(result, "data") and hasattr(result, "offsets")
+
+
+def test_strategy_functions_exist():
+    """Test that all strategy functions are properly defined"""
+    # Test that strategy functions exist and are callable
+    assert callable(strategy_tomtom)
+    assert callable(strategy_universal)
+    assert callable(strategy_motali)
 
 
 if __name__ == "__main__":

@@ -66,6 +66,12 @@ def run_motali(
     """
     logger = logging.getLogger(__name__)
 
+    if type_1 == "sitega":
+        type_1 = "sga"
+
+    if type_2 == "sitega":
+        type_2 = "sga"
+
     # Use the C++ extension directly
     result = run_motali_cpp(
         file_fasta=fasta_path,

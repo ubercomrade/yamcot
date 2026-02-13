@@ -442,17 +442,10 @@ def validate_inputs(args) -> None:
             sys.exit(1)
 
     elif args.mode in ["motif", "motali"]:
-        suffix_1 = ""
-        suffix_2 = ""
-        if args.model1_type == "bamm":
-            suffix_1 = ".ihbcp"
-        if args.model2_type == "bamm":
-            suffix_2 = ".ihbcp"
-
-        if not os.path.exists(args.model1 + suffix_1):
+        if not os.path.exists(args.model1):
             logger.error(f"Model file not found: {args.model1}")
             sys.exit(1)
-        if not os.path.exists(args.model2 + suffix_2):
+        if not os.path.exists(args.model2):
             logger.error(f"Model file not found: {args.model2}")
             sys.exit(1)
         if args.fasta and not os.path.exists(args.fasta):
@@ -463,17 +456,10 @@ def validate_inputs(args) -> None:
             sys.exit(1)
 
     elif args.mode == "tomtom-like":
-        suffix_1 = ""
-        suffix_2 = ""
-        if args.model1_type == "bamm":
-            suffix_1 = ".ihbcp"
-        if args.model2_type == "bamm":
-            suffix_2 = ".ihbcp"
-
-        if not os.path.exists(args.model1 + suffix_1):
+        if not os.path.exists(args.model1):
             logger.error(f"Model file not found: {args.model1}")
             sys.exit(1)
-        if not os.path.exists(args.model2 + suffix_2):
+        if not os.path.exists(args.model2):
             logger.error(f"Model file not found: {args.model2}")
             sys.exit(1)
 
@@ -491,7 +477,6 @@ def map_args_to_pipeline_kwargs(args) -> Dict[str, Any]:
                 "n_jobs": getattr(args, "jobs", -1),
                 "seed": getattr(args, "seed", None),
                 "pfm_mode": getattr(args, "pfm_mode", False),
-                "comparator": "tomtom",
             }
         )
     elif args.mode == "motali":
@@ -528,6 +513,40 @@ def map_args_to_pipeline_kwargs(args) -> Dict[str, Any]:
     return kwargs
 
 
+def run_pipeline_from_args(args) -> None:
+    """Run the pipeline with parsed arguments."""
+    logger = logging.getLogger(__name__)
+    logger.info(f"Running pipeline in mode: {args.mode}")
+
+    try:
+        if args.mode == "profile":
+            result = run_pipeline(
+                model1_path=args.profile1,
+                model2_path=args.profile2,
+                model1_type="profile",
+                model2_type="profile",
+                comparison_type=args.mode,
+                **map_args_to_pipeline_kwargs(args),
+            )
+        else:
+            result = run_pipeline(
+                model1_path=args.model1,
+                model2_path=args.model2,
+                model1_type=args.model1_type,
+                model2_type=args.model2_type,
+                comparison_type=args.mode,
+                **map_args_to_pipeline_kwargs(args),
+            )
+        
+        logger.info("Pipeline completed successfully")
+        json_string = json.dumps(result)
+        print(json_string)
+
+    except Exception as e:
+        logger.error(f"Pipeline execution failed: {str(e)}")
+        raise
+
+
 def main_cli():
     """Main CLI entry point."""
     # Parse arguments
@@ -545,62 +564,8 @@ def main_cli():
     # Validate inputs
     validate_inputs(args)
 
-    # Prepare pipeline arguments based on mode
-    if args.mode == "profile":
-        # Profile-based comparison
-        model1_path = args.profile1
-        model2_path = args.profile2
-        seq_source1 = None
-        seq_source2 = None
-
-    elif args.mode in ["motif", "motali"]:
-        # Sequence-based comparison
-        model1_path = args.model1
-        model2_path = args.model2
-        seq_source1 = args.fasta
-        seq_source2 = args.promoters
-
-    elif args.mode == "tomtom-like":
-        model1_path = args.model1
-        model2_path = args.model2
-        seq_source1 = None
-        seq_source2 = None
-
-    else:
-        logger = logging.getLogger(__name__)
-        logger.error(f"Unknown mode: {args.mode}")
-        sys.exit(1)
-
-    # Map CLI arguments to pipeline kwargs
-    pipeline_kwargs = map_args_to_pipeline_kwargs(args)
-
-    try:
-        # Run the pipeline
-        comparison_type = args.mode
-        result = run_pipeline(
-            model1_path=model1_path,
-            model2_path=model2_path,
-            model1_type=getattr(args, "model1_type", ""),
-            model2_type=getattr(args, "model2_type", ""),
-            comparison_type=comparison_type,
-            seq_source1=seq_source1,
-            seq_source2=seq_source2,
-            num_sequences=getattr(args, "num_sequences", 1000),
-            seq_length=getattr(args, "seq_length", 200),
-            **pipeline_kwargs,
-        )
-
-        logger = logging.getLogger(__name__)
-        json_string = json.dumps(result)
-        print(json_string)
-
-    except Exception as e:
-        print(f"ERROR: Pipeline execution failed: {e}")
-        if args.verbose:
-            import traceback
-
-            traceback.print_exc()
-        sys.exit(1)
+    # Run pipeline using the new helper
+    run_pipeline_from_args(args)
 
 
 if __name__ == "__main__":
