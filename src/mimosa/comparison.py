@@ -420,11 +420,13 @@ def strategy_universal(
     else:
         obs_score, off, orient, f_final = sc_pp, off_pp, "++", freq2_plus
 
+    motif_offset = -off
+
     result = {
         "query": model1.name,
         "target": model2.name,
         "score": float(obs_score),
-        "offset": int(off),
+        "offset": int(motif_offset),
         "orientation": orient,
         "metric": cfg.metric,
     }

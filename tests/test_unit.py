@@ -324,5 +324,47 @@ def test_strategy_functions_exist():
     assert callable(strategy_motali)
 
 
+def test_strategy_universal_uses_tomtom_offset_convention():
+    """Universal strategy should report offsets in the same direction as TomTom."""
+
+    def make_pwm_model(name: str, pwm_core: np.ndarray) -> GenericModel:
+        n_row = np.min(pwm_core, axis=0, keepdims=True)
+        pwm_ext = np.vstack([pwm_core, n_row]).astype(np.float32)
+        return GenericModel(
+            type_key="pwm", name=name, representation=pwm_ext, length=pwm_core.shape[1], config={"kmer": 1}
+        )
+
+    rng = np.random.default_rng(0)
+    core = rng.normal(size=(4, 8)).astype(np.float32)
+    model1 = make_pwm_model("m1", core)
+
+    plus_shifted = core[:, 2:7].copy()
+    model2_plus = make_pwm_model("m2_plus", plus_shifted)
+
+    rc_source = core[:, 1:7]
+    rc_index = np.array([3, 2, 1, 0])
+    minus_shifted = rc_source[rc_index][:, ::-1]
+    model2_minus = make_pwm_model("m2_minus", minus_shifted)
+
+    seq_rng = np.random.default_rng(1)
+    seqs = [seq_rng.integers(0, 4, size=60, dtype=np.int8) for _ in range(200)]
+    sequences = ragged_from_list(seqs, dtype=np.int8)
+
+    universal_cfg = create_comparator_config(metric="corr", search_range=8, n_permutations=0, seed=1)
+    tomtom_cfg = create_comparator_config(metric="pcc", n_permutations=0, seed=1)
+
+    res_uni_plus = strategy_universal(model1, model2_plus, sequences, universal_cfg)
+    res_tom_plus = strategy_tomtom(model1, model2_plus, sequences, tomtom_cfg)
+    assert res_uni_plus["orientation"] == "++"
+    assert res_tom_plus["orientation"] == "++"
+    assert res_uni_plus["offset"] == res_tom_plus["offset"] == 2
+
+    res_uni_minus = strategy_universal(model1, model2_minus, sequences, universal_cfg)
+    res_tom_minus = strategy_tomtom(model1, model2_minus, sequences, tomtom_cfg)
+    assert res_uni_minus["orientation"] == "+-"
+    assert res_tom_minus["orientation"] == "+-"
+    assert res_uni_minus["offset"] == res_tom_minus["offset"] == 1
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
