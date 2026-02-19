@@ -5,7 +5,8 @@ import os
 import sys
 from typing import Any, Dict
 
-from mimosa.pipeline import run_pipeline
+from mimosa.api import create_config, run_comparison
+from mimosa.comparison import create_comparator_config
 
 
 def setup_logging(verbose: bool):
@@ -453,8 +454,8 @@ def validate_inputs(args) -> None:
             sys.exit(1)
 
 
-def map_args_to_pipeline_kwargs(args) -> Dict[str, Any]:
-    """Map CLI arguments to pipeline keyword arguments."""
+def map_args_to_comparator_kwargs(args) -> Dict[str, Any]:
+    """Map CLI arguments to comparator configuration kwargs."""
     kwargs = {}
 
     if args.mode == "tomtom-like":
@@ -502,37 +503,63 @@ def map_args_to_pipeline_kwargs(args) -> Dict[str, Any]:
     return kwargs
 
 
-def run_pipeline_from_args(args) -> None:
-    """Run the pipeline with parsed arguments."""
+def build_comparison_config_from_args(args):
+    """Build unified ComparisonConfig from parsed CLI args."""
+    comparator_kwargs = map_args_to_comparator_kwargs(args)
+    comparator = create_comparator_config(**comparator_kwargs)
+
+    if args.mode == "profile":
+        return create_config(
+            model1=args.profile1,
+            model2=args.profile2,
+            model1_type="profile",
+            model2_type="profile",
+            strategy="profile",
+            seed=getattr(args, "seed", 127),
+            comparator=comparator,
+        )
+
+    model1 = args.model1
+    model2 = args.model2
+    model1_type = args.model1_type
+    model2_type = args.model2_type
+
+    sequences = getattr(args, "fasta", None)
+    promoters = getattr(args, "promoters", None)
+
+    # Motali uses sequences to build threshold tables.
+    if args.mode == "motali":
+        sequences = promoters or sequences
+
+    return create_config(
+        model1=model1,
+        model2=model2,
+        model1_type=model1_type,
+        model2_type=model2_type,
+        strategy=args.mode,
+        sequences=sequences,
+        promoters=promoters,
+        num_sequences=getattr(args, "num_sequences", 1000),
+        seq_length=getattr(args, "seq_length", 200),
+        seed=getattr(args, "seed", 127),
+        comparator=comparator,
+    )
+
+
+def run_comparison_from_args(args) -> None:
+    """Run comparison with parsed CLI arguments."""
     logger = logging.getLogger(__name__)
-    logger.info(f"Running pipeline in mode: {args.mode}")
+    logger.info(f"Running comparison in mode: {args.mode}")
 
     try:
-        if args.mode == "profile":
-            result = run_pipeline(
-                model1_path=args.profile1,
-                model2_path=args.profile2,
-                model1_type="profile",
-                model2_type="profile",
-                comparison_type=args.mode,
-                **map_args_to_pipeline_kwargs(args),
-            )
-        else:
-            result = run_pipeline(
-                model1_path=args.model1,
-                model2_path=args.model2,
-                model1_type=args.model1_type,
-                model2_type=args.model2_type,
-                comparison_type=args.mode,
-                **map_args_to_pipeline_kwargs(args),
-            )
-
-        logger.info("Pipeline completed successfully")
+        config = build_comparison_config_from_args(args)
+        result = run_comparison(config)
+        logger.info("Comparison completed successfully")
         json_string = json.dumps(result)
         print(json_string)
 
     except Exception as e:
-        logger.error(f"Pipeline execution failed: {str(e)}")
+        logger.error(f"Comparison execution failed: {str(e)}")
         raise
 
 
@@ -551,7 +578,7 @@ def main_cli():
 
     validate_inputs(args)
 
-    run_pipeline_from_args(args)
+    run_comparison_from_args(args)
 
 
 if __name__ == "__main__":

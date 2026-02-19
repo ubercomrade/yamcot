@@ -10,6 +10,7 @@ These tests validate the correctness of individual functions from:
 import numpy as np
 import pytest
 
+from mimosa.api import compare_motifs, create_config, run_comparison
 from mimosa.comparison import (
     create_comparator_config,
     strategy_motali,
@@ -364,6 +365,93 @@ def test_strategy_universal_uses_tomtom_offset_convention():
     assert res_uni_minus["orientation"] == "+-"
     assert res_tom_minus["orientation"] == "+-"
     assert res_uni_minus["offset"] == res_tom_minus["offset"] == 1
+
+
+def test_create_config_builds_unified_config():
+    """Unified config builder should create comparator config from kwargs."""
+    config = create_config(
+        model1="a.meme",
+        model2="b.pfm",
+        model1_type="pwm",
+        model2_type="pwm",
+        strategy="motif",
+        metric="co",
+        n_permutations=10,
+        seed=99,
+    )
+
+    assert config.strategy == "motif"
+    assert config.comparator.metric == "co"
+    assert config.comparator.n_permutations == 10
+    assert config.seed == 99
+
+
+def test_run_comparison_with_unified_config_and_models():
+    """run_comparison should work with preloaded GenericModel objects."""
+    representation = np.array(
+        [
+            [0.2, 0.3, 0.1],
+            [0.3, 0.2, 0.4],
+            [0.2, 0.4, 0.3],
+            [0.3, 0.1, 0.2],
+            [0.1, 0.1, 0.1],
+        ],
+        dtype=np.float32,
+    )
+    model1 = GenericModel(type_key="pwm", name="m1", representation=representation, length=3, config={"kmer": 1})
+    model2 = GenericModel(type_key="pwm", name="m2", representation=representation, length=3, config={"kmer": 1})
+    sequences = ragged_from_list(
+        [
+            np.array([0, 1, 2, 3, 2, 1, 0], dtype=np.int8),
+            np.array([1, 2, 3, 0, 1, 2], dtype=np.int8),
+        ],
+        dtype=np.int8,
+    )
+
+    config = create_config(
+        model1=model1,
+        model2=model2,
+        strategy="universal",
+        sequences=sequences,
+        metric="corr",
+        n_permutations=0,
+        seed=7,
+    )
+    result = run_comparison(config)
+
+    assert "score" in result
+    assert "offset" in result
+    assert "orientation" in result
+
+
+def test_compare_motifs_shortcut_works_with_single_import_api():
+    """compare_motifs should provide one-call high-level API."""
+    representation = np.array(
+        [
+            [0.2, 0.3, 0.1],
+            [0.3, 0.2, 0.4],
+            [0.2, 0.4, 0.3],
+            [0.3, 0.1, 0.2],
+            [0.1, 0.1, 0.1],
+        ],
+        dtype=np.float32,
+    )
+    model1 = GenericModel(type_key="pwm", name="m1", representation=representation, length=3, config={"kmer": 1})
+    model2 = GenericModel(type_key="pwm", name="m2", representation=representation, length=3, config={"kmer": 1})
+    sequences = ragged_from_list([np.array([0, 1, 2, 3, 2, 1, 0], dtype=np.int8)], dtype=np.int8)
+
+    result = compare_motifs(
+        model1=model1,
+        model2=model2,
+        strategy="universal",
+        sequences=sequences,
+        metric="co",
+        n_permutations=0,
+        seed=13,
+    )
+
+    assert result["query"] == "m1"
+    assert result["target"] == "m2"
 
 
 if __name__ == "__main__":

@@ -235,7 +235,7 @@ MIMOSA exposes a functional API. The core building blocks are:
 - `GenericModel` (`mimosa.models`) as an immutable model container.
 - `read_model(...)`, `scan_model(...)`, `get_sites(...)`, `get_pfm(...)` (`mimosa.models`) for model I/O and scanning.
 - `create_comparator_config(...)` and `compare(...)` (`mimosa.comparison`) for direct strategy execution.
-- `run_pipeline(...)` (`mimosa.pipeline`) as a high-level entry point mirroring CLI behavior.
+- `compare_motifs(...)`, `create_config(...)`, `run_comparison(...)` (`mimosa`) as high-level entry points.
 
 ### Implementing a Custom Model Type
 
@@ -308,6 +308,8 @@ class DinucStrategy:
 
     @staticmethod
     def score_bounds(model: GenericModel) -> tuple[float, float]:
+        # Approximation: valid for many practical cases, but not a strict bound
+        # for all dependency-aware models.
         rep = model.representation
         min_score = rep.min(axis=0).sum()
         max_score = rep.max(axis=0).sum()
@@ -329,6 +331,31 @@ class DinucStrategy:
         )
 ```
 
+Important: this module must be imported before calling `read_model(..., "dinuc")`
+or any comparison that relies on this model type. Registration happens at import time.
+
+```python
+from mimosa import compare_motifs
+from mimosa.io import read_fasta
+from mimosa.models import read_model
+
+# Ensure DinucStrategy registration code above has already run in this process.
+model1 = read_model("my_custom.npy", "dinuc")
+model2 = read_model("examples/pif4.meme", "pwm")
+sequences = read_fasta("examples/foreground.fa")
+
+result = compare_motifs(
+    model1=model1,
+    model2=model2,
+    strategy="motif",
+    sequences=sequences,
+    metric="co",
+    n_permutations=100,
+    seed=42,
+)
+print(result)
+```
+
 ### Strategy Contract
 
 A model strategy registered in `mimosa.models.registry` must provide:
@@ -339,6 +366,30 @@ A model strategy registered in `mimosa.models.registry` must provide:
 | `write(model, path)` | Required. Serializes model data. |
 | `score_bounds(model)` | Required for threshold table generation. |
 | `load(path, kwargs)` | Required. Builds and returns a `GenericModel`. |
+
+### Recommended: Unified Config API
+
+```python
+from mimosa import compare_motifs
+from mimosa.io import read_fasta
+from mimosa.models import read_model
+
+model1 = read_model("examples/pif4.meme", "pwm")
+model2 = read_model("examples/gata2.ihbcp", "bamm")
+sequences = read_fasta("examples/foreground.fa")
+
+result = compare_motifs(
+    model1=model1,
+    model2=model2,
+    strategy="universal",  # "universal", "tomtom", "tomtom-like", "motali", "motif"
+    sequences=sequences,
+    metric="co",
+    n_permutations=100,
+    seed=42,
+)
+
+print(result)
+```
 
 ### Example: Direct API Comparison
 
@@ -367,27 +418,6 @@ result = compare(
     strategy="universal",  # "universal", "tomtom", or "motali"
     config=config,
     sequences=sequences,
-)
-
-print(result)
-```
-
-### Example: Pipeline Wrapper
-
-```python
-from mimosa.pipeline import run_pipeline
-
-result = run_pipeline(
-    model1_path="examples/pif4.meme",
-    model2_path="examples/gata2.meme",
-    model1_type="pwm",
-    model2_type="pwm",
-    comparison_type="motif",
-    seq_source1="examples/foreground.fa",
-    seq_source2="examples/promoters.fa",
-    metric="co",
-    n_permutations=100,
-    seed=42,
 )
 
 print(result)
