@@ -299,7 +299,7 @@ def get_pfm(
             if nuc in nuc_map:
                 pfm[nuc_map[nuc], pos] += 1.0
 
-    pfm = pfm / pfm.sum(axis=0, keepdims=True)
+    pfm = (pfm + 1) / pfm.sum(axis=0, keepdims=True)
 
     model.config["_pfm"] = pfm
 
