@@ -1,4 +1,4 @@
-mimosa motif ./bamm ./pif4.meme `
+mimosa motif ./myog.ihbcp ./pif4.meme `
 --model1-type bamm `
 --model2-type pwm `
 --permutations 500 `
