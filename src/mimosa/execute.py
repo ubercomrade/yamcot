@@ -103,7 +103,7 @@ def run_motali(
     container = []
     with open(hist_path) as file:
         file.readline()
-        for i in range(3):
+        for _ in range(3):
             container.append(file.readline().strip().split())
 
     positions = np.array([int(float(i)) for i in container[0]])
