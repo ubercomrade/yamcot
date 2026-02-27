@@ -3,6 +3,7 @@ import os
 import subprocess
 from io import StringIO
 
+import numpy as np
 import pandas as pd
 
 from mimosa._core import run_motali_cpp
@@ -99,4 +100,29 @@ def run_motali(
     with open(all_path) as file:
         score = float(file.readline().strip())
 
-    return score
+    container = []
+    with open(hist_path) as file:
+        file.readline()
+        for i in range(3):
+            container.append(file.readline().strip().split())
+
+    positions = np.array([int(float(i)) for i in container[0]])
+    directed = np.array([float(i) for i in container[1][2:]])
+    inverted = np.array([float(i) for i in container[2][2:]])
+
+    condition = np.logical_and(positions <= 10, positions >= -10)
+    positions = positions[condition]
+    directed = directed[condition]
+    inverted = inverted[condition]
+
+    ind_dir_max = np.argmax(directed)
+    ind_inv_max = np.argmax(inverted)
+
+    if directed[ind_dir_max] > inverted[ind_inv_max]:
+        off = positions[ind_dir_max]
+        orient = "++"
+    else:
+        off = positions[ind_inv_max]
+        orient = "+-"
+
+    return score, off, orient

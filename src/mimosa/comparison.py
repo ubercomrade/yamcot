@@ -260,13 +260,18 @@ def strategy_tomtom(
         x2c = x2 - np.mean(x2, axis=0, keepdims=True)
         n = x1c * x2c
         d = np.sqrt(np.sum(x1c**2, axis=0)) * np.sqrt(np.sum(x2c**2, axis=0))
-        return np.where(d > 1e-9, np.sum(n, axis=0) / d, 0.0)
+        num = np.sum(n, axis=0)
+        out = np.zeros_like(num, dtype=np.float32)
+        np.divide(num, d, out=out, where=d > 1e-9)
+        return out
 
     def _vectorized_cosine(x1, x2):
         """Vectorized cosine similarity computation."""
         n = np.sum(x1 * x2, axis=0)
         d = np.linalg.norm(x1, axis=0) * np.linalg.norm(x2, axis=0)
-        return np.where(d > 1e-9, n / d, 0.0)
+        out = np.zeros_like(n, dtype=np.float32)
+        np.divide(n, d, out=out, where=d > 1e-9)
+        return out
 
     def _align(a1, a2):
         """Align two matrices and find best score."""
@@ -274,9 +279,9 @@ def strategy_tomtom(
         best_score, best_off = -np.inf, 0
         min_ov = min(L1, L2) / 2
 
-        if cfg.metric == "ed":
-            a1 = (a1 - np.mean(a1, axis=0)) / (np.std(a1, axis=0) + 1e-9)
-            a2 = (a2 - np.mean(a2, axis=0)) / (np.std(a2, axis=0) + 1e-9)
+        # if cfg.metric == "ed":
+        #     a1 = (a1 - np.mean(a1, axis=0)) / (np.std(a1, axis=0) + 1e-9)
+        #     a2 = (a2 - np.mean(a2, axis=0)) / (np.std(a2, axis=0) + 1e-9)
 
         for off in range(-(L2 - 1), L1):
             if off < 0:
@@ -407,7 +412,7 @@ def strategy_universal(
             sc, off = _fast_overlap_kernel_numba(S1.data, S1.offsets, S2.data, S2.offsets, cfg.search_range)
             return sc, off
         elif cfg.metric == "corr":
-            sc, _, off = _fast_pearson_kernel(S1.data, S1.offsets, S2.data, S2.offsets, cfg.search_range)
+            sc, off = _fast_pearson_kernel(S1.data, S1.offsets, S2.data, S2.offsets, cfg.search_range)
             return sc, off
         else:
             raise ValueError(f"Unknown metric: {cfg.metric}")
@@ -454,7 +459,7 @@ def strategy_motali(
     model1: GenericModel, model2: GenericModel, sequences: Optional[RaggedData], cfg: ComparatorConfig
 ) -> dict:
     """External Motali tool wrapper."""
-    with tempfile.TemporaryDirectory(dir=cfg.tmp_directory, ignore_cleanup_errors=True) as tmp:
+    with tempfile.TemporaryDirectory(dir=cfg.tmp_directory, ignore_cleanup_errors=True, delete=True) as tmp:
         ext_1 = ".pfm" if model1.type_key == "pwm" else ".mat"
         ext_2 = ".pfm" if model2.type_key == "pwm" else ".mat"
 
@@ -487,7 +492,7 @@ def strategy_motali(
         if fasta_path is None:
             pass
 
-        score = run_motali(
+        score, offset, orient = run_motali(
             fasta_path,
             m1_path,
             m2_path,
@@ -502,7 +507,13 @@ def strategy_motali(
             os.path.join(tmp, "sta.txt"),
         )
 
-        return {"query": model1.name, "target": model2.name, "score": score}
+        return {
+            "query": model1.name,
+            "target": model2.name,
+            "score": score,
+            "offset": int(offset),
+            "orientation": orient,
+        }
 
 
 def compare(

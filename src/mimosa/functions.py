@@ -1,6 +1,5 @@
 import numpy as np
 from numba import njit, prange
-from scipy.stats import pearsonr
 
 from mimosa.ragged import RaggedData
 
@@ -475,21 +474,26 @@ def _fast_cj_kernel_numba(data1, offsets1, data2, offsets2, search_range):
     return best_cj, best_offset
 
 
+@njit(fastmath=True, cache=True)
 def _fast_pearson_kernel(data1, offsets1, data2, offsets2, search_range):
-    """Pearson correlation kernel for RaggedData using numpy built-in functions."""
+    """Pearson correlation kernel for RaggedData with numba-compatible math."""
 
     n_seq = len(offsets1) - 1
     n_offsets = 2 * search_range + 1
 
-    correlations = np.zeros(n_offsets, dtype=np.float64)
-    pvalues = np.ones(n_offsets, dtype=np.float64)
-    valid_correlations = np.zeros(n_offsets, dtype=np.bool_)
+    best_corr = -2.0
+    best_offset = 0
+    found_valid = False
 
     for k in range(n_offsets):
         offset = k - search_range
 
-        all_x_values = []
-        all_y_values = []
+        n = 0
+        sum_x = 0.0
+        sum_y = 0.0
+        sum_xx = 0.0
+        sum_yy = 0.0
+        sum_xy = 0.0
 
         for i in range(n_seq):
             s1 = data1[offsets1[i] : offsets1[i + 1]]
@@ -507,43 +511,35 @@ def _fast_pearson_kernel(data1, offsets1, data2, offsets2, search_range):
             if overlap <= 0:
                 continue
 
-            x_vals = s1[idx1_start : idx1_start + overlap]
-            y_vals = s2[idx2_start : idx2_start + overlap]
+            for j in range(overlap):
+                x = s1[idx1_start + j]
+                y = s2[idx2_start + j]
+                n += 1
+                sum_x += x
+                sum_y += y
+                sum_xx += x * x
+                sum_yy += y * y
+                sum_xy += x * y
 
-            all_x_values.extend(x_vals)
-            all_y_values.extend(y_vals)
+        if n > 1:
+            mean_x = sum_x / n
+            mean_y = sum_y / n
+            var_x = sum_xx / n - mean_x * mean_x
+            var_y = sum_yy / n - mean_y * mean_y
 
-        if len(all_x_values) > 1:
-            x_array = np.array(all_x_values, dtype=np.float64)
-            y_array = np.array(all_y_values, dtype=np.float64)
+            if var_x > 1e-10 and var_y > 1e-10:
+                cov = sum_xy / n - mean_x * mean_y
+                corr_val = cov / np.sqrt(var_x * var_y)
 
-            if np.var(x_array) > 1e-10 and np.var(y_array) > 1e-10:
-                corr_val, pvalue = pearsonr(x_array, y_array)
-                correlations[k] = corr_val
-                pvalues[k] = pvalue
-                valid_correlations[k] = True
-            else:
-                correlations[k] = 0.0
-                pvalues[k] = 1.0
-                valid_correlations[k] = True
-
-    best_corr = -2.0
-    best_offset = 0
-    found_valid = False
-    best_pvalue = 1.0
-
-    for k in range(n_offsets):
-        if valid_correlations[k] and correlations[k] > best_corr:
-            best_corr = correlations[k]
-            best_pvalue = pvalues[k]
-            best_offset = k - search_range
-            found_valid = True
+                if corr_val > best_corr:
+                    best_corr = corr_val
+                    best_offset = offset
+                found_valid = True
 
     if not found_valid:
         best_corr = 0.0
-        best_pvalue = 1.0
 
-    return best_corr, best_pvalue, best_offset
+    return best_corr, best_offset
 
 
 def format_params(params: dict) -> str:
