@@ -1209,28 +1209,70 @@ extern "C" int run_motali_cpp(
     const char* file_sta_long
 ) {
     int i, k, mot;
-    char file_fasta_local[ARGLEN], file_model[2][ARGLEN], type_model[2][4], file_table[2][ARGLEN];
+    int ret_code = -1;
+    char file_fasta_local[ARGLEN], file_model[2][ARGLEN], type_model[2][8], file_table[2][ARGLEN];
     char file_hist_local[ARGLEN], file_prc_local[ARGLEN], file_short_all_local[ARGLEN], file_short_over_local[ARGLEN], file_sta_long_local[ARGLEN];
-    char*** seq;// peaks
-    double*** pwm;
+    char*** seq = NULL; // peaks
+    double*** pwm = NULL;
+    int* peak_len_real = NULL;
+    double** thr_all = NULL;
+    double** fpr_all = NULL;
     city sta[2];
-    int model_type[2] = { -1,-1 };// 0 pwm 1 sga
+    int model_type[2] = { -1,-1 }; // 0 pwm 1 sga
+    int seq_alloc_rows[2] = { 0, 0 };
+    int seq_alloc_cols = 0;
+    int pwm_alloc_rows[2] = { 0, 0 };
+    FILE* out_sta_long = NULL;
+    FILE* out_short_over = NULL;
+    FILE* out_short_all = NULL;
+    double pvalue_lg = 0.0;
+    int length_fasta_max = 0;
+    int nseq_real = 0;
+    int ftp = 0;
+    int olen[2] = { 0, 0 };
+    int nthr_dist[2] = { 0, 0 };
+    double min[2] = { 0,0 };
+    double raz[2] = { 0,0 };
+    double auprc_final_all[3] = { 0,0,0 };
+    double auprc_final_over[3] = { 0,0,0 };
+    double auprc_final_over1 = 0.0;
+    double auprc_final_all1 = 0.0;
+    char strand_final_all[4] = { '+', '+', '+', '\0' };
+    char strand_final_over[4] = { '+', '+', '+', '\0' };
+    double shift_final_all[3] = { 0,0,0 };
+    double shift_final_over[3] = { 0,0,0 };
+    int rec_status = 0;
 
-    // Copy input parameters to local variables
-    strcpy(file_fasta_local, file_fasta);
-    strcpy(type_model[0], type_model_1);//pwm or sga - type
-    strcpy(type_model[1], type_model_2);//pwm or sga - type
-    strcpy(file_model[0], file_model_1);//pwm or sga - matrix
-    strcpy(file_model[1], file_model_2);//pwm or sga - matrix
-    strcpy(file_table[0], file_table_1);//pwm or sga - thr err table
-    strcpy(file_table[1], file_table_2);//pwm or sga - thr err table
-    strcpy(file_hist_local, file_hist);
-    strcpy(file_prc_local, file_prc);
-    strcpy(file_short_over_local, file_short_over);
-    strcpy(file_short_all_local, file_short_all);
-    strcpy(file_sta_long_local, file_sta_long);
+    memset(file_fasta_local, '\0', sizeof(file_fasta_local));
+    memset(file_model, '\0', sizeof(file_model));
+    memset(type_model, '\0', sizeof(type_model));
+    memset(file_table, '\0', sizeof(file_table));
+    memset(file_hist_local, '\0', sizeof(file_hist_local));
+    memset(file_prc_local, '\0', sizeof(file_prc_local));
+    memset(file_short_all_local, '\0', sizeof(file_short_all_local));
+    memset(file_short_over_local, '\0', sizeof(file_short_over_local));
+    memset(file_sta_long_local, '\0', sizeof(file_sta_long_local));
 
-    double pvalue_lg = -log10(pvalue);
+    // Copy input parameters to local variables with bounds checking.
+    snprintf(file_fasta_local, sizeof(file_fasta_local), "%s", file_fasta);
+    snprintf(type_model[0], sizeof(type_model[0]), "%s", type_model_1);
+    snprintf(type_model[1], sizeof(type_model[1]), "%s", type_model_2);
+    snprintf(file_model[0], sizeof(file_model[0]), "%s", file_model_1);
+    snprintf(file_model[1], sizeof(file_model[1]), "%s", file_model_2);
+    snprintf(file_table[0], sizeof(file_table[0]), "%s", file_table_1);
+    snprintf(file_table[1], sizeof(file_table[1]), "%s", file_table_2);
+    snprintf(file_hist_local, sizeof(file_hist_local), "%s", file_hist);
+    snprintf(file_prc_local, sizeof(file_prc_local), "%s", file_prc);
+    snprintf(file_short_over_local, sizeof(file_short_over_local), "%s", file_short_over);
+    snprintf(file_short_all_local, sizeof(file_short_all_local), "%s", file_short_all);
+    snprintf(file_sta_long_local, sizeof(file_sta_long_local), "%s", file_sta_long);
+
+    if (file_fasta_local[0] == '\0' || file_model[0][0] == '\0' || file_model[1][0] == '\0') {
+        fprintf(stderr, "Error: empty input path in run_motali_cpp\n");
+        goto cleanup;
+    }
+
+    pvalue_lg = -log10(pvalue);
 
     {
         char pwm1[] = "pwm", pwm2[] = "PWM", sga1[] = "sga", sga2[] = "SGA";
@@ -1244,85 +1286,86 @@ extern "C" int run_motali_cpp(
             {
                 model_type[i] = 1;
             }
-
         }
         for (i = 0; i < 2; i++)
         {
             if (model_type[i] == -1)
             {
-                printf("Model type %d %s is not recognized\n", i + 1, type_model[i]);
-                return -1; // Changed from exit(1) to return -1
+                fprintf(stderr, "Model type %d %s is not recognized\n", i + 1, type_model[i]);
+                goto cleanup;
             }
         }
-
     }
-    int length_fasta_max = 0, nseq_real = 0;
-    seq = NULL;
-    int ftp = fasta_to_plain0(file_fasta_local, length_fasta_max, nseq_real);
+
+    ftp = fasta_to_plain0(file_fasta_local, length_fasta_max, nseq_real);
     if (ftp == -1)
     {
         fprintf(stderr, "Error: Fasta file %s error\n", file_fasta_local);
-        return -1;
+        goto cleanup;
     }
-    int* peak_len_real;
-    peak_len_real = new int[nseq_real];
-    if (peak_len_real == NULL) { fprintf(stderr, "Error: Not of memory..."); return -1; }
 
+    peak_len_real = new int[nseq_real];
+    if (peak_len_real == NULL) { fprintf(stderr, "Error: Not of memory...\n"); goto cleanup; }
+
+    seq_alloc_cols = nseq_real;
     seq = new char** [2];
-    if (seq == NULL) { fprintf(stderr, "Error: Not of memory..."); return -1; }
+    if (seq == NULL) { fprintf(stderr, "Error: Not of memory...\n"); goto cleanup; }
+    for (k = 0; k < 2; k++)seq[k] = NULL;
     for (k = 0; k < 2; k++)
     {
         seq[k] = new char* [nseq_real];
-        if (seq[k] == NULL) { fprintf(stderr, "Error: Not of memory..."); return -1; }
+        if (seq[k] == NULL) { fprintf(stderr, "Error: Not of memory...\n"); goto cleanup; }
+        for (i = 0; i < nseq_real; i++)seq[k][i] = NULL;
         for (i = 0; i < nseq_real; i++)
         {
             int length_fasta_max1 = length_fasta_max + 1;
             seq[k][i] = new char[length_fasta_max1];
-            if (seq[k][i] == NULL) { fprintf(stderr, "Error: Not of memory..."); return -1; }
+            if (seq[k][i] == NULL) { fprintf(stderr, "Error: Not of memory...\n"); goto cleanup; }
             memset(seq[k][i], '\0', length_fasta_max1);
         }
+        seq_alloc_rows[k] = nseq_real;
     }
     pwm = new double** [2];
-    if (pwm == NULL) { fprintf(stderr, "PWM Out of memory..."); return -1; }
+    if (pwm == NULL) { fprintf(stderr, "PWM Out of memory...\n"); goto cleanup; }
+    for (k = 0; k < 2; k++)pwm[k] = NULL;
     for (k = 0; k < 2; k++)
     {
         pwm[k] = new double* [MATLEN];
-        if (pwm[k] == NULL) { fprintf(stderr, "PWM Out of memory..."); return -1; }
+        if (pwm[k] == NULL) { fprintf(stderr, "PWM Out of memory...\n"); goto cleanup; }
+        for (i = 0; i < MATLEN; i++)pwm[k][i] = NULL;
         for (i = 0; i < MATLEN; i++)
         {
             pwm[k][i] = new double[OLIGNUM];
-            if (pwm[k][i] == NULL) { fprintf(stderr, "PWM Out of memory..."); return -1; }
+            if (pwm[k][i] == NULL) { fprintf(stderr, "PWM Out of memory...\n"); goto cleanup; }
         }
+        pwm_alloc_rows[k] = MATLEN;
     }
 
     ftp = fasta_to_plain1(file_fasta_local, length_fasta_max, nseq_real, seq, peak_len_real);
     if (ftp == -1)
     {
         fprintf(stderr, "File %s error 2nd stage\n", file_fasta_local);
-        return -1;
+        goto cleanup;
     }
-    int olen[2];
-    int nthr_dist[2];
-    double min[2] = { 0,0 }, raz[2] = { 0,0 };
 
-    double** thr_all;
     thr_all = new double* [2];
-    if (thr_all == NULL) { fprintf(stderr, "Thr_all Out of memory..."); return -1; }
-    double** fpr_all;
+    if (thr_all == NULL) { fprintf(stderr, "Thr_all Out of memory...\n"); goto cleanup; }
+    for (k = 0; k < 2; k++)thr_all[k] = NULL;
+
     fpr_all = new double* [2];
-    if (fpr_all == NULL) { fprintf(stderr, "Thr_all Out of memory..."); return -1; }
+    if (fpr_all == NULL) { fprintf(stderr, "Fpr_all Out of memory...\n"); goto cleanup; }
+    for (k = 0; k < 2; k++)fpr_all[k] = NULL;
+
     for (mot = 0; mot < 2; mot++)
     {
-        //printf("Mot %d\n", mot);
-        nthr_dist[mot] = 0;
-        FILE* in_tab;
-        if ((in_tab = fopen(file_table[mot], "rt")) == NULL)
+        FILE* in_tab = fopen(file_table[mot], "rt");
+        if (in_tab == NULL)
         {
-            printf("Input file %s can't be opened!", file_table[mot]);
-            return -1;
+            fprintf(stderr, "Input file %s can't be opened!\n", file_table[mot]);
+            goto cleanup;
         }
+
         char d[ARGLEN];
-        //fgets(d, sizeof(d), in_tab);//header
         while (fgets(d, sizeof(d), in_tab) != NULL)
         {
             char c = d[0];
@@ -1331,17 +1374,30 @@ extern "C" int run_motali_cpp(
             {
                 char s[30];
                 int test = UnderStol(d, 1, s, sizeof(s), sep);
-                if (test == -1) { printf("Wrong format %s\n", d); return -1; } // Changed from exit(1) to return -1
+                if (test == -1) {
+                    fprintf(stderr, "Wrong format %s\n", d);
+                    fclose(in_tab);
+                    goto cleanup;
+                }
                 nthr_dist[mot]++;
                 double fprx = atof(s);
                 if (fprx < pvalue_lg)break;
             }
         }
+
         rewind(in_tab);
         thr_all[mot] = new double[nthr_dist[mot]];
-        if (thr_all[mot] == NULL) { puts("thr_all Out of memory..."); return -1; }
+        if (thr_all[mot] == NULL) {
+            fclose(in_tab);
+            fprintf(stderr, "thr_all Out of memory...\n");
+            goto cleanup;
+        }
         fpr_all[mot] = new double[nthr_dist[mot]];
-        if (fpr_all[mot] == NULL) { puts("fpr_all Out of memory..."); return -1; }
+        if (fpr_all[mot] == NULL) {
+            fclose(in_tab);
+            fprintf(stderr, "fpr_all Out of memory...\n");
+            goto cleanup;
+        }
         k = 0;
         while (fgets(d, sizeof(d), in_tab) != NULL)
         {
@@ -1351,126 +1407,184 @@ extern "C" int run_motali_cpp(
                 char s[30];
                 char sep = '\t';
                 int test = UnderStol(d, 1, s, sizeof(s), sep);
-                if (test == -1) { printf("Wrong format %s\n", d); return -1; } // Changed from exit(1) to return -1
+                if (test == -1) {
+                    fprintf(stderr, "Wrong format %s\n", d);
+                    fclose(in_tab);
+                    goto cleanup;
+                }
                 thr_all[mot][k] = atof(d);
                 fpr_all[mot][k] = atof(s);
-                if(fpr_all[mot][k] < pvalue_lg)break;
+                if (fpr_all[mot][k] < pvalue_lg)break;
                 k++;
             }
         }
         fclose(in_tab);
     }
+
     for (mot = 0; mot < 2; mot++)
     {
-        //printf("Mot %d\n", mot);
         if (model_type[mot] == 0)
         {
             int test = pfm_to_pwm(file_model[mot], pwm[mot]);
-            if (test == -1)return -1;
-            else olen[mot] = test;
+            if (test == -1) {
+                fprintf(stderr, "Failed to parse PWM model %s\n", file_model[mot]);
+                goto cleanup;
+            }
+            olen[mot] = test;
             PWMScore(pwm[mot], min[mot], raz[mot], olen[mot]);
         }
         else
         {
             if (sta[mot].get_file(file_model[mot]) == -1)
             {
-                printf("Site %s function not found!", file_model[mot]);
-                return -1; // Changed from exit(1) to return -1
+                fprintf(stderr, "Site %s function not found!\n", file_model[mot]);
+                goto cleanup;
             }
             olen[mot] = sta[mot].len;
         }
     }
-    double auprc_final_all[3], auprc_final_over[3];
-    double auprc_final_over1 = 0, auprc_final_all1 = 0;
-    char strand_final_all[4], strand_final_over[4];
-    for (k = 0; k < 3; k++)strand_final_all[k] = strand_final_over[k] = '+';
-    strand_final_all[3] = strand_final_over[3] = '\0';
-    double shift_final_all[3] = {0,0,0}, shift_final_over[3] = { 0,0,0 };
-    for (k = 0; k < 3; k++)shift_final_all[k] = shift_final_over[k] = 0;
-    PWM_SGA_rec_real(pwm, min, raz, sta, model_type, nthr_dist, thr_all, fpr_all, seq, olen, nseq_real, shift, length_fasta_max, file_hist_local, file_prc_local, yes_out_hist, yes_out_prc,
-        auprc_final_all, auprc_final_over, auprc_final_over1, auprc_final_all1, shift_final_all, shift_final_over, strand_final_all, strand_final_over);
-    
-    // Output results to files
-    FILE* out_sta_long;
-    if ((out_sta_long = fopen(file_sta_long_local, "at")) == NULL)
+
+    rec_status = PWM_SGA_rec_real(
+        pwm,
+        min,
+        raz,
+        sta,
+        model_type,
+        nthr_dist,
+        thr_all,
+        fpr_all,
+        seq,
+        olen,
+        nseq_real,
+        shift,
+        length_fasta_max,
+        file_hist_local,
+        file_prc_local,
+        yes_out_hist,
+        yes_out_prc,
+        auprc_final_all,
+        auprc_final_over,
+        auprc_final_over1,
+        auprc_final_all1,
+        shift_final_all,
+        shift_final_over,
+        strand_final_all,
+        strand_final_over
+    );
+    if (rec_status <= 0) {
+        fprintf(stderr, "PWM_SGA_rec_real failed with code %d\n", rec_status);
+        goto cleanup;
+    }
+
+    out_sta_long = fopen(file_sta_long_local, "at");
+    if (out_sta_long == NULL)
     {
-        printf("Output file can't be opened!\n");
-        return -1; // Changed from exit(1) to return -1
+        fprintf(stderr, "Output file %s can't be opened!\n", file_sta_long_local);
+        goto cleanup;
     }
     fprintf(out_sta_long, "%s\t%s", file_model[0], file_model[1]);
     fprintf(out_sta_long, "\tOverlap\t%f", auprc_final_over1);
     fprintf(out_sta_long, "\tAll\t%f", auprc_final_all1);
     fprintf(out_sta_long, "\tHeterotypic");
-    //overap
     fprintf(out_sta_long, "\t%f", auprc_final_over[0]);
     fprintf(out_sta_long, "\t%.1f", shift_final_over[0]);
     fprintf(out_sta_long, "\t%c", strand_final_over[0]);
-    //all
     fprintf(out_sta_long, "\t%f", auprc_final_all[0]);
     fprintf(out_sta_long, "\t%.1f", shift_final_all[0]);
     fprintf(out_sta_long, "\t%c", strand_final_all[0]);
     fprintf(out_sta_long, "\tHomotypic");
-    //overap
     for (i = 1; i < 3; i++)fprintf(out_sta_long, "\t%f", auprc_final_over[i]);
     for (i = 1; i < 3; i++)fprintf(out_sta_long, "\t%.1f", shift_final_over[i]);
     fprintf(out_sta_long, "\t");
     for (i = 1; i < 3; i++)fprintf(out_sta_long, "%c", strand_final_over[i]);
-    //all
     for (i = 1; i < 3; i++)fprintf(out_sta_long, "\t%f", auprc_final_all[i]);
     for (i = 1; i < 3; i++)fprintf(out_sta_long, "\t%.1f", shift_final_all[i]);
     fprintf(out_sta_long, "\t");
     for (i = 1; i < 3; i++)fprintf(out_sta_long, "%c", strand_final_all[i]);
     fprintf(out_sta_long, "\n");
     fclose(out_sta_long);
-    
-    FILE* out_short_over;
-    if ((out_short_over = fopen(file_short_over_local, "at")) == NULL)
+    out_sta_long = NULL;
+
+    out_short_over = fopen(file_short_over_local, "at");
+    if (out_short_over == NULL)
     {
-        printf("Output file can't be opened!\n");
-        return -1; // Changed from exit(1) to return -1
+        fprintf(stderr, "Output file %s can't be opened!\n", file_short_over_local);
+        goto cleanup;
     }
     fprintf(out_short_over, "\t%f", auprc_final_over1);
     fclose(out_short_over);
+    out_short_over = NULL;
 
-    FILE* out_short_all;
-    if ((out_short_all = fopen(file_short_all_local, "at")) == NULL)
+    out_short_all = fopen(file_short_all_local, "at");
+    if (out_short_all == NULL)
     {
-        printf("Output file can't be opened!\n");
-        return -1; // Changed from exit(1) to return -1
+        fprintf(stderr, "Output file %s can't be opened!\n", file_short_all_local);
+        goto cleanup;
     }
     fprintf(out_short_all, "\t%f", auprc_final_all1);
     fclose(out_short_all);
+    out_short_all = NULL;
 
-    // Cleanup allocated memory
-    for (k = 0; k < 2; k++)
+    ret_code = 0;
+
+cleanup:
+    if (out_short_all != NULL) fclose(out_short_all);
+    if (out_short_over != NULL) fclose(out_short_over);
+    if (out_sta_long != NULL) fclose(out_sta_long);
+
+    if (thr_all != NULL)
     {
-        delete[] thr_all[k];
-    }
-    delete[] thr_all;
-    for (k = 0; k < 2; k++)
-    {
-        delete[] fpr_all[k];
-    }
-    delete[] fpr_all;
-    delete[] peak_len_real;
-    for (k = 0; k < 2; k++)
-    {
-        for (i = 0; i < nseq_real; i++)
+        for (k = 0; k < 2; k++)
         {
-            delete[] seq[k][i];
+            if (thr_all[k] != NULL) delete[] thr_all[k];
         }
-        delete[] seq[k];
+        delete[] thr_all;
     }
-    delete[] seq;
-    for (k = 0; k < 2; k++)
+    if (fpr_all != NULL)
     {
-        for (i = 0; i < MATLEN; i++)
+        for (k = 0; k < 2; k++)
         {
-            delete[] pwm[k][i];
+            if (fpr_all[k] != NULL) delete[] fpr_all[k];
         }
-        delete[] pwm[k];
+        delete[] fpr_all;
     }
-    delete[] pwm;
-    
-    return 0;
+    if (peak_len_real != NULL) delete[] peak_len_real;
+
+    if (seq != NULL)
+    {
+        for (k = 0; k < 2; k++)
+        {
+            if (seq[k] != NULL)
+            {
+                int n_rows = seq_alloc_rows[k];
+                if (n_rows == 0) n_rows = seq_alloc_cols;
+                for (i = 0; i < n_rows; i++)
+                {
+                    if (seq[k][i] != NULL) delete[] seq[k][i];
+                }
+                delete[] seq[k];
+            }
+        }
+        delete[] seq;
+    }
+
+    if (pwm != NULL)
+    {
+        for (k = 0; k < 2; k++)
+        {
+            if (pwm[k] != NULL)
+            {
+                int n_rows = pwm_alloc_rows[k];
+                if (n_rows == 0) n_rows = MATLEN;
+                for (i = 0; i < n_rows; i++)
+                {
+                    if (pwm[k][i] != NULL) delete[] pwm[k][i];
+                }
+                delete[] pwm[k];
+            }
+        }
+        delete[] pwm;
+    }
+
+    return ret_code;
 }

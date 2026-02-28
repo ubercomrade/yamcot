@@ -267,6 +267,18 @@ def create_arg_parser() -> argparse.ArgumentParser:
 
     motali_group.add_argument("model1", help="Path to the first motif model file.")
     motali_group.add_argument("model2", help="Path to the second motif model file.")
+    motali_group.add_argument(
+        "--err",
+        type=float,
+        default=0.002,
+        help="Expected recognition rate (ERR) cutoff used by Motali threshold table trimming. (default: %(default)s)",
+    )
+    motali_group.add_argument(
+        "--shift",
+        type=int,
+        default=50,
+        help="Maximum motif-center shift considered by Motali. (default: %(default)s)",
+    )
 
     motali_io_group = motali_parser.add_argument_group("Input/Output Options")
     motali_io_group.add_argument(
@@ -470,7 +482,14 @@ def map_args_to_comparator_kwargs(args) -> Dict[str, Any]:
             }
         )
     elif args.mode == "motali":
-        kwargs.update({"fasta_path": getattr(args, "fasta", None), "tmp_directory": getattr(args, "tmp_dir", ".")})
+        kwargs.update(
+            {
+                "fasta_path": getattr(args, "fasta", None),
+                "tmp_directory": getattr(args, "tmp_dir", "."),
+                "motali_err": getattr(args, "err", 0.002),
+                "motali_shift": getattr(args, "shift", 50),
+            }
+        )
     elif args.mode == "motif":
         kwargs.update(
             {

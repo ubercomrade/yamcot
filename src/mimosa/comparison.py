@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from dataclasses import field as dc_field
 from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
@@ -57,9 +58,11 @@ class ComparatorConfig:
     min_kernel_size: int = 3
     max_kernel_size: int = 11
 
-    motali_threshold: float = 0.95
+    motali_err: float = 0.002
+    motali_shift: int = 50
     tmp_directory: str = "."
     fasta_path: Optional[str] = None
+    promoters: Optional[RaggedData] = dc_field(default=None, compare=False, hash=False, repr=False)
 
 
 def create_comparator_config(**kwargs) -> ComparatorConfig:
@@ -67,6 +70,14 @@ def create_comparator_config(**kwargs) -> ComparatorConfig:
 
     if "motali_tmp_dir" in kwargs and "tmp_directory" not in kwargs:
         kwargs["tmp_directory"] = kwargs.pop("motali_tmp_dir")
+    if "motali_pvalue" in kwargs and "motali_err" not in kwargs:
+        kwargs["motali_err"] = kwargs.pop("motali_pvalue")
+    elif "motali_pvalue" in kwargs:
+        kwargs.pop("motali_pvalue")
+    if "motali_threshold" in kwargs and "motali_err" not in kwargs:
+        kwargs["motali_err"] = kwargs.pop("motali_threshold")
+    elif "motali_threshold" in kwargs:
+        kwargs.pop("motali_threshold")
 
     defaults = {
         "metric": "pcc",
@@ -79,7 +90,8 @@ def create_comparator_config(**kwargs) -> ComparatorConfig:
         "search_range": 10,
         "min_kernel_size": 3,
         "max_kernel_size": 11,
-        "motali_threshold": 0.95,
+        "motali_err": 0.002,
+        "motali_shift": 50,
         "tmp_directory": ".",
     }
 
@@ -389,7 +401,10 @@ def strategy_tomtom(
 
 @registry.register("universal")
 def strategy_universal(
-    model1: GenericModel, model2: GenericModel, sequences: RaggedData, cfg: ComparatorConfig
+    model1: GenericModel,
+    model2: GenericModel,
+    sequences: RaggedData,
+    cfg: ComparatorConfig,
 ) -> dict:
     """RaggedData-based comparison strategy (CJ/CO/Corr)."""
     if sequences is None:
@@ -456,9 +471,16 @@ def strategy_universal(
 
 @registry.register("motali")
 def strategy_motali(
-    model1: GenericModel, model2: GenericModel, sequences: Optional[RaggedData], cfg: ComparatorConfig
+    model1: GenericModel,
+    model2: GenericModel,
+    sequences: Optional[RaggedData],
+    cfg: ComparatorConfig,
 ) -> dict:
     """External Motali tool wrapper."""
+    threshold_sequences = cfg.promoters if cfg.promoters is not None else sequences
+    if threshold_sequences is None:
+        raise ValueError("Motali strategy requires 'promoters' or 'sequences' for threshold table calculation.")
+
     with tempfile.TemporaryDirectory(dir=cfg.tmp_directory, ignore_cleanup_errors=True, delete=True) as tmp:
         ext_1 = ".pfm" if model1.type_key == "pwm" else ".mat"
         ext_2 = ".pfm" if model2.type_key == "pwm" else ".mat"
@@ -476,8 +498,8 @@ def strategy_motali(
         write_model(model1, m1_path)
         write_model(model2, m2_path)
 
-        dist1 = calculate_threshold_table(model1, sequences)
-        dist2 = calculate_threshold_table(model2, sequences)
+        dist1 = calculate_threshold_table(model1, threshold_sequences)
+        dist2 = calculate_threshold_table(model2, threshold_sequences)
         min_1, max_1 = get_score_bounds(model1)
         min_2, max_2 = get_score_bounds(model2)
 
@@ -490,7 +512,7 @@ def strategy_motali(
             write_fasta(sequences, fasta_path)
 
         if fasta_path is None:
-            pass
+            raise ValueError("Motali strategy requires 'sequences' or comparator.fasta_path for FASTA input.")
 
         score, offset, orient = run_motali(
             fasta_path,
@@ -505,6 +527,8 @@ def strategy_motali(
             os.path.join(tmp, "prc_pass.txt"),
             os.path.join(tmp, "hist_pass.txt"),
             os.path.join(tmp, "sta.txt"),
+            shift=cfg.motali_shift,
+            err=cfg.motali_err,
         )
 
         return {
@@ -530,4 +554,5 @@ def compare(
         available = list(registry._strategies.keys())
         raise ValueError(f"Strategy '{strategy}' not found. Available: {available}")
 
-    return strategy_fn(model1, model2, sequences, config)
+    effective_config = config if promoters is None else replace(config, promoters=promoters)
+    return strategy_fn(model1, model2, sequences, effective_config)

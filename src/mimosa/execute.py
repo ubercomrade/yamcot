@@ -61,7 +61,20 @@ def run_tomtom(motifs_1, motifs_2):
 
 
 def run_motali(
-    fasta_path, motif_1, motif_2, type_1, type_2, dist_1, dist_2, overlap_path, all_path, prc_path, hist_path, sta_path
+    fasta_path,
+    motif_1,
+    motif_2,
+    type_1,
+    type_2,
+    dist_1,
+    dist_2,
+    overlap_path,
+    all_path,
+    prc_path,
+    hist_path,
+    sta_path,
+    shift: int = 50,
+    err: float = 0.002,
 ):
     """
     Run motali comparison using either the C++ extension or subprocess fallback.
@@ -82,8 +95,8 @@ def run_motali(
         file_model_2=motif_2,
         file_table_1=dist_1,
         file_table_2=dist_2,
-        shift=50,
-        threshold=0.002,
+        shift=shift,
+        threshold=err,
         file_hist=hist_path,
         yes_out_hist=1,
         file_prc=prc_path,

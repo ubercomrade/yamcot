@@ -1,5 +1,12 @@
 import os
 import tempfile
+from pathlib import Path
+
+import pytest
+
+from mimosa import compare_motifs
+from mimosa.io import read_fasta
+from mimosa.models import PwmStrategy
 
 
 def test_c_module_import():
@@ -69,6 +76,37 @@ def test_c_function_return_type():
     # Instead of checking signature (which doesn't work with nanobind),
     # just verify the function exists and is callable
     assert callable(run_motali_cpp)
+
+
+def test_motali_no_fd_leak_on_repeated_calls(tmp_path):
+    """Repeated Motali calls should not leak file descriptors."""
+    fd_dir = Path("/proc/self/fd")
+    if not fd_dir.exists():
+        pytest.skip("FD leak check requires /proc/self/fd (Linux only).")
+
+    root = Path(__file__).resolve().parent.parent
+    examples_dir = root / "examples"
+
+    model1 = PwmStrategy.load(str(examples_dir / "pif4.meme"), {"index": 0})
+    model2 = PwmStrategy.load(str(examples_dir / "gata2.meme"), {"index": 0})
+    sequences = read_fasta(examples_dir / "foreground.fa")
+    promoters = read_fasta(examples_dir / "background.fa")
+
+    before = len(list(fd_dir.iterdir()))
+
+    for _ in range(20):
+        result = compare_motifs(
+            model1=model1,
+            model2=model2,
+            strategy="motali",
+            sequences=sequences,
+            promoters=promoters,
+            tmp_directory=str(tmp_path),
+        )
+        assert "score" in result
+
+    after = len(list(fd_dir.iterdir()))
+    assert after - before < 8, f"Potential FD leak detected: before={before}, after={after}"
 
 
 if __name__ == "__main__":

@@ -65,6 +65,7 @@ int pfm_to_pwm(char *file_pfm, double **mat)
 			else
 			{
 				printf("Reading errorin Cisbp/Homer matrix file %s !\n",file_pfm);
+				fclose(in_pfm);
 				return -1;
 			}
 		}
@@ -126,5 +127,6 @@ int pfm_to_pwm(char *file_pfm, double **mat)
 			mat[i][j]=log10(ves)-vych;
 		}			
 	}
+	fclose(in_pfm);
 	return olen;
 }
