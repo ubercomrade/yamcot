@@ -85,8 +85,8 @@ def create_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.4,
         help=(
-            "Distortion level (0.0-1.0) applied to kernels during surrogate data generation. "
-            "Higher values increase variance in the null model. Used for cj and co options. "
+            "Mixing coefficient (0.0-1.0) between identity and random smoothed kernels "
+            "during surrogate generation. Higher values produce stronger perturbations. "
             "(default: %(default)s)"
         ),
     )
@@ -101,8 +101,8 @@ def create_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help=(
-            "Minimum kernel size for convolution during surrogate generation. "
-            "Used for cj and co options. (default: %(default)s)"
+            "Minimum kernel size sampled for surrogate convolution. "
+            "Range must include at least one odd value. (default: %(default)s)"
         ),
     )
     profile_group.add_argument(
@@ -110,8 +110,8 @@ def create_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=11,
         help=(
-            "Maximum kernel size for convolution during surrogate generation. "
-            "Used for cj and co options. (default: %(default)s)"
+            "Maximum kernel size sampled for surrogate convolution. "
+            "Range must include at least one odd value. (default: %(default)s)"
         ),
     )
 
@@ -206,8 +206,8 @@ def create_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.4,
         help=(
-            "Distortion level (0.0-1.0) applied to kernels during surrogate data generation. "
-            "Higher values increase variance in the null model. Used for cj and co options. "
+            "Mixing coefficient (0.0-1.0) between identity and random smoothed kernels "
+            "during surrogate generation. Higher values produce stronger perturbations. "
             "(default: %(default)s)"
         ),
     )
@@ -222,8 +222,8 @@ def create_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help=(
-            "Minimum kernel size for convolution during surrogate generation. "
-            "Used for cj and co options. (default: %(default)s)"
+            "Minimum kernel size sampled for surrogate convolution. "
+            "Range must include at least one odd value. (default: %(default)s)"
         ),
     )
     motif_group.add_argument(
@@ -231,8 +231,8 @@ def create_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=11,
         help=(
-            "Maximum kernel size for convolution during surrogate generation. "
-            "Used for cj and co options. (default: %(default)s)"
+            "Maximum kernel size sampled for surrogate convolution. "
+            "Range must include at least one odd value. (default: %(default)s)"
         ),
     )
 
@@ -435,6 +435,22 @@ def validate_inputs(args) -> None:
     """Validate input files and parameters."""
     logger = logging.getLogger(__name__)
 
+    def validate_kernel_size_range(min_kernel_size: int, max_kernel_size: int) -> None:
+        """Validate kernel-size bounds used by surrogate generation."""
+        if min_kernel_size <= 0 or max_kernel_size <= 0:
+            logger.error("Kernel sizes must be positive integers.")
+            sys.exit(1)
+        if min_kernel_size > max_kernel_size:
+            logger.error(
+                f"Invalid kernel-size range: min-kernel-size ({min_kernel_size}) must be <= max-kernel-size "
+                f"({max_kernel_size})."
+            )
+            sys.exit(1)
+        first_odd = min_kernel_size if min_kernel_size % 2 == 1 else min_kernel_size + 1
+        if first_odd > max_kernel_size:
+            logger.error("Kernel-size range must include at least one odd value.")
+            sys.exit(1)
+
     if args.mode == "profile":
         if not os.path.exists(args.profile1):
             logger.error(f"Profile file not found: {args.profile1}")
@@ -442,6 +458,7 @@ def validate_inputs(args) -> None:
         if not os.path.exists(args.profile2):
             logger.error(f"Profile file not found: {args.profile2}")
             sys.exit(1)
+        validate_kernel_size_range(args.min_kernel_size, args.max_kernel_size)
 
     elif args.mode in ["motif", "motali"]:
         if not os.path.exists(args.model1):
@@ -456,6 +473,8 @@ def validate_inputs(args) -> None:
         if args.promoters and not os.path.exists(args.promoters):
             logger.error(f"Promoter threshold file not found: {args.promoters}")
             sys.exit(1)
+        if args.mode == "motif":
+            validate_kernel_size_range(args.min_kernel_size, args.max_kernel_size)
 
     elif args.mode == "tomtom-like":
         if not os.path.exists(args.model1):

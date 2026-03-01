@@ -101,15 +101,16 @@ This design preserves the Tomtom-style matrix comparison logic [22], while enabl
 
 #### Null Hypothesis and Surrogate Generation
 
-To estimate the statistical significance (p-values) of observed similarity scores, MIMOSA employs a **Surrogate Null Model**. Unlike simple permutations that destroy local dependencies, our tool generates synthetic "surrogate" profiles that preserve the marginal properties and biological plausibility (smoothness) of the original data.
+To estimate the statistical significance (p-values) of observed similarity scores, MIMOSA employs a **Surrogate Null Model**.
 
-1. **Convolutional Distortion**: For profile-based surrogates, a sophisticated distortion logic is applied:
-    * **Kernel Selection**: A base kernel (smooth, edge, or double-peak) is selected to represent typical profile features.
-    * **Controlled Perturbation**: Noise and gradient bias are added to introduce variation while maintaining structural integrity.
-    * **Smoothing**: Convolution ensures the surrogate remains biologically realistic.
-    * **Convex Combination**: The final surrogate is a blend of the identity kernel and the distorted kernel, controlled by a user-defined distortion parameter.
+1. **Convolutional Distortion** (for `profile` and `motif` modes): surrogate profiles are built as follows:
+    * **Odd kernel-size sampling**: kernel size is sampled within [`min_kernel_size`, `max_kernel_size`] from odd values.
+    * **Random kernel draw**: kernel coefficients are sampled from a normal distribution and smoothed with a short filter.
+    * **Identity mixing**: the random kernel is mixed with an identity (delta) kernel using the distortion coefficient `alpha` (`--distortion`), where `alpha=0` keeps identity and `alpha=1` gives fully random distortion.
+    * **Optional sign flip**: the final kernel can be negated with probability 0.5.
+    * **Segment-wise convolution**: each ragged sequence segment is convolved independently, then converted back to frequency space.
 
-2. **Permutation**: For matrix-based comparisons (`tomtom-like`), the tool performs random column-wise permutations.
+2. **Permutation**: for matrix-based comparisons (`tomtom-like`), the tool performs random column-wise permutations.
    For $R$ permutations, the empirical p-value is computed as:
    $$
    p = \frac{1 + \sum_{r=1}^{R} \mathbf{1}[S_r \ge S_{\text{obs}}]}{R + 1}
@@ -194,8 +195,8 @@ mimosa profile scores_1.fasta scores_2.fasta \
 | `--permutations` | Integer | Number of permutations for p-value calculation (default: 0). |
 | `--distortion` | Float | Distortion level (0.0-1.0) for surrogate generation (default: 0.4). |
 | `--search-range` | Integer | Maximum offset range to explore when aligning profiles (default: 10). |
-| `--min-kernel-size` | Integer | Minimum kernel size for surrogate convolution (default: 3). |
-| `--max-kernel-size` | Integer | Maximum kernel size for surrogate convolution (default: 11). |
+| `--min-kernel-size` | Integer | Minimum kernel size for surrogate convolution (range must contain an odd value) (default: 3). |
+| `--max-kernel-size` | Integer | Maximum kernel size for surrogate convolution (range must contain an odd value) (default: 11). |
 | `--seed` | Integer | Global random seed for reproducibility. |
 | `--jobs` | Integer | Number of parallel jobs (-1 uses all cores) (default: -1). |
 | `-v`, `--verbose` | Flag | Enable verbose logging. |
@@ -209,7 +210,7 @@ Compare motifs by scanning sequences with models and comparing the resulting pro
 
 ```bash
 # in the `examples` directory
-mimosa foxa2.meme gata4.meme \
+mimosa motif foxa2.meme gata4.meme \
   --model1-type pwm \
   --model2-type pwm \
   --fasta examples/foreground.fa \
@@ -234,8 +235,11 @@ mimosa foxa2.meme gata4.meme \
 | `--permutations` | Integer | Number of permutations (default: 0). |
 | `--distortion` | Float | Distortion level (default: 0.4). |
 | `--search-range` | Integer | Maximum alignment offset (default: 10). |
+| `--min-kernel-size` | Integer | Minimum kernel size for surrogate convolution (range must contain an odd value) (default: 3). |
+| `--max-kernel-size` | Integer | Maximum kernel size for surrogate convolution (range must contain an odd value) (default: 11). |
 | `--seed` | Integer | Global random seed. |
 | `--jobs` | Integer | Number of parallel jobs (default: -1). |
+| `-v`, `--verbose` | Flag | Enable verbose logging. |
 
 ### `motali` mode
 
@@ -266,7 +270,7 @@ mimosa motali sitega_gata2.mat gata2.meme \
 | `--promoters` | Path | FASTA file with promoter sequences (Required for thresholds). |
 | `--num-sequences` | Integer | Number of random sequences (default: 10000). |
 | `--seq-length` | Integer | Length of random sequences (default: 200). |
-| `--tmp-dir` | Path | Directory for temporary files (default: `/tmp`). |
+| `--tmp-dir` | Path | Directory for temporary files (default: `.`). |
 
 ### `tomtom-like` mode
 

@@ -239,6 +239,19 @@ def test_create_comparator_config():
     assert config.seed == 42
 
 
+def test_create_comparator_config_validates_kernel_range():
+    """Kernel-size range should be valid for centered surrogate kernels."""
+    with pytest.raises(ValueError, match="min_kernel_size"):
+        create_comparator_config(min_kernel_size=7, max_kernel_size=5)
+
+    with pytest.raises(ValueError, match="at least one odd value"):
+        create_comparator_config(min_kernel_size=4, max_kernel_size=4)
+
+    config = create_comparator_config(min_kernel_size=4, max_kernel_size=6)
+    assert config.min_kernel_size == 4
+    assert config.max_kernel_size == 6
+
+
 def test_comparison_registry():
     """Test comparison registry functionality"""
     # Test that we can get registered strategies

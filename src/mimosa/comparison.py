@@ -97,6 +97,21 @@ def create_comparator_config(**kwargs) -> ComparatorConfig:
 
     config_params = {**defaults, **kwargs}
 
+    min_kernel_size = int(config_params["min_kernel_size"])
+    max_kernel_size = int(config_params["max_kernel_size"])
+    if min_kernel_size <= 0 or max_kernel_size <= 0:
+        raise ValueError("Kernel sizes must be positive integers.")
+    if min_kernel_size > max_kernel_size:
+        raise ValueError(
+            f"min_kernel_size ({min_kernel_size}) must be less than or equal to max_kernel_size ({max_kernel_size})."
+        )
+    first_odd = min_kernel_size if min_kernel_size % 2 == 1 else min_kernel_size + 1
+    if first_odd > max_kernel_size:
+        raise ValueError(
+            "Kernel size range must include at least one odd value, "
+            "because surrogate convolution uses centered kernels."
+        )
+
     return ComparatorConfig(**config_params)
 
 
@@ -106,9 +121,11 @@ def _create_surrogate_ragged(frequencies: RaggedData, rng: np.random.Generator, 
     data = frequencies.data
     offsets = frequencies.offsets
 
-    kernel_size = int(rng.integers(cfg.min_kernel_size, cfg.max_kernel_size + 1))
-    if kernel_size % 2 == 0:
-        kernel_size += 1
+    min_kernel_size = int(cfg.min_kernel_size)
+    max_kernel_size = int(cfg.max_kernel_size)
+    first_odd = min_kernel_size if min_kernel_size % 2 == 1 else min_kernel_size + 1
+    n_odd = ((max_kernel_size - first_odd) // 2) + 1
+    kernel_size = int(first_odd + 2 * int(rng.integers(0, n_odd)))
     center = kernel_size // 2
 
     # identity δ

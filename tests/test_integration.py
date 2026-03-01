@@ -369,6 +369,24 @@ def test_profile_comparison_basic(examples_dir, temp_dir):
         assert key in output, f"Missing key '{key}' in output"
 
 
+def test_profile_comparison_invalid_kernel_range(examples_dir, temp_dir):
+    """Profile mode should fail fast when kernel range contains no odd size."""
+    cmd = [
+        "mimosa",
+        "profile",
+        str(examples_dir / "scores_1.fasta"),
+        str(examples_dir / "scores_2.fasta"),
+        "--min-kernel-size",
+        "4",
+        "--max-kernel-size",
+        "4",
+    ]
+
+    result = run_cli(cmd)
+    assert result.returncode != 0, "Should fail with invalid kernel-size range"
+    assert "odd value" in result.stderr.lower(), "Should mention odd kernel-size requirement"
+
+
 def test_pipeline_with_missing_files():
     """Test pipeline behavior with missing input files."""
     cmd = [
