@@ -101,7 +101,7 @@ def create_comparator_config(**kwargs) -> ComparatorConfig:
 
 
 def _create_surrogate_ragged(frequencies: RaggedData, rng: np.random.Generator, cfg: ComparatorConfig) -> RaggedData:
-    """Unified surrogate generation logic (extracted from Data/Universal comparators)."""
+    """Surrogate generation: random kernel + delta-spike at a random offset, then smoothing + normalization."""
 
     data = frequencies.data
     offsets = frequencies.offsets
@@ -111,45 +111,35 @@ def _create_surrogate_ragged(frequencies: RaggedData, rng: np.random.Generator, 
         kernel_size += 1
     center = kernel_size // 2
 
-    kernel_types = ["smooth", "edge", "double_peak"]
-    k_type = str(rng.choice(kernel_types))
-
+    # identity δ
     identity_kernel = np.zeros(kernel_size, dtype=np.float32)
     identity_kernel[center] = 1.0
 
-    if k_type == "smooth":
-        x = np.linspace(-3, 3, kernel_size)
-        base = np.exp(-0.5 * x**2).astype(np.float32)
-    elif k_type == "edge":
-        base = np.zeros(kernel_size, dtype=np.float32)
-        base[max(center - 1, 0)] = -1.0
-        base[min(center + 1, kernel_size - 1)] = 1.0
-    elif k_type == "double_peak":
-        base = np.zeros(kernel_size, dtype=np.float32)
-        base[0] = 0.5
-        base[-1] = 0.5
-        base[center] = -1.0
-    else:
-        base = identity_kernel.copy()
+    # distortion strength (kept as before; gives you a knob)
+    alpha = float(np.clip(cfg.distortion_level, 0.0, 1.0))
 
-    noise = rng.normal(0, 1, size=kernel_size).astype(np.float32)
-    slope = float(rng.uniform(-1.0, 1.0)) * cfg.distortion_level * 2.0
-    gradient = np.linspace(-slope, slope, kernel_size).astype(np.float32)
+    # --- 1) random kernel (optionally with smaller sigma so the spike matters) ---
+    sigma = 1.0  # <- tune: smaller => spike dominates more
+    kernel = rng.normal(0.0, sigma, size=kernel_size).astype(np.float32)
 
-    distorted_kernel = base + cfg.distortion_level * noise + gradient
-
+    # --- 2) smooth the kernel for biological plausibility ---
     if kernel_size >= 3:
         smooth_filter = np.array([0.25, 0.5, 0.25], dtype=np.float32)
-        distorted_kernel = np.convolve(distorted_kernel, smooth_filter, mode="same")
+        kernel = np.convolve(kernel, smooth_filter, mode="same").astype(np.float32)
 
-    distorted_kernel /= np.linalg.norm(distorted_kernel) + 1e-8
+    # --- 3) normalize (L2) to stabilize scale across surrogates ---
+    kernel /= np.linalg.norm(kernel) + 1e-8
 
-    alpha = max(0.0, min(1.0, cfg.distortion_level))
-    final_kernel = (1.0 - alpha) * identity_kernel + alpha * distorted_kernel
+    # --- 4) (optional but recommended) mix with identity to control distortion ---
+    final_kernel = (1.0 - alpha) * identity_kernel + alpha * kernel
+
+    # (optional) allow negative correlations
     if rng.uniform() < 0.5:
         final_kernel = -final_kernel
+
     final_kernel /= np.linalg.norm(final_kernel) + 1e-8
 
+    # apply convolution per ragged segment
     convolved = np.empty_like(data, dtype=np.float32)
     for i in range(len(offsets) - 1):
         start = int(offsets[i])
@@ -160,7 +150,6 @@ def _create_surrogate_ragged(frequencies: RaggedData, rng: np.random.Generator, 
         convolved[start:end] = convolve1d(segment, final_kernel, axis=0, mode="constant", cval=0.0).astype(np.float32)
 
     convolved_ragged = RaggedData(data=convolved, offsets=offsets)
-
     return scores_to_frequencies(convolved_ragged)
 
 
