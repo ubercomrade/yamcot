@@ -66,18 +66,7 @@ class ComparatorConfig:
 
 
 def create_comparator_config(**kwargs) -> ComparatorConfig:
-    """Factory function for creating ComparatorConfig with backward compatibility."""
-
-    if "motali_tmp_dir" in kwargs and "tmp_directory" not in kwargs:
-        kwargs["tmp_directory"] = kwargs.pop("motali_tmp_dir")
-    if "motali_pvalue" in kwargs and "motali_err" not in kwargs:
-        kwargs["motali_err"] = kwargs.pop("motali_pvalue")
-    elif "motali_pvalue" in kwargs:
-        kwargs.pop("motali_pvalue")
-    if "motali_threshold" in kwargs and "motali_err" not in kwargs:
-        kwargs["motali_err"] = kwargs.pop("motali_threshold")
-    elif "motali_threshold" in kwargs:
-        kwargs.pop("motali_threshold")
+    """Factory function for creating ComparatorConfig."""
 
     defaults = {
         "metric": "pcc",
@@ -223,8 +212,8 @@ class ComparatorRegistry:
 registry = ComparatorRegistry()
 
 
-@registry.register("tomtom")
-def strategy_tomtom(
+@registry.register("motif")
+def strategy_motif(
     model1: GenericModel,
     model2: GenericModel,
     sequences: Optional[RaggedData],
@@ -326,27 +315,6 @@ def strategy_tomtom(
                 best_score, best_off = sc, off
         return best_score, best_off
 
-    def _matrix_shuffle(matrix: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-        """
-        Shuffle columns and optionally rows (values) in the original multidimensional matrix.
-        """
-
-        shuffled = matrix.copy()
-
-        pos_indices = np.arange(shuffled.shape[-1])
-        rng.shuffle(pos_indices)
-        shuffled = shuffled[..., pos_indices]
-
-        if cfg.permute_rows:
-            alphabet_size = shuffled.shape[0]
-
-            perm = rng.permutation(alphabet_size)
-
-            for axis in range(shuffled.ndim - 1):
-                shuffled = np.take(shuffled, perm, axis=axis)
-
-        return shuffled
-
     use_pfm_mode = cfg.pfm_mode or (model1.type_key != model2.type_key)
     if use_pfm_mode:
         if sequences is None:
@@ -405,20 +373,26 @@ def strategy_tomtom(
     return result
 
 
-@registry.register("universal")
-def strategy_universal(
+@registry.register("profile")
+def strategy_profile(
     model1: GenericModel,
     model2: GenericModel,
-    sequences: RaggedData,
+    sequences: Optional[RaggedData],
     cfg: ComparatorConfig,
 ) -> dict:
     """RaggedData-based comparison strategy (CJ/CO/Corr)."""
-    if sequences is None:
-        raise ValueError("Universal strategy requires 'sequences' argument.")
 
-    freq1_plus = scan_model(model1, sequences, "+")
-    freq2_plus = scan_model(model2, sequences, "+")
-    freq2_minus = scan_model(model2, sequences, "-")
+    def resolve_scores(model: GenericModel, strand: str) -> RaggedData:
+        """Resolve an input model to positional scores."""
+        if model.type_key == "scores":
+            return scan_model(model, None, strand)
+        if sequences is None:
+            raise ValueError("Profile strategy requires sequences when comparing motif models.")
+        return scan_model(model, sequences, strand)
+
+    freq1_plus = resolve_scores(model1, "+")
+    freq2_plus = resolve_scores(model2, "+")
+    freq2_minus = resolve_scores(model2, "-")
 
     freq1_plus = scores_to_frequencies(freq1_plus)
     freq2_plus = scores_to_frequencies(freq2_plus)

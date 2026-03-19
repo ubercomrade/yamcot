@@ -1,63 +1,8 @@
 import logging
-import os
-import subprocess
-from io import StringIO
 
 import numpy as np
-import pandas as pd
 
 from mimosa._core import run_motali_cpp
-
-
-def run_prosampler(foreground_path, background_path, output_dir, motif_length, number_of_motifs):
-    """Run ProSampler and write results to the output directory."""
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    args = [
-        "ProSampler",
-        "-i",
-        foreground_path,
-        "-b",
-        background_path,
-        "-k",
-        f"{motif_length}",
-        "-l",
-        "0",
-        "-m",
-        f"{number_of_motifs}",
-        "-z",
-        "0",
-        "-t",
-        "4",
-        "-w",
-        "2",
-        "-o",
-        f"{output_dir}/motifs",
-    ]
-    logger = logging.getLogger(__name__)
-    logger.debug(" ".join(args))
-    stdout = subprocess.run(args, shell=False, capture_output=True)
-    logger.debug(stdout)
-    return 0
-
-
-def run_tomtom(motifs_1, motifs_2):
-    """Run TomTom and return the top match as a dictionary."""
-    args = ["tomtom", motifs_1, motifs_2, "-thresh", "1", "-text"]
-
-    logger = logging.getLogger(__name__)
-    logger.debug(" ".join(args))
-
-    stdout = subprocess.run(args, shell=False, capture_output=True)
-
-    logger.debug(stdout)
-
-    table = pd.read_csv(StringIO(stdout.stdout.decode()), sep="\t", comment="#")
-    table = table[["Query_ID", "Target_ID", "p-value", "Overlap", "Orientation"]]
-    table.columns = ["query", "target", "p-value", "overlap", "orientation"]
-    table = table.reset_index(drop=True)
-
-    return table.iloc[0].to_dict()
 
 
 def run_motali(

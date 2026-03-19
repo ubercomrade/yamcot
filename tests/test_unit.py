@@ -14,8 +14,8 @@ from mimosa.api import compare_motifs, create_config, run_comparison
 from mimosa.comparison import (
     create_comparator_config,
     strategy_motali,
-    strategy_tomtom,
-    strategy_universal,
+    strategy_motif,
+    strategy_profile,
 )
 from mimosa.comparison import registry as comparison_registry
 from mimosa.functions import (
@@ -31,6 +31,7 @@ from mimosa.functions import (
     scores_to_frequencies,
     standardized_pauc,
 )
+from mimosa.io import read_scores
 from mimosa.models import (
     GenericModel,
     get_frequencies,
@@ -192,6 +193,18 @@ def test_scores_to_frequencies_basic():
     assert freq_result.offsets.shape == ragged_scores.offsets.shape
 
 
+def test_read_scores_basic(tmp_path):
+    """Numerical score profiles should be parsed from FASTA-like input."""
+    path = tmp_path / "scores.fasta"
+    path.write_text(">seq1\n0.1 0.2 0.3\n>seq2\n1.0 2.0\n", encoding="utf-8")
+
+    result = read_scores(path)
+
+    assert result.num_sequences == 2
+    np.testing.assert_allclose(result.get_slice(0), np.array([0.1, 0.2, 0.3], dtype=np.float32))
+    np.testing.assert_allclose(result.get_slice(1), np.array([1.0, 2.0], dtype=np.float32))
+
+
 def test_format_params_basic():
     """Test basic parameter formatting"""
     params = {"k": 3, "metric": "pcc", "n_perm": 1000}
@@ -255,11 +268,11 @@ def test_create_comparator_config_validates_kernel_range():
 def test_comparison_registry():
     """Test comparison registry functionality"""
     # Test that we can get registered strategies
-    tomtom_strategy = comparison_registry.get("tomtom")
-    assert tomtom_strategy is not None
+    motif_strategy = comparison_registry.get("motif")
+    assert motif_strategy is not None
 
-    universal_strategy = comparison_registry.get("universal")
-    assert universal_strategy is not None
+    profile_strategy = comparison_registry.get("profile")
+    assert profile_strategy is not None
 
     motali_strategy = comparison_registry.get("motali")
     assert motali_strategy is not None
@@ -333,13 +346,13 @@ def test_batch_all_scores_with_simple_data():
 def test_strategy_functions_exist():
     """Test that all strategy functions are properly defined"""
     # Test that strategy functions exist and are callable
-    assert callable(strategy_tomtom)
-    assert callable(strategy_universal)
+    assert callable(strategy_motif)
+    assert callable(strategy_profile)
     assert callable(strategy_motali)
 
 
-def test_strategy_universal_uses_tomtom_offset_convention():
-    """Universal strategy should report offsets in the same direction as TomTom."""
+def test_strategy_profile_uses_motif_offset_convention():
+    """Profile strategy should report offsets in the same direction as motif mode."""
 
     def make_pwm_model(name: str, pwm_core: np.ndarray) -> GenericModel:
         n_row = np.min(pwm_core, axis=0, keepdims=True)
@@ -367,17 +380,17 @@ def test_strategy_universal_uses_tomtom_offset_convention():
     universal_cfg = create_comparator_config(metric="corr", search_range=8, n_permutations=0, seed=1)
     tomtom_cfg = create_comparator_config(metric="pcc", n_permutations=0, seed=1)
 
-    res_uni_plus = strategy_universal(model1, model2_plus, sequences, universal_cfg)
-    res_tom_plus = strategy_tomtom(model1, model2_plus, sequences, tomtom_cfg)
-    assert res_uni_plus["orientation"] == "++"
-    assert res_tom_plus["orientation"] == "++"
-    assert res_uni_plus["offset"] == res_tom_plus["offset"] == 2
+    res_profile_plus = strategy_profile(model1, model2_plus, sequences, universal_cfg)
+    res_motif_plus = strategy_motif(model1, model2_plus, sequences, tomtom_cfg)
+    assert res_profile_plus["orientation"] == "++"
+    assert res_motif_plus["orientation"] == "++"
+    assert res_profile_plus["offset"] == res_motif_plus["offset"] == 2
 
-    res_uni_minus = strategy_universal(model1, model2_minus, sequences, universal_cfg)
-    res_tom_minus = strategy_tomtom(model1, model2_minus, sequences, tomtom_cfg)
-    assert res_uni_minus["orientation"] == "+-"
-    assert res_tom_minus["orientation"] == "+-"
-    assert res_uni_minus["offset"] == res_tom_minus["offset"] == 1
+    res_profile_minus = strategy_profile(model1, model2_minus, sequences, universal_cfg)
+    res_motif_minus = strategy_motif(model1, model2_minus, sequences, tomtom_cfg)
+    assert res_profile_minus["orientation"] == "+-"
+    assert res_motif_minus["orientation"] == "+-"
+    assert res_profile_minus["offset"] == res_motif_minus["offset"] == 1
 
 
 def test_create_config_builds_unified_config():
@@ -387,13 +400,13 @@ def test_create_config_builds_unified_config():
         model2="b.pfm",
         model1_type="pwm",
         model2_type="pwm",
-        strategy="motif",
+        strategy="profile",
         metric="co",
         n_permutations=10,
         seed=99,
     )
 
-    assert config.strategy == "motif"
+    assert config.strategy == "profile"
     assert config.comparator.metric == "co"
     assert config.comparator.n_permutations == 10
     assert config.seed == 99
@@ -424,7 +437,7 @@ def test_run_comparison_with_unified_config_and_models():
     config = create_config(
         model1=model1,
         model2=model2,
-        strategy="universal",
+        strategy="profile",
         sequences=sequences,
         metric="corr",
         n_permutations=0,
@@ -456,7 +469,7 @@ def test_compare_motifs_shortcut_works_with_single_import_api():
     result = compare_motifs(
         model1=model1,
         model2=model2,
-        strategy="universal",
+        strategy="profile",
         sequences=sequences,
         metric="co",
         n_permutations=0,

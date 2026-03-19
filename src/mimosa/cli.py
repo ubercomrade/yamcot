@@ -8,8 +8,12 @@ from typing import Any, Dict
 from mimosa.api import create_config, run_comparison
 from mimosa.comparison import create_comparator_config
 
+PROFILE_MODEL_TYPES = ["scores", "pwm", "bamm", "sitega"]
+MOTIF_MODEL_TYPES = ["pwm", "bamm", "sitega"]
+MOTALI_MODEL_TYPES = ["pwm", "sitega"]
 
-def setup_logging(verbose: bool):
+
+def setup_logging(verbose: bool) -> None:
     """Setup logging configuration."""
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -20,258 +24,243 @@ def setup_logging(verbose: bool):
 def create_arg_parser() -> argparse.ArgumentParser:
     """Create and configure argument parser with subcommands."""
     parser = argparse.ArgumentParser(
-        description=("MIMOSA: Compare motifs using three distinct approaches - profile, motif, and tomtom-like"),
+        description="MIMOSA: Compare motifs in `profile`, `motif`, and `motali` modes.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
- Examples:
-   # Profile-based comparison
-   mimosa profile scores_1.fasta scores_2.fasta \\
-     --metric corr --permutations 1000 --distortion 0.5
+Examples:
+  # Compare precomputed score profiles directly
+  mimosa profile scores_1.fasta scores_2.fasta \
+    --model1-type scores --model2-type scores --metric corr
 
-   # Motif-based comparison with PWM models
-   mimosa motif model1.meme model2.pfm --model1-type pwm --model2-type pwm \\
-     --fasta sequences.fa --metric co --permutations 1000 \\
-     --distortion 0.3
+  # Compare motifs through sequence-derived profiles
+  mimosa profile model1.meme model2.ihbcp \
+    --model1-type pwm --model2-type bamm \
+    --fasta sequences.fa --metric co --permutations 1000
 
-   # Motif-based comparison with BAMM models
-   mimosa motif model1.hbcp model2.ihbcp --model1-type bamm --model2-type bamm \\
-     --fasta sequences.fa --promoters promoters.fa --search-range 15 \\
-     --min-kernel-size 5 --max-kernel-size 15 --jobs 4 --seed 42
+  # Direct motif comparison (former tomtom-like mode)
+  mimosa motif model1.meme model2.pfm \
+    --model1-type pwm --model2-type pwm \
+    --metric pcc --permutations 1000 --permute-rows
 
-   # Motali comparison with SiteGA models
-   mimosa motali model1.mat model2.meme --model1-type sitega --model2-type pwm \\
-     --fasta sequences.fa --promoters promoters.fa \\
-     --tmp-dir . --num-sequences 5000 --seq-length 150
-
-   # TomTom-like comparison with PWM models
-   mimosa tomtom-like model1.meme model2.pfm --model1-type pwm --model2-type pwm \\
-     --metric pcc --permutations 1000 --permute-rows \\
-     --jobs 8 --seed 123
-
-   # TomTom-like comparison with BAMM models using PFM mode
-   mimosa tomtom-like model1.hbcp model2.ihbcp --model1-type bamm --model2-type bamm \\
-     --pfm-mode --num-sequences 10000 --seq-length 120 --metric ed \\
-     --permutations 500 --permute-rows
-         """,
+  # Motali comparison
+  mimosa motali model1.mat model2.meme \
+    --model1-type sitega --model2-type pwm \
+    --fasta sequences.fa --promoters promoters.fa
+        """,
     )
 
     subparsers = parser.add_subparsers(dest="mode", help="Operation mode", required=True)
 
-    profile_parser = subparsers.add_parser(
-        "profile", help="Compare motifs based on pre-calculated score profiles (uses DataComparator engine)."
-    )
-    profile_parser.add_argument("profile1", help="Path to the first profile file containing pre-calculated scores.")
-    profile_parser.add_argument("profile2", help="Path to the second profile file containing pre-calculated scores.")
+    _add_profile_parser(subparsers)
+    _add_motif_parser(subparsers)
+    _add_motali_parser(subparsers)
 
-    profile_group = profile_parser.add_argument_group("Profile Comparator Options")
-    profile_group.add_argument(
-        "--metric",
-        choices=["cj", "co", "corr"],
-        default="cj",
-        help=(
-            "Similarity metric for comparing frequency profiles. "
-            "Choices: cj (Continuous Jaccard), co (Continuous Overlap), "
-            "corr (Pearson Correlation). (default: %(default)s)"
-        ),
-    )
-    profile_group.add_argument(
-        "--permutations",
-        type=int,
-        default=0,
-        help="Number of permutations to perform for p-value calculation. (default: %(default)s)",
-    )
-    profile_group.add_argument(
-        "--distortion",
-        type=float,
-        default=0.4,
-        help=(
-            "Mixing coefficient (0.0-1.0) between identity and random smoothed kernels "
-            "during surrogate generation. Higher values produce stronger perturbations. "
-            "(default: %(default)s)"
-        ),
-    )
-    profile_group.add_argument(
-        "--search-range",
-        type=int,
-        default=10,
-        help="Maximum offset (shift) range to explore when aligning profiles. (default: %(default)s)",
-    )
-    profile_group.add_argument(
-        "--min-kernel-size",
-        type=int,
-        default=3,
-        help=(
-            "Minimum kernel size sampled for surrogate convolution. "
-            "Range must include at least one odd value. (default: %(default)s)"
-        ),
-    )
-    profile_group.add_argument(
-        "--max-kernel-size",
-        type=int,
-        default=11,
-        help=(
-            "Maximum kernel size sampled for surrogate convolution. "
-            "Range must include at least one odd value. (default: %(default)s)"
-        ),
-    )
+    return parser
 
-    profile_technical_group = profile_parser.add_argument_group("Technical Options")
-    profile_technical_group.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable verbose logging to standard output for detailed execution tracking.",
-    )
-    profile_technical_group.add_argument(
-        "--seed",
-        type=int,
-        default=127,
-        help=(
-            "Set a global random seed for reproducible results in stochastic operations "
-            "(e.g., permutations, surrogate generation). (default: %(default)s)"
-        ),
-    )
-    profile_technical_group.add_argument(
-        "--jobs",
-        type=int,
-        default=-1,
-        help="Number of parallel jobs to run. Set to -1 to use all available CPU cores. (default: %(default)s)",
-    )
 
-    motif_parser = subparsers.add_parser(
-        "motif", help="Compare motifs by calculating scores derived from scanning sequences with models."
+def _add_profile_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Add the profile mode parser."""
+    parser = subparsers.add_parser(
+        "profile",
+        help="Compare motifs via score profiles: either precomputed scores or profiles generated from motif scans.",
     )
-    motif_parser.add_argument("model1", help="Path to the first motif model file.")
-    motif_parser.add_argument("model2", help="Path to the second motif model file.")
+    parser.add_argument("model1", help="Path to the first input model or score-profile file.")
+    parser.add_argument("model2", help="Path to the second input model or score-profile file.")
 
-    motif_io_group = motif_parser.add_argument_group("Input/Output Options")
-    motif_io_group.add_argument(
+    io_group = parser.add_argument_group("Input Options")
+    io_group.add_argument(
         "--model1-type",
-        choices=["pwm", "bamm", "sitega"],
+        choices=PROFILE_MODEL_TYPES,
         required=True,
-        help="Format of the first model. Choices: pwm, bamm, sitega.",
+        help="Format of the first input. Choices: scores, pwm, bamm, sitega.",
     )
-    motif_io_group.add_argument(
+    io_group.add_argument(
         "--model2-type",
-        choices=["pwm", "bamm", "sitega"],
+        choices=PROFILE_MODEL_TYPES,
         required=True,
-        help="Format of the second model. Choices: pwm, bamm, sitega.",
+        help="Format of the second input. Choices: scores, pwm, bamm, sitega.",
     )
-    motif_io_group.add_argument(
+    io_group.add_argument(
         "--fasta",
         help=(
-            "Path to a FASTA file containing target sequences for comparison. "
-            "If omitted, random sequences are generated."
+            "Path to FASTA sequences used to scan motif inputs. "
+            "If omitted and motif scanning is required, random sequences are generated."
         ),
     )
-    motif_io_group.add_argument(
-        "--promoters",
-        help=(
-            "Path to a FASTA file containing promoter sequences, required for "
-            "calculating threshold tables in Motali comparisons."
-        ),
-    )
-    motif_io_group.add_argument(
+    io_group.add_argument(
         "--num-sequences",
         type=int,
         default=1000,
-        help="Number of random sequences to generate if --fasta is not provided. (default: %(default)s)",
+        help="Number of random sequences to generate when motif scanning is required. (default: %(default)s)",
     )
-    motif_io_group.add_argument(
+    io_group.add_argument(
         "--seq-length",
         type=int,
         default=200,
-        help="Length of each random sequence to generate if --fasta is not provided. (default: %(default)s)",
+        help="Length of random sequences generated for motif scanning. (default: %(default)s)",
     )
 
-    motif_group = motif_parser.add_argument_group("Motif Comparator Options")
-    motif_group.add_argument(
+    profile_group = parser.add_argument_group("Profile Comparison Options")
+    profile_group.add_argument(
         "--metric",
         choices=["cj", "co", "corr"],
         default="cj",
+        help="Profile similarity metric. Choices: cj, co, corr. (default: %(default)s)",
+    )
+    profile_group.add_argument(
+        "--permutations",
+        type=int,
+        default=0,
+        help="Number of permutations for p-value estimation. (default: %(default)s)",
+    )
+    profile_group.add_argument(
+        "--distortion",
+        type=float,
+        default=0.4,
+        help="Surrogate-profile distortion level in the 0.0-1.0 range. (default: %(default)s)",
+    )
+    profile_group.add_argument(
+        "--search-range",
+        type=int,
+        default=10,
+        help="Maximum alignment offset explored between profiles. (default: %(default)s)",
+    )
+    profile_group.add_argument(
+        "--min-kernel-size",
+        type=int,
+        default=3,
+        help="Minimum surrogate convolution kernel size. (default: %(default)s)",
+    )
+    profile_group.add_argument(
+        "--max-kernel-size",
+        type=int,
+        default=11,
+        help="Maximum surrogate convolution kernel size. (default: %(default)s)",
+    )
+
+    technical_group = parser.add_argument_group("Technical Options")
+    technical_group.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging.",
+    )
+    technical_group.add_argument(
+        "--seed",
+        type=int,
+        default=127,
+        help="Global random seed for reproducible stochastic steps. (default: %(default)s)",
+    )
+    technical_group.add_argument(
+        "--jobs",
+        type=int,
+        default=-1,
+        help="Number of parallel jobs. Use -1 for all cores. (default: %(default)s)",
+    )
+
+
+def _add_motif_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Add the motif mode parser."""
+    parser = subparsers.add_parser(
+        "motif",
+        help="Compare motifs directly by aligning their matrix or tensor representations.",
+    )
+    parser.add_argument("model1", help="Path to the first motif model file.")
+    parser.add_argument("model2", help="Path to the second motif model file.")
+
+    io_group = parser.add_argument_group("Input Options")
+    io_group.add_argument(
+        "--model1-type",
+        choices=MOTIF_MODEL_TYPES,
+        required=True,
+        help="Format of the first motif. Choices: pwm, bamm, sitega.",
+    )
+    io_group.add_argument(
+        "--model2-type",
+        choices=MOTIF_MODEL_TYPES,
+        required=True,
+        help="Format of the second motif. Choices: pwm, bamm, sitega.",
+    )
+    io_group.add_argument(
+        "--fasta",
         help=(
-            "Similarity metric for comparing frequency profiles. "
-            "Choices: cj (Continuous Jaccard), co (Continuous Overlap), "
-            "corr (Pearson Correlation). (default: %(default)s)"
+            "Optional FASTA sequences used for PFM reconstruction. "
+            "If omitted when reconstruction is required, random sequences are generated."
         ),
+    )
+    io_group.add_argument(
+        "--num-sequences",
+        type=int,
+        default=20000,
+        help="Number of random sequences to generate for PFM reconstruction. (default: %(default)s)",
+    )
+    io_group.add_argument(
+        "--seq-length",
+        type=int,
+        default=100,
+        help="Length of random sequences for PFM reconstruction. (default: %(default)s)",
+    )
+
+    motif_group = parser.add_argument_group("Motif Comparison Options")
+    motif_group.add_argument(
+        "--metric",
+        choices=["pcc", "ed", "cosine"],
+        default="pcc",
+        help="Column-wise comparison metric. Choices: pcc, ed, cosine. (default: %(default)s)",
     )
     motif_group.add_argument(
         "--permutations",
         type=int,
         default=0,
-        help="Number of permutations to perform for p-value calculation. (default: %(default)s)",
+        help="Number of Monte Carlo permutations for p-value estimation. (default: %(default)s)",
     )
     motif_group.add_argument(
-        "--distortion",
-        type=float,
-        default=0.4,
-        help=(
-            "Mixing coefficient (0.0-1.0) between identity and random smoothed kernels "
-            "during surrogate generation. Higher values produce stronger perturbations. "
-            "(default: %(default)s)"
-        ),
+        "--permute-rows",
+        action="store_true",
+        help="Shuffle matrix rows in addition to positions during permutation testing.",
     )
     motif_group.add_argument(
-        "--search-range",
-        type=int,
-        default=10,
-        help="Maximum offset (shift) range to explore when aligning profiles. (default: %(default)s)",
-    )
-    motif_group.add_argument(
-        "--min-kernel-size",
-        type=int,
-        default=3,
-        help=(
-            "Minimum kernel size sampled for surrogate convolution. "
-            "Range must include at least one odd value. (default: %(default)s)"
-        ),
-    )
-    motif_group.add_argument(
-        "--max-kernel-size",
-        type=int,
-        default=11,
-        help=(
-            "Maximum kernel size sampled for surrogate convolution. "
-            "Range must include at least one odd value. (default: %(default)s)"
-        ),
+        "--pfm-mode",
+        action="store_true",
+        help="Force sequence-driven PFM reconstruction before direct motif comparison.",
     )
 
-    motif_technical_group = motif_parser.add_argument_group("Technical Options")
-    motif_technical_group.add_argument(
+    technical_group = parser.add_argument_group("Technical Options")
+    technical_group.add_argument(
         "-v",
         "--verbose",
         action="store_true",
-        help="Enable verbose logging to standard output for detailed execution tracking.",
+        help="Enable verbose logging.",
     )
-    motif_technical_group.add_argument(
+    technical_group.add_argument(
         "--seed",
         type=int,
         default=127,
-        help=(
-            "Set a global random seed for reproducible results in stochastic operations "
-            "(e.g., permutations, surrogate generation). (default: %(default)s)"
-        ),
+        help="Global random seed for reproducible stochastic steps. (default: %(default)s)",
     )
-    motif_technical_group.add_argument(
+    technical_group.add_argument(
         "--jobs",
         type=int,
         default=-1,
-        help="Number of parallel jobs to run. Set to -1 to use all available CPU cores. (default: %(default)s)",
+        help="Number of parallel jobs. Use -1 for all cores. (default: %(default)s)",
     )
 
-    motali_parser = subparsers.add_parser(
-        "motali", help="Compare motifs by calculating PRC AUC derived from scanning sequences with models."
+
+def _add_motali_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Add the motali mode parser."""
+    parser = subparsers.add_parser(
+        "motali",
+        help="Compare motifs with the Motali scoring workflow.",
     )
+    parser.add_argument("model1", help="Path to the first motif model file.")
+    parser.add_argument("model2", help="Path to the second motif model file.")
 
-    motali_group = motali_parser.add_argument_group("Motali Options")
-
-    motali_group.add_argument("model1", help="Path to the first motif model file.")
-    motali_group.add_argument("model2", help="Path to the second motif model file.")
+    motali_group = parser.add_argument_group("Motali Options")
     motali_group.add_argument(
         "--err",
         type=float,
         default=0.002,
-        help="Expected recognition rate (ERR) cutoff used by Motali threshold table trimming. (default: %(default)s)",
+        help="Expected recognition rate cutoff used by Motali. (default: %(default)s)",
     )
     motali_group.add_argument(
         "--shift",
@@ -280,155 +269,52 @@ def create_arg_parser() -> argparse.ArgumentParser:
         help="Maximum motif-center shift considered by Motali. (default: %(default)s)",
     )
 
-    motali_io_group = motali_parser.add_argument_group("Input/Output Options")
-    motali_io_group.add_argument(
+    io_group = parser.add_argument_group("Input Options")
+    io_group.add_argument(
         "--model1-type",
-        choices=["pwm", "sitega"],
+        choices=MOTALI_MODEL_TYPES,
         required=True,
-        help="Format of the first model. Choices: pwm, bamm, sitega.",
+        help="Format of the first motif. Choices: pwm, sitega.",
     )
-    motali_io_group.add_argument(
+    io_group.add_argument(
         "--model2-type",
-        choices=["pwm", "sitega"],
+        choices=MOTALI_MODEL_TYPES,
         required=True,
-        help="Format of the second model. Choices: pwm, bamm, sitega.",
+        help="Format of the second motif. Choices: pwm, sitega.",
     )
-    motali_io_group.add_argument(
+    io_group.add_argument(
         "--fasta",
-        help=(
-            "Path to a FASTA file containing target sequences for comparison. "
-            "If omitted, random sequences are generated."
-        ),
+        help="Path to FASTA sequences used in the Motali comparison. Random sequences are generated if omitted.",
     )
-    motali_io_group.add_argument(
+    io_group.add_argument(
         "--promoters",
-        help=(
-            "Path to a FASTA file containing promoter sequences, required for "
-            "calculating threshold tables in Motali comparisons."
-        ),
+        help="Path to FASTA promoter sequences used for threshold-table calculation.",
     )
-    motali_io_group.add_argument(
+    io_group.add_argument(
         "--num-sequences",
         type=int,
         default=10000,
-        help="Number of random sequences to generate if --fasta is not provided. (default: %(default)s)",
+        help="Number of random sequences to generate when --fasta is omitted. (default: %(default)s)",
     )
-    motali_io_group.add_argument(
+    io_group.add_argument(
         "--seq-length",
         type=int,
         default=200,
-        help="Length of each random sequence to generate if --fasta is not provided. (default: %(default)s)",
+        help="Length of random sequences generated when --fasta is omitted. (default: %(default)s)",
     )
-
-    motali_io_group.add_argument(
+    io_group.add_argument(
         "--tmp-dir",
         default=".",
-        help=(
-            "Directory path for storing temporary intermediate files generated "
-            "during Motali execution. (default: %(default)s)"
-        ),
+        help="Directory for temporary Motali intermediate files. (default: %(default)s)",
     )
 
-    motali_technical_group = motali_parser.add_argument_group("Technical Options")
-    motali_technical_group.add_argument(
+    technical_group = parser.add_argument_group("Technical Options")
+    technical_group.add_argument(
         "-v",
         "--verbose",
         action="store_true",
-        help="Enable verbose logging to standard output for detailed execution tracking.",
+        help="Enable verbose logging.",
     )
-
-    tomtom_parser = subparsers.add_parser(
-        "tomtom-like", help="Compare motifs by direct matrix comparison (uses TomTomComparator engine)."
-    )
-    tomtom_parser.add_argument("model1", help="Path to the first motif model file.")
-    tomtom_parser.add_argument("model2", help="Path to the second motif model file.")
-
-    tomtom_io_group = tomtom_parser.add_argument_group("Input/Output Options")
-    tomtom_io_group.add_argument(
-        "--model1-type",
-        choices=["pwm", "bamm", "sitega"],
-        required=True,
-        help="Format of the first model. Choices: pwm, bamm, sitega.",
-    )
-    tomtom_io_group.add_argument(
-        "--model2-type",
-        choices=["pwm", "bamm", "sitega"],
-        required=True,
-        help="Format of the second model. Choices: pwm, bamm, sitega.",
-    )
-
-    tomtom_options_group = tomtom_parser.add_argument_group("TomTom Options")
-    tomtom_options_group.add_argument(
-        "--metric",
-        choices=["pcc", "ed", "cosine"],
-        default="pcc",
-        help=(
-            "Metric for column-wise motif comparison. "
-            "Choices: pcc (Pearson Correlation Coefficient), ed (Euclidean Distance), "
-            "cosine (Cosine Similarity). (default: %(default)s)"
-        ),
-    )
-    tomtom_options_group.add_argument(
-        "--permutations",
-        type=int,
-        default=0,
-        help="Number of Monte Carlo permutations for p-value estimation. (default: %(default)s)",
-    )
-    tomtom_options_group.add_argument(
-        "--permute-rows",
-        action="store_true",
-        help=(
-            "If set, shuffles values within columns during permutation, destroying "
-            "nucleotide dependencies. Default behavior shuffles only columns (positions)."
-        ),
-    )
-    tomtom_options_group.add_argument(
-        "--pfm-mode",
-        action="store_true",
-        help=(
-            "If set, a Position Frequency Matrix (PFM) is derived for the model motifs "
-            "by scanning sequences and constructing the PFM based on the top 5% of "
-            "predicted binding sites"
-        ),
-    )
-
-    tomtom_options_group.add_argument(
-        "--num-sequences",
-        type=int,
-        default=20000,
-        help="Number of random sequences to generate if --pfm-mode is used. (default: %(default)s)",
-    )
-    tomtom_options_group.add_argument(
-        "--seq-length",
-        type=int,
-        default=100,
-        help="Length of each random sequence to generate if --pfm-mode is used. (default: %(default)s)",
-    )
-
-    tomtom_technical_group = tomtom_parser.add_argument_group("Technical Options")
-    tomtom_technical_group.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable verbose logging to standard output for detailed execution tracking.",
-    )
-    tomtom_technical_group.add_argument(
-        "--seed",
-        type=int,
-        default=127,
-        help=(
-            "Set a global random seed for reproducible results in stochastic operations "
-            "(e.g., permutations, surrogate generation). (default: %(default)s)"
-        ),
-    )
-    tomtom_technical_group.add_argument(
-        "--jobs",
-        type=int,
-        default=-1,
-        help="Number of parallel jobs to run. Set to -1 to use all available CPU cores. (default: %(default)s)",
-    )
-
-    return parser
 
 
 def validate_inputs(args) -> None:
@@ -442,8 +328,9 @@ def validate_inputs(args) -> None:
             sys.exit(1)
         if min_kernel_size > max_kernel_size:
             logger.error(
-                f"Invalid kernel-size range: min-kernel-size ({min_kernel_size}) must be <= max-kernel-size "
-                f"({max_kernel_size})."
+                "Invalid kernel-size range: min-kernel-size (%s) must be <= max-kernel-size (%s).",
+                min_kernel_size,
+                max_kernel_size,
             )
             sys.exit(1)
         first_odd = min_kernel_size if min_kernel_size % 2 == 1 else min_kernel_size + 1
@@ -451,129 +338,76 @@ def validate_inputs(args) -> None:
             logger.error("Kernel-size range must include at least one odd value.")
             sys.exit(1)
 
+    def validate_file(path: str, label: str) -> None:
+        """Validate that a required input file exists."""
+        if not os.path.exists(path):
+            logger.error("%s not found: %s", label, path)
+            sys.exit(1)
+
+    validate_file(args.model1, "Input file")
+    validate_file(args.model2, "Input file")
+
+    if getattr(args, "fasta", None):
+        validate_file(args.fasta, "FASTA file")
+
+    if getattr(args, "promoters", None):
+        validate_file(args.promoters, "Promoter FASTA file")
+
     if args.mode == "profile":
-        if not os.path.exists(args.profile1):
-            logger.error(f"Profile file not found: {args.profile1}")
-            sys.exit(1)
-        if not os.path.exists(args.profile2):
-            logger.error(f"Profile file not found: {args.profile2}")
-            sys.exit(1)
         validate_kernel_size_range(args.min_kernel_size, args.max_kernel_size)
-
-    elif args.mode in ["motif", "motali"]:
-        if not os.path.exists(args.model1):
-            logger.error(f"Model file not found: {args.model1}")
-            sys.exit(1)
-        if not os.path.exists(args.model2):
-            logger.error(f"Model file not found: {args.model2}")
-            sys.exit(1)
-        if args.fasta and not os.path.exists(args.fasta):
-            logger.error(f"FASTA file not found: {args.fasta}")
-            sys.exit(1)
-        if args.promoters and not os.path.exists(args.promoters):
-            logger.error(f"Promoter threshold file not found: {args.promoters}")
-            sys.exit(1)
-        if args.mode == "motif":
-            validate_kernel_size_range(args.min_kernel_size, args.max_kernel_size)
-
-    elif args.mode == "tomtom-like":
-        if not os.path.exists(args.model1):
-            logger.error(f"Model file not found: {args.model1}")
-            sys.exit(1)
-        if not os.path.exists(args.model2):
-            logger.error(f"Model file not found: {args.model2}")
-            sys.exit(1)
 
 
 def map_args_to_comparator_kwargs(args) -> Dict[str, Any]:
     """Map CLI arguments to comparator configuration kwargs."""
-    kwargs = {}
+    if args.mode == "profile":
+        return {
+            "metric": args.metric,
+            "n_permutations": args.permutations,
+            "distortion_level": args.distortion,
+            "n_jobs": args.jobs,
+            "seed": args.seed,
+            "search_range": args.search_range,
+            "min_kernel_size": args.min_kernel_size,
+            "max_kernel_size": args.max_kernel_size,
+        }
 
-    if args.mode == "tomtom-like":
-        kwargs.update(
-            {
-                "metric": getattr(args, "metric", "pcc"),
-                "n_permutations": getattr(args, "permutations", 1000),
-                "permute_rows": getattr(args, "permute_rows", False),
-                "n_jobs": getattr(args, "jobs", -1),
-                "seed": getattr(args, "seed", None),
-                "pfm_mode": getattr(args, "pfm_mode", False),
-            }
-        )
-    elif args.mode == "motali":
-        kwargs.update(
-            {
-                "fasta_path": getattr(args, "fasta", None),
-                "tmp_directory": getattr(args, "tmp_dir", "."),
-                "motali_err": getattr(args, "err", 0.002),
-                "motali_shift": getattr(args, "shift", 50),
-            }
-        )
-    elif args.mode == "motif":
-        kwargs.update(
-            {
-                "metric": getattr(args, "metric", "cj"),
-                "n_permutations": getattr(args, "permutations", 1000),
-                "distortion_level": getattr(args, "distortion", 0.4),
-                "n_jobs": getattr(args, "jobs", -1),
-                "permute_rows": getattr(args, "permute_rows", False),
-                "pfm_mode": getattr(args, "pfm_mode", False),
-                "seed": getattr(args, "seed", None),
-                "search_range": getattr(args, "search_range", 10),
-                "min_kernel_size": getattr(args, "min_kernel_size", 3),
-                "max_kernel_size": getattr(args, "max_kernel_size", 11),
-            }
-        )
-    elif args.mode == "profile":
-        kwargs.update(
-            {
-                "metric": getattr(args, "metric", "cj"),
-                "n_permutations": getattr(args, "permutations", 1000),
-                "distortion_level": getattr(args, "distortion", 0.4),
-                "n_jobs": getattr(args, "jobs", -1),
-                "seed": getattr(args, "seed", None),
-                "search_range": getattr(args, "search_range", 10),
-                "min_kernel_size": getattr(args, "min_kernel_size", 3),
-                "max_kernel_size": getattr(args, "max_kernel_size", 11),
-            }
-        )
+    if args.mode == "motif":
+        return {
+            "metric": args.metric,
+            "n_permutations": args.permutations,
+            "permute_rows": args.permute_rows,
+            "n_jobs": args.jobs,
+            "seed": args.seed,
+            "pfm_mode": args.pfm_mode,
+        }
 
-    return kwargs
+    if args.mode == "motali":
+        return {
+            "fasta_path": args.fasta,
+            "tmp_directory": args.tmp_dir,
+            "motali_err": args.err,
+            "motali_shift": args.shift,
+        }
+
+    return {}
 
 
 def build_comparison_config_from_args(args):
-    """Build unified ComparisonConfig from parsed CLI args."""
+    """Build ComparisonConfig from parsed CLI args."""
     comparator_kwargs = map_args_to_comparator_kwargs(args)
     comparator = create_comparator_config(**comparator_kwargs)
-
-    if args.mode == "profile":
-        return create_config(
-            model1=args.profile1,
-            model2=args.profile2,
-            model1_type="profile",
-            model2_type="profile",
-            strategy="profile",
-            seed=getattr(args, "seed", 127),
-            comparator=comparator,
-        )
-
-    model1 = args.model1
-    model2 = args.model2
-    model1_type = args.model1_type
-    model2_type = args.model2_type
 
     sequences = getattr(args, "fasta", None)
     promoters = getattr(args, "promoters", None)
 
-    # Motali uses sequences to build threshold tables.
     if args.mode == "motali":
         sequences = promoters or sequences
 
     return create_config(
-        model1=model1,
-        model2=model2,
-        model1_type=model1_type,
-        model2_type=model2_type,
+        model1=args.model1,
+        model2=args.model2,
+        model1_type=args.model1_type,
+        model2_type=args.model2_type,
         strategy=args.mode,
         sequences=sequences,
         promoters=promoters,
@@ -587,23 +421,20 @@ def build_comparison_config_from_args(args):
 def run_comparison_from_args(args) -> None:
     """Run comparison with parsed CLI arguments."""
     logger = logging.getLogger(__name__)
-    logger.info(f"Running comparison in mode: {args.mode}")
+    logger.info("Running comparison in mode: %s", args.mode)
 
     try:
         config = build_comparison_config_from_args(args)
         result = run_comparison(config)
         logger.info("Comparison completed successfully")
-        json_string = json.dumps(result)
-        print(json_string)
-
-    except Exception as e:
-        logger.error(f"Comparison execution failed: {str(e)}")
+        print(json.dumps(result))
+    except Exception as exc:
+        logger.error("Comparison execution failed: %s", exc)
         raise
 
 
-def main_cli():
+def main_cli() -> None:
     """Main CLI entry point."""
-
     parser = create_arg_parser()
 
     if len(sys.argv) == 1:
@@ -611,11 +442,8 @@ def main_cli():
         sys.exit(1)
 
     args = parser.parse_args()
-
     setup_logging(args.verbose)
-
     validate_inputs(args)
-
     run_comparison_from_args(args)
 
 

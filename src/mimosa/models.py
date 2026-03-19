@@ -26,7 +26,15 @@ import numpy as np
 import pandas as pd
 
 from mimosa.functions import batch_all_scores, pfm_to_pwm, scores_to_frequencies
-from mimosa.io import parse_file_content, read_bamm, read_fasta, read_meme, read_pfm, read_sitega, write_sitega
+from mimosa.io import (
+    parse_file_content,
+    read_bamm,
+    read_meme,
+    read_pfm,
+    read_scores,
+    read_sitega,
+    write_sitega,
+)
 from mimosa.ragged import RaggedData
 
 StrandMode = Literal["best", "+", "-"]
@@ -93,7 +101,7 @@ class ModelRegistry:
 registry = ModelRegistry()
 
 
-def scan_model(model: GenericModel, sequences: RaggedData, strand: Optional[StrandMode] = None) -> RaggedData:
+def scan_model(model: GenericModel, sequences: Optional[RaggedData], strand: Optional[StrandMode] = None) -> RaggedData:
     """Universal scanning function that dispatches to the appropriate strategy."""
     strategy_cls = registry.get(model.type_key)
     strand_mode = strand or model.config.get("strand_mode", "best")
@@ -546,39 +554,39 @@ class BammStrategy:
         )
 
 
-@registry.register("profile")
-class ProfileStrategy:
-    """Profile data strategy implementation."""
+@registry.register("scores")
+class ScoresStrategy:
+    """Numerical score-profile strategy implementation."""
 
     @staticmethod
     def scan(model: GenericModel, sequences: Optional[RaggedData] = None, strand: StrandMode = "best") -> RaggedData:
-        """For profile comparisons, return the profile data directly."""
-        return model.config["profile_data"]
+        """Return stored score profiles directly."""
+        return model.config["scores_data"]
 
     @staticmethod
     def write(model: GenericModel, path: str) -> None:
-        """Profile models are not writable in the traditional sense."""
-        raise NotImplementedError("Profile models cannot be written to files")
+        """Score profiles are not writable through model serialization."""
+        raise NotImplementedError("Score profiles cannot be written to files")
 
     @staticmethod
     def score_bounds(model: GenericModel) -> tuple[float, float]:
-        """Return score bounds for profile data."""
-        profile_data = model.config["profile_data"]
-        if profile_data.data.size == 0:
+        """Return score bounds for numerical score profiles."""
+        scores_data = model.config["scores_data"]
+        if scores_data.data.size == 0:
             return 0.0, 0.0
-        return float(np.min(profile_data.data)), float(np.max(profile_data.data))
+        return float(np.min(scores_data.data)), float(np.max(scores_data.data))
 
     @staticmethod
     def load(path: str, kwargs: dict) -> GenericModel:
-        """Load profile data from FASTA file."""
+        """Load numerical score profiles from a FASTA-like text file."""
 
-        profile_data = read_fasta(path)
+        scores_data = read_scores(path)
         name = os.path.splitext(os.path.basename(path))[0]
 
         return GenericModel(
-            type_key="profile",
+            type_key="scores",
             name=name,
             length=0,
             representation=None,
-            config={"profile_data": profile_data},
+            config={"scores_data": scores_data},
         )

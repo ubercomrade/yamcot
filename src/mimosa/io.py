@@ -54,6 +54,47 @@ def read_fasta(path: str | Path) -> RaggedData:
     return RaggedData(total_data, offsets)
 
 
+def read_scores(path: str | Path) -> RaggedData:
+    """Read FASTA-like numerical score profiles into RaggedData."""
+
+    profiles: List[np.ndarray] = []
+    current_values: List[float] = []
+
+    with open(path, "r") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            if line.startswith(">"):
+                if current_values:
+                    profiles.append(np.asarray(current_values, dtype=np.float32))
+                    current_values = []
+                continue
+
+            try:
+                current_values.extend(float(token) for token in line.replace(",", " ").split())
+            except ValueError as exc:
+                raise ValueError(f"Invalid score value in {path}: {line}") from exc
+
+    if current_values:
+        profiles.append(np.asarray(current_values, dtype=np.float32))
+
+    if not profiles:
+        return RaggedData(np.empty(0, dtype=np.float32), np.zeros(1, dtype=np.int64))
+
+    n = len(profiles)
+    offsets = np.zeros(n + 1, dtype=np.int64)
+    for i, profile in enumerate(profiles):
+        offsets[i + 1] = offsets[i] + len(profile)
+
+    total_data = np.empty(offsets[-1], dtype=np.float32)
+    for i, profile in enumerate(profiles):
+        total_data[offsets[i] : offsets[i + 1]] = profile
+
+    return RaggedData(total_data, offsets)
+
+
 def write_fasta(sequences: Union[RaggedData, Iterable[np.ndarray]], path: str) -> None:
     """Write integer-encoded sequences to a FASTA file."""
 

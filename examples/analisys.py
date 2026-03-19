@@ -150,7 +150,7 @@ pwm = PwmStrategy.load(
 config = create_config(
     model1=pwm,
     model2=bamm,
-    strategy="universal",
+    strategy="profile",
     sequences=sequences,
     seed=100,
     metric="co",
@@ -178,7 +178,7 @@ plt.show()
 result = compare_motifs(
     model1=pwm,
     model2=bamm,
-    strategy="universal",
+    strategy="profile",
     sequences=sequences,
     seed=100,
     metric="co",
@@ -199,7 +199,7 @@ plt.show()
 result = compare_motifs(
     model1=pwm,
     model2=bamm,
-    strategy="tomtom",
+    strategy="motif",
     sequences=sequences,
     seed=100,
     metric="pcc",

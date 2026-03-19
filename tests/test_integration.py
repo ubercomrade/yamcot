@@ -1,9 +1,4 @@
-"""
-Integration tests for mimosa based on examples/run.sh scenarios.
-
-These tests cover various command-line scenarios from the example script,
-excluding any tests with .fa and .fasta files as specified.
-"""
+"""Integration tests for the public CLI modes of mimosa."""
 
 import subprocess
 import sys
@@ -48,11 +43,11 @@ def test_motali_comparison_pwm_vs_sitega(examples_dir, temp_dir):
     assert result.returncode == 0, f"Command failed with stderr: {result.stderr}"
 
 
-def test_motif_comparison_bamm_vs_pwm(examples_dir, temp_dir):
-    """Test motif comparison: bamm vs pwm"""
+def test_profile_comparison_bamm_vs_pwm(examples_dir, temp_dir):
+    """Profile mode should compare bamm vs pwm via scanned profiles."""
     cmd = [
         "mimosa",
-        "motif",
+        "profile",
         str(examples_dir / "myog.ihbcp"),
         str(examples_dir / "pif4.meme"),
         "--model1-type",
@@ -77,11 +72,11 @@ def test_motif_comparison_bamm_vs_pwm(examples_dir, temp_dir):
         assert key in output, f"Missing key '{key}' in output"
 
 
-def test_motif_comparison_bamm_vs_bamm(examples_dir, temp_dir):
-    """Test motif comparison: bamm vs bamm"""
+def test_profile_comparison_bamm_vs_bamm(examples_dir, temp_dir):
+    """Profile mode should compare bamm vs bamm via scanned profiles."""
     cmd = [
         "mimosa",
-        "motif",
+        "profile",
         str(examples_dir / "gata2.ihbcp"),
         str(examples_dir / "gata4.ihbcp"),
         "--model1-type",
@@ -106,11 +101,11 @@ def test_motif_comparison_bamm_vs_bamm(examples_dir, temp_dir):
         assert key in output, f"Missing key '{key}' in output"
 
 
-def test_tomtom_like_comparison_pwm_vs_pwm(examples_dir, temp_dir):
-    """Test tomtom-like comparison: pwm vs pwm"""
+def test_motif_comparison_pwm_vs_pwm(examples_dir, temp_dir):
+    """Motif mode should compare pwm vs pwm directly."""
     cmd = [
         "mimosa",
-        "tomtom-like",
+        "motif",
         str(examples_dir / "pif4.meme"),
         str(examples_dir / "pif4.meme"),
         "--model1-type",
@@ -136,11 +131,11 @@ def test_tomtom_like_comparison_pwm_vs_pwm(examples_dir, temp_dir):
         assert key in output, f"Missing key '{key}' in output"
 
 
-def test_tomtom_like_comparison_bamm_vs_bamm(examples_dir, temp_dir):
-    """Test tomtom-like comparison: bamm vs bamm"""
+def test_motif_comparison_bamm_vs_bamm(examples_dir, temp_dir):
+    """Motif mode should compare bamm vs bamm directly."""
     cmd = [
         "mimosa",
-        "tomtom-like",
+        "motif",
         str(examples_dir / "gata2.ihbcp"),
         str(examples_dir / "gata4.ihbcp"),
         "--model1-type",
@@ -166,11 +161,11 @@ def test_tomtom_like_comparison_bamm_vs_bamm(examples_dir, temp_dir):
         assert key in output, f"Missing key '{key}' in output"
 
 
-def test_motif_comparison_sitega_vs_pwm(examples_dir, temp_dir):
-    """Test motif comparison: sitega vs pwm"""
+def test_profile_comparison_sitega_vs_pwm(examples_dir, temp_dir):
+    """Profile mode should compare sitega vs pwm via scanned profiles."""
     cmd = [
         "mimosa",
-        "motif",
+        "profile",
         str(examples_dir / "sitega_stat6.mat"),
         str(examples_dir / "pif4.meme"),
         "--model1-type",
@@ -187,11 +182,11 @@ def test_motif_comparison_sitega_vs_pwm(examples_dir, temp_dir):
     assert result.returncode == 0, f"Command failed with stderr: {result.stderr}"
 
 
-def test_tomtom_like_comparison_sitega_vs_pwm(examples_dir, temp_dir):
-    """Test tomtom-like comparison: sitega vs pwm"""
+def test_motif_comparison_sitega_vs_pwm(examples_dir, temp_dir):
+    """Motif mode should compare sitega vs pwm directly."""
     cmd = [
         "mimosa",
-        "tomtom-like",
+        "motif",
         str(examples_dir / "sitega_gata2.mat"),
         str(examples_dir / "pif4.meme"),
         "--model1-type",
@@ -208,11 +203,11 @@ def test_tomtom_like_comparison_sitega_vs_pwm(examples_dir, temp_dir):
     assert result.returncode == 0, f"Command failed with stderr: {result.stderr}"
 
 
-def test_tomtom_like_comparison_sitega_vs_pwm_pcc(examples_dir, temp_dir):
-    """Test tomtom-like comparison: sitega vs pwm with PCC metric"""
+def test_motif_comparison_sitega_vs_pwm_pcc(examples_dir, temp_dir):
+    """Motif mode should support PFM-based sitega vs pwm comparison."""
     cmd = [
         "mimosa",
-        "tomtom-like",
+        "motif",
         str(examples_dir / "sitega_stat6.mat"),
         str(examples_dir / "pif4.meme"),
         "--model1-type",
@@ -230,13 +225,11 @@ def test_tomtom_like_comparison_sitega_vs_pwm_pcc(examples_dir, temp_dir):
     assert result.returncode == 0, f"Command failed with stderr: {result.stderr}"
 
 
-def test_sequence_comparison_sitega_vs_pwm(examples_dir, temp_dir):
-    """Test motif comparison: sitega vs pwm"""
-    # Note: This test uses scores_1.fasta and scores_2.fasta which are not excluded
-    # according to the requirements since they don't have the .fa/.fasta extension
+def test_profile_comparison_sitega_vs_pwm_second_case(examples_dir, temp_dir):
+    """Profile mode should handle a second sitega vs pwm example."""
     cmd = [
         "mimosa",
-        "motif",
+        "profile",
         str(examples_dir / "sitega.mat"),
         str(examples_dir / "pif4.meme"),
         "--model1-type",
@@ -253,11 +246,11 @@ def test_sequence_comparison_sitega_vs_pwm(examples_dir, temp_dir):
     assert result.returncode == 0, f"Command failed with stderr: {result.stderr}"
 
 
-def test_tomtom_like_comparison_sitega_vs_sitega_1(examples_dir, temp_dir):
-    """Test tomtom-like comparison: sitega vs sitega (first scenario)"""
+def test_motif_comparison_sitega_vs_sitega_1(examples_dir, temp_dir):
+    """Motif mode should compare sitega vs sitega in the first scenario."""
     cmd = [
         "mimosa",
-        "tomtom-like",
+        "motif",
         str(examples_dir / "sitega_stat6.mat"),
         str(examples_dir / "sitega_gata2.mat"),
         "--model1-type",
@@ -276,11 +269,11 @@ def test_tomtom_like_comparison_sitega_vs_sitega_1(examples_dir, temp_dir):
     assert result.returncode == 0, f"Command failed with stderr: {result.stderr}"
 
 
-def test_tomtom_like_comparison_sitega_vs_sitega_2(examples_dir, temp_dir):
-    """Test tomtom-like comparison: sitega vs sitega (second scenario)"""
+def test_motif_comparison_sitega_vs_sitega_2(examples_dir, temp_dir):
+    """Motif mode should compare sitega vs sitega in the second scenario."""
     cmd = [
         "mimosa",
-        "tomtom-like",
+        "motif",
         str(examples_dir / "sitega_stat6.mat"),
         str(examples_dir / "sitega_gata2.mat"),
         "--model1-type",
@@ -299,11 +292,11 @@ def test_tomtom_like_comparison_sitega_vs_sitega_2(examples_dir, temp_dir):
     assert result.returncode == 0, f"Command failed with stderr: {result.stderr}"
 
 
-def test_tomtom_like_comparison_sitega_vs_sitega_3(examples_dir, temp_dir):
-    """Test tomtom-like comparison: sitega vs sitega (third scenario)"""
+def test_motif_comparison_sitega_vs_sitega_3(examples_dir, temp_dir):
+    """Motif mode should compare sitega vs sitega in the third scenario."""
     cmd = [
         "mimosa",
-        "tomtom-like",
+        "motif",
         str(examples_dir / "sitega_stat6.mat"),
         str(examples_dir / "sitega_stat6.mat"),
         "--model1-type",
@@ -322,11 +315,11 @@ def test_tomtom_like_comparison_sitega_vs_sitega_3(examples_dir, temp_dir):
     assert result.returncode == 0, f"Command failed with stderr: {result.stderr}"
 
 
-def test_tomtom_like_comparison_pwm_vs_sitega(examples_dir, temp_dir):
-    """Test tomtom-like comparison: pwm vs sitega"""
+def test_motif_comparison_pwm_vs_sitega(examples_dir, temp_dir):
+    """Motif mode should compare pwm vs sitega directly."""
     cmd = [
         "mimosa",
-        "tomtom-like",
+        "motif",
         str(examples_dir / "gata2.meme"),
         str(examples_dir / "sitega_gata2.mat"),
         "--model1-type",
@@ -345,12 +338,16 @@ def test_tomtom_like_comparison_pwm_vs_sitega(examples_dir, temp_dir):
 
 
 def test_profile_comparison_basic(examples_dir, temp_dir):
-    """Test profile comparison between two score profiles."""
+    """Profile mode should compare two precomputed score profiles."""
     cmd = [
         "mimosa",
         "profile",
         str(examples_dir / "scores_1.fasta"),
         str(examples_dir / "scores_2.fasta"),
+        "--model1-type",
+        "scores",
+        "--model2-type",
+        "scores",
         "--metric",
         "cj",
         "--permutations",
@@ -376,6 +373,10 @@ def test_profile_comparison_invalid_kernel_range(examples_dir, temp_dir):
         "profile",
         str(examples_dir / "scores_1.fasta"),
         str(examples_dir / "scores_2.fasta"),
+        "--model1-type",
+        "scores",
+        "--model2-type",
+        "scores",
         "--min-kernel-size",
         "4",
         "--max-kernel-size",
@@ -391,7 +392,7 @@ def test_pipeline_with_missing_files():
     """Test pipeline behavior with missing input files."""
     cmd = [
         "mimosa",
-        "motif",
+        "profile",
         "nonexistent1.ihbcp",
         "nonexistent2.ihbcp",
         "--model1-type",

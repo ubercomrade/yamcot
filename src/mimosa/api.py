@@ -15,12 +15,19 @@ ModelRef = Union[GenericModel, str, Path]
 SequenceRef = Union[RaggedData, str, Path]
 
 _STRATEGY_ALIASES = {
-    "motif": "universal",
-    "profile": "universal",
-    "universal": "universal",
-    "tomtom": "tomtom",
-    "tomtom-like": "tomtom",
+    "profile": "profile",
+    "motif": "motif",
     "motali": "motali",
+}
+
+_DEFAULT_METRICS = {
+    "profile": "cj",
+    "motif": "pcc",
+}
+
+_ALLOWED_METRICS = {
+    "profile": {"cj", "co", "corr"},
+    "motif": {"pcc", "ed", "cosine"},
 }
 
 
@@ -32,13 +39,13 @@ class ComparisonConfig:
     model2: ModelRef
     model1_type: Optional[str] = None
     model2_type: Optional[str] = None
-    strategy: str = "universal"
+    strategy: str = "profile"
     sequences: Optional[SequenceRef] = None
     promoters: Optional[SequenceRef] = None
     num_sequences: int = 1000
     seq_length: int = 200
     seed: int = 127
-    comparator: ComparatorConfig = field(default_factory=create_comparator_config)
+    comparator: ComparatorConfig = field(default_factory=lambda: create_comparator_config(metric="cj"))
     model1_kwargs: Dict[str, Any] = field(default_factory=dict)
     model2_kwargs: Dict[str, Any] = field(default_factory=dict)
 
@@ -48,7 +55,7 @@ def create_config(
     model2: ModelRef,
     model1_type: Optional[str] = None,
     model2_type: Optional[str] = None,
-    strategy: str = "universal",
+    strategy: str = "profile",
     sequences: Optional[SequenceRef] = None,
     promoters: Optional[SequenceRef] = None,
     num_sequences: int = 1000,
@@ -61,17 +68,24 @@ def create_config(
 ) -> ComparisonConfig:
     """Build a unified comparison config."""
 
+    normalized_strategy = _normalize_strategy(strategy)
+
     if comparator is not None and comparator_kwargs:
         raise ValueError("Use either 'comparator' or comparator kwargs, not both.")
 
-    resolved_comparator = comparator or create_comparator_config(**comparator_kwargs)
+    effective_kwargs = dict(comparator_kwargs)
+    default_metric = _DEFAULT_METRICS.get(normalized_strategy)
+    if comparator is None and default_metric is not None and "metric" not in effective_kwargs:
+        effective_kwargs["metric"] = default_metric
+
+    resolved_comparator = comparator or create_comparator_config(**effective_kwargs)
 
     return ComparisonConfig(
         model1=model1,
         model2=model2,
         model1_type=model1_type,
         model2_type=model2_type,
-        strategy=strategy,
+        strategy=normalized_strategy,
         sequences=sequences,
         promoters=promoters,
         num_sequences=num_sequences,
@@ -88,7 +102,7 @@ def compare_motifs(
     model2: ModelRef,
     model1_type: Optional[str] = None,
     model2_type: Optional[str] = None,
-    strategy: str = "universal",
+    strategy: str = "profile",
     sequences: Optional[SequenceRef] = None,
     promoters: Optional[SequenceRef] = None,
     num_sequences: int = 1000,
@@ -126,13 +140,18 @@ def run_comparison(config: ComparisonConfig) -> dict:
     strategy = _normalize_strategy(config.strategy)
     model1 = _resolve_model(config.model1, config.model1_type, config.model1_kwargs)
     model2 = _resolve_model(config.model2, config.model2_type, config.model2_kwargs)
-
-    needs_sequences = _needs_sequences(strategy, config.comparator, model1, model2)
-    sequences = _resolve_sequences(config.sequences, config) if needs_sequences else None
+    _validate_models_for_strategy(strategy, model1, model2)
+    _validate_comparator_for_strategy(strategy, config.comparator)
 
     promoters = None
     if config.promoters is not None:
         promoters = _resolve_sequences(config.promoters, config)
+
+    needs_sequences = _needs_sequences(strategy, config.comparator, model1, model2)
+    if strategy == "motali" and config.sequences is None and promoters is not None:
+        sequences = None
+    else:
+        sequences = _resolve_sequences(config.sequences, config) if needs_sequences else None
 
     if strategy == "motali" and sequences is None:
         sequences = promoters
@@ -174,11 +193,35 @@ def _resolve_model(model: ModelRef, model_type: Optional[str], kwargs: Dict[str,
 def _needs_sequences(strategy: str, comparator: ComparatorConfig, model1: GenericModel, model2: GenericModel) -> bool:
     """Return True if selected strategy requires sequence input."""
 
-    if strategy in {"universal", "motali"}:
+    if strategy == "profile":
+        return model1.type_key != "scores" or model2.type_key != "scores"
+    if strategy == "motali":
         return True
-    if strategy == "tomtom" and (comparator.pfm_mode or model1.type_key != model2.type_key):
+    if strategy == "motif" and (comparator.pfm_mode or model1.type_key != model2.type_key):
         return True
     return False
+
+
+def _validate_models_for_strategy(strategy: str, model1: GenericModel, model2: GenericModel) -> None:
+    """Validate model combinations for the selected comparison strategy."""
+
+    if strategy == "motif" and ("scores" in {model1.type_key, model2.type_key}):
+        raise ValueError("Motif strategy does not support score-profile inputs.")
+
+    if strategy == "motali":
+        invalid = {model1.type_key, model2.type_key} - {"pwm", "sitega"}
+        if invalid:
+            invalid_types = ", ".join(sorted(invalid))
+            raise ValueError(f"Motali strategy supports only pwm and sitega models, got: {invalid_types}")
+
+
+def _validate_comparator_for_strategy(strategy: str, comparator: ComparatorConfig) -> None:
+    """Validate comparator options for the selected strategy."""
+
+    allowed_metrics = _ALLOWED_METRICS.get(strategy)
+    if allowed_metrics is not None and comparator.metric not in allowed_metrics:
+        options = ", ".join(sorted(allowed_metrics))
+        raise ValueError(f"Strategy '{strategy}' requires one of the following metrics: {options}")
 
 
 def _resolve_sequences(source: Optional[SequenceRef], config: ComparisonConfig) -> Optional[RaggedData]:
