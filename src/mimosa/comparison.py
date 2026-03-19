@@ -461,7 +461,7 @@ def strategy_motali(
     if threshold_sequences is None:
         raise ValueError("Motali strategy requires 'promoters' or 'sequences' for threshold table calculation.")
 
-    with tempfile.TemporaryDirectory(dir=cfg.tmp_directory, ignore_cleanup_errors=True, delete=True) as tmp:
+    with tempfile.TemporaryDirectory(dir=cfg.tmp_directory, ignore_cleanup_errors=True) as tmp:
         ext_1 = ".pfm" if model1.type_key == "pwm" else ".mat"
         ext_2 = ".pfm" if model2.type_key == "pwm" else ".mat"
 
