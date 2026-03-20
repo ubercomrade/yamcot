@@ -26,7 +26,7 @@ _DEFAULT_METRICS = {
 }
 
 _ALLOWED_METRICS = {
-    "profile": {"cj", "co"},
+    "profile": {"cj", "co", "dice"},
     "motif": {"pcc", "ed", "cosine"},
 }
 

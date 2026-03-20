@@ -107,9 +107,9 @@ def _add_profile_parser(subparsers: argparse._SubParsersAction) -> None:
     profile_group = parser.add_argument_group("Profile Comparison Options")
     profile_group.add_argument(
         "--metric",
-        choices=["cj", "co"],
+        choices=["cj", "co", "dice"],
         default="cj",
-        help="Profile similarity metric. Choices: cj, co. (default: %(default)s)",
+        help="Profile similarity metric. Choices: cj, co, dice. (default: %(default)s)",
     )
     profile_group.add_argument(
         "--permutations",

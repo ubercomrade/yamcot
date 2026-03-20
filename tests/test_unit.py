@@ -19,11 +19,10 @@ from mimosa.comparison import (
 )
 from mimosa.comparison import registry as comparison_registry
 from mimosa.functions import (
-    _fast_cj_kernel_numba,
-    _fast_overlap_kernel_numba,
     batch_all_scores,
     cut_prc,
     cut_roc,
+    fast_profile_score,
     format_params,
     pcm_to_pfm,
     pfm_to_pwm,
@@ -387,28 +386,33 @@ def test_batch_all_scores_with_simple_data():
     assert hasattr(result, "data") and hasattr(result, "offsets")
 
 
-def test_cj_pairwise_threshold_mask_keeps_real_values():
-    """CJ masking should ignore only dual-below-threshold pairs."""
+@pytest.mark.parametrize(
+    ("metric", "expected"),
+    [
+        ("cj", 0.4),
+        ("co", 1.0),
+        ("dice", 4.0 / 7.0),
+    ],
+)
+def test_profile_pairwise_threshold_mask_keeps_real_values(metric, expected):
+    """Profile metrics should ignore only dual-below-threshold pairs."""
     data1 = np.array([2.0], dtype=np.float32)
     data2 = np.array([0.8], dtype=np.float32)
     offsets = np.array([0, 1], dtype=np.int64)
 
-    score, offset = _fast_cj_kernel_numba(data1, offsets, data2, offsets, 0, 1.0)
+    score, offset = fast_profile_score(data1, offsets, data2, offsets, 0, 1.0, metric=metric)
 
-    assert score == pytest.approx(0.4)
+    assert score == pytest.approx(expected)
     assert offset == 0
 
 
-def test_overlap_pairwise_threshold_mask_keeps_real_values():
-    """Overlap masking should use the true sub-threshold value when paired with a strong one."""
-    data1 = np.array([2.0], dtype=np.float32)
-    data2 = np.array([0.8], dtype=np.float32)
+def test_fast_profile_score_rejects_unknown_metric():
+    """Shared profile scorer should reject unsupported metric names."""
+    data = np.array([1.0], dtype=np.float32)
     offsets = np.array([0, 1], dtype=np.int64)
 
-    score, offset = _fast_overlap_kernel_numba(data1, offsets, data2, offsets, 0, 1.0)
-
-    assert score == pytest.approx(1.0)
-    assert offset == 0
+    with pytest.raises(ValueError, match="'cj', 'co', 'dice'"):
+        fast_profile_score(data, offsets, data, offsets, 0, metric="corr")
 
 
 def test_strategy_functions_exist():
@@ -544,7 +548,7 @@ def test_run_comparison_rejects_corr_for_profile():
         seed=7,
     )
 
-    with pytest.raises(ValueError, match="cj, co"):
+    with pytest.raises(ValueError, match="cj, co, dice"):
         run_comparison(config)
 
 
@@ -561,7 +565,7 @@ def test_strategy_profile_rejects_promoters_with_scores_inputs():
         strategy_profile(model1, model2, None, cfg)
 
 
-@pytest.mark.parametrize("metric", ["cj", "co"])
+@pytest.mark.parametrize("metric", ["cj", "co", "dice"])
 def test_strategy_profile_handles_all_positions_masked_by_threshold(metric):
     """Pairwise threshold masking should not crash when every aligned pair is filtered out."""
     scores_1 = RaggedData(np.array([0.1, 0.2, 0.3], dtype=np.float32), np.array([0, 3], dtype=np.int64))
@@ -575,6 +579,20 @@ def test_strategy_profile_handles_all_positions_masked_by_threshold(metric):
     assert result["score"] == pytest.approx(0.0)
     assert result["offset"] == 0
     assert result["orientation"] == "++"
+
+
+def test_run_comparison_supports_dice_for_profile():
+    """Unified API should expose the Dice profile metric."""
+    scores_1 = RaggedData(np.array([0.1, 0.5, 1.0], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    scores_2 = RaggedData(np.array([0.1, 0.5, 0.9], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    model1 = GenericModel(type_key="scores", name="s1", representation=None, length=0, config={"scores_data": scores_1})
+    model2 = GenericModel(type_key="scores", name="s2", representation=None, length=0, config={"scores_data": scores_2})
+
+    config = create_config(model1=model1, model2=model2, strategy="profile", metric="dice", n_permutations=0, seed=7)
+    result = run_comparison(config)
+
+    assert result["metric"] == "dice"
+    assert 0.0 <= result["score"] <= 1.0
 
 
 def test_compare_motifs_shortcut_works_with_single_import_api():

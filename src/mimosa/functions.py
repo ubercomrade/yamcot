@@ -359,9 +359,30 @@ def scores_to_frequencies(ragged_scores: RaggedData) -> RaggedData:
     return RaggedData(new_data, ragged_scores.offsets.copy())
 
 
+@njit(inline="always", cache=True)
+def _profile_score_from_stats_numba(metric_id, inter, sum1, sum2, eps):
+    """Compute a profile similarity score from accumulated overlap statistics."""
+    if metric_id == 0:
+        denom = sum1 if sum1 < sum2 else sum2
+        if denom > eps:
+            return inter / denom
+        return np.float32(-1.0)
+
+    if metric_id == 1:
+        denom = sum1 + sum2 - inter
+        if denom > eps:
+            return inter / denom
+        return np.float32(-1.0)
+
+    denom = sum1 + sum2
+    if denom > eps:
+        return (np.float32(2.0) * inter) / denom
+    return np.float32(-1.0)
+
+
 @njit(fastmath=True, cache=True)
-def _fast_overlap_kernel_numba(data1, offsets1, data2, offsets2, search_range, min_value):
-    """Fast overlap coefficient kernel for RaggedData using JIT compilation."""
+def _fast_profile_score_kernel_numba(data1, offsets1, data2, offsets2, search_range, min_value, metric_id):
+    """Compute overlap-derived profile similarity scores over RaggedData with JIT."""
     n_seq = len(offsets1) - 1
     n_offsets = 2 * search_range + 1
 
@@ -388,104 +409,56 @@ def _fast_overlap_kernel_numba(data1, offsets1, data2, offsets2, search_range, m
                 continue
 
             local_inter = np.float32(0.0)
-            local_s1 = np.float32(0.0)
-            local_s2 = np.float32(0.0)
+            local_sum1 = np.float32(0.0)
+            local_sum2 = np.float32(0.0)
 
             for j in range(overlap):
                 v1 = s1[idx1_start + j]
                 v2 = s2[idx2_start + j]
                 if min_value > 0.0 and v1 < min_value and v2 < min_value:
                     continue
-                local_s1 += v1
-                local_s2 += v2
-
+                local_sum1 += v1
+                local_sum2 += v2
                 local_inter += np.float32(0.5) * (v1 + v2 - abs(v1 - v2))
 
             inters[k] += local_inter
-            sum1s[k] += local_s1
-            sum2s[k] += local_s2
+            sum1s[k] += local_sum1
+            sum2s[k] += local_sum2
 
-    best = -1.0
+    best_score = np.float32(-1.0)
     best_offset = 0
-    eps = 1e-6
+    eps = np.float32(1e-6)
     found_valid = False
 
     for k in range(n_offsets):
-        denom = min(sum1s[k], sum2s[k])
-        if denom > eps:
+        score = _profile_score_from_stats_numba(metric_id, inters[k], sum1s[k], sum2s[k], eps)
+        if score >= 0.0:
             found_valid = True
-            val = inters[k] / denom
-            if val > best:
-                best = val
+            if score > best_score:
+                best_score = score
                 best_offset = k - search_range
 
     if not found_valid:
         return np.float32(0.0), 0
 
-    return best, best_offset
+    return best_score, best_offset
 
 
-@njit(fastmath=True, cache=True)
-def _fast_cj_kernel_numba(data1, offsets1, data2, offsets2, search_range, min_value):
-    """Compute Continuous Jaccard scores over RaggedData with JIT."""
-    n_seq = len(offsets1) - 1
-    n_offsets = 2 * search_range + 1
+def _profile_metric_to_id(metric: str) -> int:
+    """Map profile metric names to numba-friendly integer identifiers."""
+    if metric == "co":
+        return 0
+    if metric == "cj":
+        return 1
+    if metric == "dice":
+        return 2
+    raise ValueError("metric must be one of: 'cj', 'co', 'dice'")
 
-    sums = np.zeros(n_offsets, dtype=np.float32)
-    diffs = np.zeros(n_offsets, dtype=np.float32)
 
-    for i in range(n_seq):
-        s1 = data1[offsets1[i] : offsets1[i + 1]]
-        s2 = data2[offsets2[i] : offsets2[i + 1]]
-        vlen1 = s1.size
-        vlen2 = s2.size
-
-        for k in range(n_offsets):
-            offset = k - search_range
-            idx1_start = 0 if offset < 0 else offset
-            idx2_start = -offset if offset < 0 else 0
-
-            if idx1_start >= vlen1 or idx2_start >= vlen2:
-                continue
-
-            overlap = min(vlen1 - idx1_start, vlen2 - idx2_start)
-            if overlap <= 0:
-                continue
-
-            local_sum = np.float32(0.0)
-            local_diff = np.float32(0.0)
-
-            for j in range(overlap):
-                v1 = s1[idx1_start + j]
-                v2 = s2[idx2_start + j]
-                if min_value > 0.0 and v1 < min_value and v2 < min_value:
-                    continue
-                local_sum += v1 + v2
-                local_diff += abs(v1 - v2)
-
-            sums[k] += local_sum
-            diffs[k] += local_diff
-
-    best_cj = -1.0
-    best_offset = 0
-    eps = 1e-6
-    found_valid = False
-
-    for k in range(n_offsets):
-        S = sums[k]
-        D = diffs[k]
-        denom = S + D
-        if denom > eps:
-            found_valid = True
-            cj = (S - D) / denom
-            if cj > best_cj:
-                best_cj = cj
-                best_offset = k - search_range
-
-    if not found_valid:
-        return np.float32(0.0), 0
-
-    return best_cj, best_offset
+def fast_profile_score(data1, offsets1, data2, offsets2, search_range, min_value=0.0, metric="cj"):
+    """Dispatch profile similarity scoring to the shared overlap-based kernel."""
+    metric_id = _profile_metric_to_id(metric)
+    return _fast_profile_score_kernel_numba(data1, offsets1, data2, offsets2, search_range, min_value, metric_id)
 
 
 def format_params(params: dict) -> str:

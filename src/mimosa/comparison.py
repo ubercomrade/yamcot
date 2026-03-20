@@ -26,8 +26,7 @@ from scipy.ndimage import convolve1d
 
 from mimosa.execute import run_motali
 from mimosa.functions import (
-    _fast_cj_kernel_numba,
-    _fast_overlap_kernel_numba,
+    fast_profile_score,
     scores_to_frequencies,
 )
 from mimosa.io import write_dist, write_fasta
@@ -407,7 +406,7 @@ def strategy_profile(
     sequences: Optional[RaggedData],
     cfg: ComparatorConfig,
 ) -> dict:
-    """RaggedData-based comparison strategy (CJ/CO)."""
+    """RaggedData-based comparison strategy (CJ/CO/Dice)."""
     if cfg.promoters is not None and ("scores" in {model1.type_key, model2.type_key}):
         raise ValueError("Profile strategy with promoters requires motif models for both inputs.")
 
@@ -426,14 +425,16 @@ def strategy_profile(
     def get_score(S1: RaggedData, S2: RaggedData) -> Tuple[float, int]:
         """Compute score and offset for two profiles."""
         min_value = -1.0 if cfg.min_logfpr is None else float(cfg.min_logfpr)
-        if cfg.metric == "cj":
-            sc, off = _fast_cj_kernel_numba(S1.data, S1.offsets, S2.data, S2.offsets, cfg.search_range, min_value)
-            return sc, off
-        elif cfg.metric == "co":
-            sc, off = _fast_overlap_kernel_numba(S1.data, S1.offsets, S2.data, S2.offsets, cfg.search_range, min_value)
-            return sc, off
-        else:
-            raise ValueError(f"Unknown metric: {cfg.metric}")
+        sc, off = fast_profile_score(
+            S1.data,
+            S1.offsets,
+            S2.data,
+            S2.offsets,
+            cfg.search_range,
+            min_value=min_value,
+            metric=cfg.metric,
+        )
+        return sc, off
 
     sc_pp, off_pp = get_score(freq1_plus, freq2_plus)
     sc_pm, off_pm = get_score(freq1_plus, freq2_minus)

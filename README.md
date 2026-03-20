@@ -25,6 +25,10 @@ This metric is equivalent to averaging the binary Jaccard index across all possi
 The Continuous Overlap coefficient (or Szymkiewicz-Simpson coefficient) measures the sub-set relationship between two profiles, normalizing the intersection by the smaller of the two total affinities:
 $$\text{CO}(v_1, v_2) = \frac{\sum_i \min(v_1^i, v_2^i)}{\min\left(\sum_i v_1^i, \sum_i v_2^i\right)}$$
 
+**Continuous Dice**
+The Dice coefficient balances shared signal against the total profile mass:
+$$\text{Dice}(v_1, v_2) = \frac{2 \sum_i \min(v_1^i, v_2^i)}{\sum_i v_1^i + \sum_i v_2^i}$$
+
 **Pearson Correlation Coefficient (PCC)**
 For linear correlation between profiles or motif columns, the PCC is calculated as:
 $$\text{PCC}(v_1, v_2) = \frac{\sum_i (v_1^i - \bar{v}_1)(v_2^i - \bar{v}_2)}{\sqrt{\sum_i (v_1^i - \bar{v}_1)^2 \sum_i (v_2^i - \bar{v}_2)^2}}$$
@@ -206,7 +210,7 @@ mimosa profile foxa2.meme gata4.meme \
 | `--fasta` | Path | FASTA file used to scan motif inputs. If omitted when scanning is needed, random sequences are generated. |
 | `--num-sequences` | Integer | Number of generated sequences for scanning mode (default: `1000`). |
 | `--seq-length` | Integer | Length of generated sequences for scanning mode (default: `200`). |
-| `--metric` | `cj`, `co`, `corr` | Similarity metric for profile comparison (default: `cj`). |
+| `--metric` | `cj`, `co`, `dice` | Similarity metric for profile comparison (default: `cj`). |
 | `--permutations` | Integer | Number of permutations for p-value calculation (default: `0`). |
 | `--distortion` | Float | Distortion level for surrogate profile generation (default: `0.4`). |
 | `--search-range` | Integer | Maximum offset range explored during alignment (default: `10`). |

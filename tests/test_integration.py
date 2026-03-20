@@ -366,6 +366,31 @@ def test_profile_comparison_basic(examples_dir, temp_dir):
         assert key in output, f"Missing key '{key}' in output"
 
 
+def test_profile_comparison_accepts_dice_metric(examples_dir, temp_dir):
+    """Profile mode should expose the Dice metric through CLI."""
+    cmd = [
+        "mimosa",
+        "profile",
+        str(examples_dir / "scores_1.fasta"),
+        str(examples_dir / "scores_2.fasta"),
+        "--model1-type",
+        "scores",
+        "--model2-type",
+        "scores",
+        "--metric",
+        "dice",
+    ]
+
+    result = run_cli(cmd)
+    assert result.returncode == 0, f"Command failed with stderr: {result.stderr}"
+
+    import json
+
+    output = json.loads(result.stdout)
+    assert output["metric"] == "dice"
+    assert "score" in output
+
+
 def test_profile_comparison_with_promoter_calibration(examples_dir, temp_dir):
     """Profile mode should support promoter-calibrated logFPR profiles with hard thresholding."""
     cmd = [

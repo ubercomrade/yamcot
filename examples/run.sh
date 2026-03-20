@@ -3,7 +3,7 @@ mimosa profile ./myog.ihbcp ./pif4.meme \
 --model1-type bamm \
 --model2-type pwm \
 --permutations 500 \
---metric corr
+--metric dice
 
 
 mimosa profile ./gata2.ihbcp ./gata4.ihbcp \
