@@ -392,6 +392,7 @@ def test_batch_all_scores_with_simple_data():
         ("cj", 0.4),
         ("co", 1.0),
         ("dice", 4.0 / 7.0),
+        ("l1sim", 1.0 / 2.2),
     ],
 )
 def test_profile_pairwise_threshold_mask_keeps_real_values(metric, expected):
@@ -406,12 +407,24 @@ def test_profile_pairwise_threshold_mask_keeps_real_values(metric, expected):
     assert offset == 0
 
 
+def test_l1sim_uses_only_unmasked_positions_in_mean():
+    """L1 similarity should average distance over positions that survive threshold masking."""
+    data1 = np.array([2.0, 0.1], dtype=np.float32)
+    data2 = np.array([0.8, 0.1], dtype=np.float32)
+    offsets = np.array([0, 2], dtype=np.int64)
+
+    score, offset = fast_profile_score(data1, offsets, data2, offsets, 0, 1.0, metric="l1sim")
+
+    assert score == pytest.approx(1.0 / 2.2)
+    assert offset == 0
+
+
 def test_fast_profile_score_rejects_unknown_metric():
     """Shared profile scorer should reject unsupported metric names."""
     data = np.array([1.0], dtype=np.float32)
     offsets = np.array([0, 1], dtype=np.int64)
 
-    with pytest.raises(ValueError, match="'cj', 'co', 'dice'"):
+    with pytest.raises(ValueError, match="'cj', 'co', 'dice', 'l1sim'"):
         fast_profile_score(data, offsets, data, offsets, 0, metric="corr")
 
 
@@ -548,7 +561,7 @@ def test_run_comparison_rejects_corr_for_profile():
         seed=7,
     )
 
-    with pytest.raises(ValueError, match="cj, co, dice"):
+    with pytest.raises(ValueError, match="cj, co, dice, l1sim"):
         run_comparison(config)
 
 
@@ -565,7 +578,7 @@ def test_strategy_profile_rejects_promoters_with_scores_inputs():
         strategy_profile(model1, model2, None, cfg)
 
 
-@pytest.mark.parametrize("metric", ["cj", "co", "dice"])
+@pytest.mark.parametrize("metric", ["cj", "co", "dice", "l1sim"])
 def test_strategy_profile_handles_all_positions_masked_by_threshold(metric):
     """Pairwise threshold masking should not crash when every aligned pair is filtered out."""
     scores_1 = RaggedData(np.array([0.1, 0.2, 0.3], dtype=np.float32), np.array([0, 3], dtype=np.int64))
@@ -579,6 +592,20 @@ def test_strategy_profile_handles_all_positions_masked_by_threshold(metric):
     assert result["score"] == pytest.approx(0.0)
     assert result["offset"] == 0
     assert result["orientation"] == "++"
+
+
+def test_run_comparison_supports_l1sim_for_profile():
+    """Unified API should expose the L1-based profile similarity."""
+    scores_1 = RaggedData(np.array([0.1, 0.5, 1.0], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    scores_2 = RaggedData(np.array([0.1, 0.5, 0.9], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    model1 = GenericModel(type_key="scores", name="s1", representation=None, length=0, config={"scores_data": scores_1})
+    model2 = GenericModel(type_key="scores", name="s2", representation=None, length=0, config={"scores_data": scores_2})
+
+    config = create_config(model1=model1, model2=model2, strategy="profile", metric="l1sim", n_permutations=0, seed=7)
+    result = run_comparison(config)
+
+    assert result["metric"] == "l1sim"
+    assert 0.0 <= result["score"] <= 1.0
 
 
 def test_run_comparison_supports_dice_for_profile():

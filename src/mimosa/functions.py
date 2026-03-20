@@ -360,7 +360,7 @@ def scores_to_frequencies(ragged_scores: RaggedData) -> RaggedData:
 
 
 @njit(inline="always", cache=True)
-def _profile_score_from_stats_numba(metric_id, inter, sum1, sum2, eps):
+def _profile_score_from_stats_numba(metric_id, inter, sum1, sum2, valid_count, eps):
     """Compute a profile similarity score from accumulated overlap statistics."""
     if metric_id == 0:
         denom = sum1 if sum1 < sum2 else sum2
@@ -374,9 +374,17 @@ def _profile_score_from_stats_numba(metric_id, inter, sum1, sum2, eps):
             return inter / denom
         return np.float32(-1.0)
 
-    denom = sum1 + sum2
-    if denom > eps:
-        return (np.float32(2.0) * inter) / denom
+    if metric_id == 2:
+        denom = sum1 + sum2
+        if denom > eps:
+            return (np.float32(2.0) * inter) / denom
+        return np.float32(-1.0)
+
+    if valid_count > 0:
+        denom = sum1 + sum2
+        l1_sum = denom - (np.float32(2.0) * inter)
+        mean_l1 = l1_sum / np.float32(valid_count)
+        return np.float32(1.0) / (np.float32(1.0) + mean_l1)
     return np.float32(-1.0)
 
 
@@ -389,6 +397,7 @@ def _fast_profile_score_kernel_numba(data1, offsets1, data2, offsets2, search_ra
     inters = np.zeros(n_offsets, dtype=np.float32)
     sum1s = np.zeros(n_offsets, dtype=np.float32)
     sum2s = np.zeros(n_offsets, dtype=np.float32)
+    valid_counts = np.zeros(n_offsets, dtype=np.int32)
 
     for i in range(n_seq):
         s1 = data1[offsets1[i] : offsets1[i + 1]]
@@ -411,6 +420,7 @@ def _fast_profile_score_kernel_numba(data1, offsets1, data2, offsets2, search_ra
             local_inter = np.float32(0.0)
             local_sum1 = np.float32(0.0)
             local_sum2 = np.float32(0.0)
+            local_count = 0
 
             for j in range(overlap):
                 v1 = s1[idx1_start + j]
@@ -420,10 +430,12 @@ def _fast_profile_score_kernel_numba(data1, offsets1, data2, offsets2, search_ra
                 local_sum1 += v1
                 local_sum2 += v2
                 local_inter += np.float32(0.5) * (v1 + v2 - abs(v1 - v2))
+                local_count += 1
 
             inters[k] += local_inter
             sum1s[k] += local_sum1
             sum2s[k] += local_sum2
+            valid_counts[k] += local_count
 
     best_score = np.float32(-1.0)
     best_offset = 0
@@ -431,7 +443,7 @@ def _fast_profile_score_kernel_numba(data1, offsets1, data2, offsets2, search_ra
     found_valid = False
 
     for k in range(n_offsets):
-        score = _profile_score_from_stats_numba(metric_id, inters[k], sum1s[k], sum2s[k], eps)
+        score = _profile_score_from_stats_numba(metric_id, inters[k], sum1s[k], sum2s[k], valid_counts[k], eps)
         if score >= 0.0:
             found_valid = True
             if score > best_score:
@@ -452,7 +464,9 @@ def _profile_metric_to_id(metric: str) -> int:
         return 1
     if metric == "dice":
         return 2
-    raise ValueError("metric must be one of: 'cj', 'co', 'dice'")
+    if metric == "l1sim":
+        return 3
+    raise ValueError("metric must be one of: 'cj', 'co', 'dice', 'l1sim'")
 
 
 def fast_profile_score(data1, offsets1, data2, offsets2, search_range, min_value=0.0, metric="cj"):
