@@ -139,11 +139,39 @@ def _score_bounds_from_representation(representation: np.ndarray) -> tuple[float
     return minimum, maximum
 
 
-@functools.lru_cache(maxsize=32)
-def calculate_threshold_table(model: GenericModel, promoters: RaggedData) -> np.ndarray:
-    """Pure function to calculate threshold table."""
+def _get_threshold_tables(model: GenericModel) -> Dict[str, np.ndarray]:
+    """Return cached threshold tables keyed by strand mode."""
+    tables = model.config.get("_threshold_tables")
+    if tables is None:
+        tables = {}
+        legacy_table = model.config.get("_threshold_table")
+        if legacy_table is not None:
+            tables["best"] = legacy_table
+        model.config["_threshold_tables"] = tables
+    return tables
 
-    ragged_scores = scan_model(model, promoters, strand="best")
+
+def _resolve_threshold_table(model: GenericModel, strand: StrandMode = "best") -> Optional[np.ndarray]:
+    """Return a cached threshold table for the requested strand mode."""
+    tables = _get_threshold_tables(model)
+    table = tables.get(strand)
+    if table is not None:
+        return table
+
+    if strand == "best":
+        legacy_table = model.config.get("_threshold_table")
+        if legacy_table is not None:
+            tables["best"] = legacy_table
+            return legacy_table
+
+    return None
+
+
+@functools.lru_cache(maxsize=96)
+def calculate_threshold_table(model: GenericModel, promoters: RaggedData, strand: StrandMode = "best") -> np.ndarray:
+    """Calculate a score-to-logFPR lookup table on the provided background."""
+
+    ragged_scores = scan_model(model, promoters, strand=strand)
 
     flat_scores = ragged_scores.data
 
@@ -163,9 +191,33 @@ def calculate_threshold_table(model: GenericModel, promoters: RaggedData) -> np.
 
     table = np.column_stack([unique_scores, np.abs(log_fpr_values)])
     table = table.astype(np.float64)
-    model.config["_threshold_table"] = table
+    tables = _get_threshold_tables(model)
+    tables[strand] = table
+    if strand == "best":
+        model.config["_threshold_table"] = table
 
     return table.astype(np.float64)
+
+
+def scores_to_log_fpr(
+    model: GenericModel,
+    ragged_scores: RaggedData,
+    promoters: RaggedData,
+    strand: StrandMode = "best",
+) -> RaggedData:
+    """Convert scores to logFPR values using a precomputed threshold table."""
+    flat = ragged_scores.data
+    if flat.size == 0:
+        return RaggedData(np.zeros(0, dtype=np.float32), ragged_scores.offsets.copy())
+
+    threshold_table = calculate_threshold_table(model, promoters, strand=strand)
+    scores_col = threshold_table[:, 0]
+    logfpr_col = threshold_table[:, 1]
+
+    idx = np.searchsorted(-scores_col, -flat, side="left")
+    idx = np.clip(idx, 0, len(logfpr_col) - 1)
+
+    return RaggedData(logfpr_col[idx].astype(np.float32), ragged_scores.offsets.copy())
 
 
 def get_frequencies(model: GenericModel, sequences: RaggedData, strand: Optional[StrandMode] = None) -> RaggedData:
@@ -187,7 +239,7 @@ def get_sites(
     fpr_threshold: Optional[float] = None,
 ) -> pd.DataFrame:
     """Find motif binding sites in sequences."""
-    threshold_table = model.config.get("_threshold_table")
+    threshold_table = _resolve_threshold_table(model)
     if mode not in ["best", "threshold"]:
         raise ValueError(f"mode must be 'best' or 'threshold', got {mode!r}")
     if mode == "threshold" and fpr_threshold is None:
@@ -314,9 +366,9 @@ def get_pfm(
     return pfm
 
 
-def _score_to_frequency(model: GenericModel, score: float) -> float:
+def _score_to_frequency(model: GenericModel, score: float, strand: StrandMode = "best") -> float:
     """Convert score to frequency using threshold table."""
-    threshold_table = model.config.get("_threshold_table")
+    threshold_table = _resolve_threshold_table(model, strand)
     if threshold_table is None:
         return np.nan
 
@@ -334,9 +386,9 @@ def _score_to_frequency(model: GenericModel, score: float) -> float:
     return float(logfpr_col[idx])
 
 
-def _frequency_to_score(model: GenericModel, frequency: float) -> float:
+def _frequency_to_score(model: GenericModel, frequency: float, strand: StrandMode = "best") -> float:
     """Convert frequency to score using threshold table."""
-    threshold_table = model.config.get("_threshold_table")
+    threshold_table = _resolve_threshold_table(model, strand)
     if threshold_table is None:
         raise ValueError("Model has no threshold table")
 

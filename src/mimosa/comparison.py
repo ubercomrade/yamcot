@@ -28,11 +28,18 @@ from mimosa.execute import run_motali
 from mimosa.functions import (
     _fast_cj_kernel_numba,
     _fast_overlap_kernel_numba,
-    _fast_pearson_kernel,
     scores_to_frequencies,
 )
 from mimosa.io import write_dist, write_fasta
-from mimosa.models import GenericModel, calculate_threshold_table, get_pfm, get_score_bounds, scan_model, write_model
+from mimosa.models import (
+    GenericModel,
+    calculate_threshold_table,
+    get_pfm,
+    get_score_bounds,
+    scan_model,
+    scores_to_log_fpr,
+    write_model,
+)
 from mimosa.ragged import RaggedData
 
 
@@ -57,6 +64,7 @@ class ComparatorConfig:
     search_range: int = 10
     min_kernel_size: int = 3
     max_kernel_size: int = 11
+    min_logfpr: Optional[float] = None
 
     motali_err: float = 0.002
     motali_shift: int = 50
@@ -79,6 +87,7 @@ def create_comparator_config(**kwargs) -> ComparatorConfig:
         "search_range": 10,
         "min_kernel_size": 3,
         "max_kernel_size": 11,
+        "min_logfpr": None,
         "motali_err": 0.002,
         "motali_shift": 50,
         "tmp_directory": ".",
@@ -100,8 +109,36 @@ def create_comparator_config(**kwargs) -> ComparatorConfig:
             "Kernel size range must include at least one odd value, "
             "because surrogate convolution uses centered kernels."
         )
+    min_logfpr = config_params.get("min_logfpr")
+    if min_logfpr is not None and float(min_logfpr) < 0.0:
+        raise ValueError("min_logfpr must be non-negative.")
 
     return ComparatorConfig(**config_params)
+
+
+def _apply_profile_floor(profile: RaggedData, min_logfpr: Optional[float]) -> RaggedData:
+    """Zero out weak profile positions below the requested logFPR floor."""
+    if min_logfpr is None or float(min_logfpr) <= 0.0:
+        return profile
+
+    floored = profile.data.copy()
+    floored[floored < float(min_logfpr)] = 0.0
+    return RaggedData(floored.astype(np.float32, copy=False), profile.offsets.copy())
+
+
+def _scores_to_profile_signal(
+    model: GenericModel,
+    scores: RaggedData,
+    cfg: ComparatorConfig,
+    strand: str,
+) -> RaggedData:
+    """Convert raw scores to the profile scale used for comparison."""
+    if cfg.promoters is None:
+        profile = scores_to_frequencies(scores)
+    else:
+        profile = scores_to_log_fpr(model, scores, cfg.promoters, strand=strand)
+
+    return _apply_profile_floor(profile, cfg.min_logfpr)
 
 
 def _create_surrogate_ragged(frequencies: RaggedData, rng: np.random.Generator, cfg: ComparatorConfig) -> RaggedData:
@@ -380,7 +417,9 @@ def strategy_profile(
     sequences: Optional[RaggedData],
     cfg: ComparatorConfig,
 ) -> dict:
-    """RaggedData-based comparison strategy (CJ/CO/Corr)."""
+    """RaggedData-based comparison strategy (CJ/CO)."""
+    if cfg.promoters is not None and ("scores" in {model1.type_key, model2.type_key}):
+        raise ValueError("Profile strategy with promoters requires motif models for both inputs.")
 
     def resolve_scores(model: GenericModel, strand: str) -> RaggedData:
         """Resolve an input model to positional scores."""
@@ -390,13 +429,9 @@ def strategy_profile(
             raise ValueError("Profile strategy requires sequences when comparing motif models.")
         return scan_model(model, sequences, strand)
 
-    freq1_plus = resolve_scores(model1, "+")
-    freq2_plus = resolve_scores(model2, "+")
-    freq2_minus = resolve_scores(model2, "-")
-
-    freq1_plus = scores_to_frequencies(freq1_plus)
-    freq2_plus = scores_to_frequencies(freq2_plus)
-    freq2_minus = scores_to_frequencies(freq2_minus)
+    freq1_plus = _scores_to_profile_signal(model1, resolve_scores(model1, "+"), cfg, "+")
+    freq2_plus = _scores_to_profile_signal(model2, resolve_scores(model2, "+"), cfg, "+")
+    freq2_minus = _scores_to_profile_signal(model2, resolve_scores(model2, "-"), cfg, "-")
 
     def get_score(S1: RaggedData, S2: RaggedData) -> Tuple[float, int]:
         """Compute score and offset for two profiles."""
@@ -405,9 +440,6 @@ def strategy_profile(
             return sc, off
         elif cfg.metric == "co":
             sc, off = _fast_overlap_kernel_numba(S1.data, S1.offsets, S2.data, S2.offsets, cfg.search_range)
-            return sc, off
-        elif cfg.metric == "corr":
-            sc, off = _fast_pearson_kernel(S1.data, S1.offsets, S2.data, S2.offsets, cfg.search_range)
             return sc, off
         else:
             raise ValueError(f"Unknown metric: {cfg.metric}")
@@ -436,6 +468,7 @@ def strategy_profile(
         def surrogate_gen(rng):
             """Generate one surrogate score."""
             surr = _create_surrogate_ragged(f_final, rng, cfg)
+            surr = _apply_profile_floor(surr, cfg.min_logfpr)
             sc, _ = get_score(freq1_plus, surr)
             return sc
 

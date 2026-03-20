@@ -34,8 +34,10 @@ from mimosa.functions import (
 from mimosa.io import read_scores
 from mimosa.models import (
     GenericModel,
+    calculate_threshold_table,
     get_frequencies,
     scan_model,
+    scores_to_log_fpr,
 )
 from mimosa.models import registry as model_registry
 from mimosa.ragged import RaggedData, ragged_from_list
@@ -265,6 +267,12 @@ def test_create_comparator_config_validates_kernel_range():
     assert config.max_kernel_size == 6
 
 
+def test_create_comparator_config_validates_min_logfpr():
+    """Profile floor should reject negative logFPR thresholds."""
+    with pytest.raises(ValueError, match="min_logfpr"):
+        create_comparator_config(min_logfpr=-0.1)
+
+
 def test_comparison_registry():
     """Test comparison registry functionality"""
     # Test that we can get registered strategies
@@ -331,6 +339,40 @@ def test_get_frequencies():
     assert frequencies.data.size > 0
 
 
+def test_scores_to_log_fpr_uses_threshold_table_scale():
+    """Threshold-table conversion should match the cached score-to-logFPR lookup."""
+    representation = np.array(
+        [
+            [1.0, 0.2],
+            [0.2, 1.0],
+            [0.1, 0.1],
+            [0.1, 0.1],
+            [0.1, 0.1],
+        ],
+        dtype=np.float32,
+    )
+    model = GenericModel(type_key="pwm", name="test_pwm", representation=representation, length=2, config={"kmer": 1})
+    promoters = ragged_from_list(
+        [
+            np.array([0, 1, 0, 1, 0, 1], dtype=np.int8),
+            np.array([1, 0, 1, 0, 1, 0], dtype=np.int8),
+        ],
+        dtype=np.int8,
+    )
+
+    scores = scan_model(model, promoters, "+")
+    threshold_table = calculate_threshold_table(model, promoters, strand="+")
+
+    transformed = scores_to_log_fpr(model, scores, promoters, strand="+")
+
+    idx = np.searchsorted(-threshold_table[:, 0], -scores.data, side="left")
+    idx = np.clip(idx, 0, len(threshold_table) - 1)
+    expected = threshold_table[:, 1][idx].astype(np.float32)
+
+    np.testing.assert_allclose(transformed.data, expected)
+    np.testing.assert_array_equal(transformed.offsets, scores.offsets)
+
+
 def test_batch_all_scores_with_simple_data():
     """Test batch_all_scores with simple RaggedData"""
     # Create proper RaggedData for testing
@@ -377,7 +419,7 @@ def test_strategy_profile_uses_motif_offset_convention():
     seqs = [seq_rng.integers(0, 4, size=60, dtype=np.int8) for _ in range(200)]
     sequences = ragged_from_list(seqs, dtype=np.int8)
 
-    universal_cfg = create_comparator_config(metric="corr", search_range=8, n_permutations=0, seed=1)
+    universal_cfg = create_comparator_config(metric="co", search_range=8, n_permutations=0, seed=1)
     tomtom_cfg = create_comparator_config(metric="pcc", n_permutations=0, seed=1)
 
     res_profile_plus = strategy_profile(model1, model2_plus, sequences, universal_cfg)
@@ -439,7 +481,7 @@ def test_run_comparison_with_unified_config_and_models():
         model2=model2,
         strategy="profile",
         sequences=sequences,
-        metric="corr",
+        metric="co",
         n_permutations=0,
         seed=7,
     )
@@ -448,6 +490,65 @@ def test_run_comparison_with_unified_config_and_models():
     assert "score" in result
     assert "offset" in result
     assert "orientation" in result
+
+
+def test_run_comparison_rejects_corr_for_profile():
+    """Profile mode should reject the removed Pearson metric."""
+    representation = np.array(
+        [
+            [0.2, 0.3, 0.1],
+            [0.3, 0.2, 0.4],
+            [0.2, 0.4, 0.3],
+            [0.3, 0.1, 0.2],
+            [0.1, 0.1, 0.1],
+        ],
+        dtype=np.float32,
+    )
+    model1 = GenericModel(type_key="pwm", name="m1", representation=representation, length=3, config={"kmer": 1})
+    model2 = GenericModel(type_key="pwm", name="m2", representation=representation, length=3, config={"kmer": 1})
+    sequences = ragged_from_list([np.array([0, 1, 2, 3, 2, 1, 0], dtype=np.int8)], dtype=np.int8)
+
+    config = create_config(
+        model1=model1,
+        model2=model2,
+        strategy="profile",
+        sequences=sequences,
+        metric="corr",
+        n_permutations=0,
+        seed=7,
+    )
+
+    with pytest.raises(ValueError, match="cj, co"):
+        run_comparison(config)
+
+
+def test_strategy_profile_rejects_promoters_with_scores_inputs():
+    """Calibrated profile mode should reject precomputed numerical profiles."""
+    scores_1 = RaggedData(np.array([0.1, 0.2, 0.3], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    scores_2 = RaggedData(np.array([0.2, 0.3, 0.4], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    promoters = ragged_from_list([np.array([0, 1, 2, 3, 0, 1], dtype=np.int8)], dtype=np.int8)
+    model1 = GenericModel(type_key="scores", name="s1", representation=None, length=0, config={"scores_data": scores_1})
+    model2 = GenericModel(type_key="scores", name="s2", representation=None, length=0, config={"scores_data": scores_2})
+    cfg = create_comparator_config(metric="cj", promoters=promoters)
+
+    with pytest.raises(ValueError, match="requires motif"):
+        strategy_profile(model1, model2, None, cfg)
+
+
+@pytest.mark.parametrize("metric", ["cj", "co"])
+def test_strategy_profile_handles_all_zero_profiles_after_threshold(metric):
+    """Hard thresholding should not crash when it zeroes every profile value."""
+    scores_1 = RaggedData(np.array([0.1, 0.2, 0.3], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    scores_2 = RaggedData(np.array([0.1, 0.2, 0.4], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    model1 = GenericModel(type_key="scores", name="s1", representation=None, length=0, config={"scores_data": scores_1})
+    model2 = GenericModel(type_key="scores", name="s2", representation=None, length=0, config={"scores_data": scores_2})
+    cfg = create_comparator_config(metric=metric, min_logfpr=10.0, n_permutations=0)
+
+    result = strategy_profile(model1, model2, None, cfg)
+
+    assert result["score"] == pytest.approx(0.0)
+    assert result["offset"] == 0
+    assert result["orientation"] == "++"
 
 
 def test_compare_motifs_shortcut_works_with_single_import_api():

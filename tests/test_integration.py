@@ -366,6 +366,37 @@ def test_profile_comparison_basic(examples_dir, temp_dir):
         assert key in output, f"Missing key '{key}' in output"
 
 
+def test_profile_comparison_with_promoter_calibration(examples_dir, temp_dir):
+    """Profile mode should support promoter-calibrated logFPR profiles with hard thresholding."""
+    cmd = [
+        "mimosa",
+        "profile",
+        str(examples_dir / "gata2.meme"),
+        str(examples_dir / "gata4.meme"),
+        "--model1-type",
+        "pwm",
+        "--model2-type",
+        "pwm",
+        "--fasta",
+        str(examples_dir / "foreground.fa"),
+        "--promoters",
+        str(examples_dir / "background.fa"),
+        "--metric",
+        "cj",
+        "--min-logfpr",
+        "2",
+    ]
+
+    result = run_cli(cmd)
+    assert result.returncode == 0, f"Command failed with stderr: {result.stderr}"
+
+    import json
+
+    output = json.loads(result.stdout)
+    assert output["metric"] == "cj"
+    assert "score" in output
+
+
 def test_profile_comparison_invalid_kernel_range(examples_dir, temp_dir):
     """Profile mode should fail fast when kernel range contains no odd size."""
     cmd = [
@@ -404,6 +435,26 @@ def test_pipeline_with_missing_files():
     result = run_cli(cmd)
     assert result.returncode != 0, "Should fail with missing files"
     assert "file not found" in result.stderr.lower(), "Should mention missing file"
+
+
+def test_profile_comparison_rejects_corr_metric(examples_dir, temp_dir):
+    """Profile CLI should reject the removed Pearson metric."""
+    cmd = [
+        "mimosa",
+        "profile",
+        str(examples_dir / "scores_1.fasta"),
+        str(examples_dir / "scores_2.fasta"),
+        "--model1-type",
+        "scores",
+        "--model2-type",
+        "scores",
+        "--metric",
+        "corr",
+    ]
+
+    result = run_cli(cmd)
+    assert result.returncode != 0, "Should fail with unsupported profile metric"
+    assert "invalid choice" in result.stderr.lower()
 
 
 def test_pipeline_with_invalid_mode():

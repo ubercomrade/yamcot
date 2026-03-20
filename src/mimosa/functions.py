@@ -342,7 +342,7 @@ def standardized_pauc(pauc_raw: float, pauc_min: float, pauc_max: float) -> floa
 
 
 def scores_to_frequencies(ragged_scores: RaggedData) -> RaggedData:
-    """Convert RaggedData containing scores to frequency representation."""
+    """Convert scores to empirical log-tail frequencies within the current sample."""
     flat = ragged_scores.data
     n = flat.size
 
@@ -406,14 +406,19 @@ def _fast_overlap_kernel_numba(data1, offsets1, data2, offsets2, search_range):
     best = -1.0
     best_offset = 0
     eps = 1e-6
+    found_valid = False
 
     for k in range(n_offsets):
         denom = min(sum1s[k], sum2s[k])
         if denom > eps:
+            found_valid = True
             val = inters[k] / denom
             if val > best:
                 best = val
                 best_offset = k - search_range
+
+    if not found_valid:
+        return np.float32(0.0), 0
 
     return best, best_offset
 
@@ -460,86 +465,23 @@ def _fast_cj_kernel_numba(data1, offsets1, data2, offsets2, search_range):
     best_cj = -1.0
     best_offset = 0
     eps = 1e-6
+    found_valid = False
 
     for k in range(n_offsets):
         S = sums[k]
         D = diffs[k]
         denom = S + D
         if denom > eps:
+            found_valid = True
             cj = (S - D) / denom
             if cj > best_cj:
                 best_cj = cj
                 best_offset = k - search_range
 
-    return best_cj, best_offset
-
-
-@njit(fastmath=True, cache=True)
-def _fast_pearson_kernel(data1, offsets1, data2, offsets2, search_range):
-    """Pearson correlation kernel for RaggedData with numba-compatible math."""
-
-    n_seq = len(offsets1) - 1
-    n_offsets = 2 * search_range + 1
-
-    best_corr = -2.0
-    best_offset = 0
-    found_valid = False
-
-    for k in range(n_offsets):
-        offset = k - search_range
-
-        n = 0
-        sum_x = 0.0
-        sum_y = 0.0
-        sum_xx = 0.0
-        sum_yy = 0.0
-        sum_xy = 0.0
-
-        for i in range(n_seq):
-            s1 = data1[offsets1[i] : offsets1[i + 1]]
-            s2 = data2[offsets2[i] : offsets2[i + 1]]
-            vlen1 = s1.size
-            vlen2 = s2.size
-
-            idx1_start = 0 if offset < 0 else offset
-            idx2_start = -offset if offset < 0 else 0
-
-            if idx1_start >= vlen1 or idx2_start >= vlen2:
-                continue
-
-            overlap = min(vlen1 - idx1_start, vlen2 - idx2_start)
-            if overlap <= 0:
-                continue
-
-            for j in range(overlap):
-                x = s1[idx1_start + j]
-                y = s2[idx2_start + j]
-                n += 1
-                sum_x += x
-                sum_y += y
-                sum_xx += x * x
-                sum_yy += y * y
-                sum_xy += x * y
-
-        if n > 1:
-            mean_x = sum_x / n
-            mean_y = sum_y / n
-            var_x = sum_xx / n - mean_x * mean_x
-            var_y = sum_yy / n - mean_y * mean_y
-
-            if var_x > 1e-10 and var_y > 1e-10:
-                cov = sum_xy / n - mean_x * mean_y
-                corr_val = cov / np.sqrt(var_x * var_y)
-
-                if corr_val > best_corr:
-                    best_corr = corr_val
-                    best_offset = offset
-                found_valid = True
-
     if not found_valid:
-        best_corr = 0.0
+        return np.float32(0.0), 0
 
-    return best_corr, best_offset
+    return best_cj, best_offset
 
 
 def format_params(params: dict) -> str:

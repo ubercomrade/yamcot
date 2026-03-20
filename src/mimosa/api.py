@@ -26,7 +26,7 @@ _DEFAULT_METRICS = {
 }
 
 _ALLOWED_METRICS = {
-    "profile": {"cj", "co", "corr"},
+    "profile": {"cj", "co"},
     "motif": {"pcc", "ed", "cosine"},
 }
 
@@ -146,6 +146,9 @@ def run_comparison(config: ComparisonConfig) -> dict:
     promoters = None
     if config.promoters is not None:
         promoters = _resolve_sequences(config.promoters, config)
+
+    if strategy == "profile" and promoters is not None and ("scores" in {model1.type_key, model2.type_key}):
+        raise ValueError("Profile strategy with promoters requires motif inputs for both models.")
 
     needs_sequences = _needs_sequences(strategy, config.comparator, model1, model2)
     if strategy == "motali" and config.sequences is None and promoters is not None:

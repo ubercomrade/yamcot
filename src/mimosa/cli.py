@@ -30,12 +30,12 @@ def create_arg_parser() -> argparse.ArgumentParser:
 Examples:
   # Compare precomputed score profiles directly
   mimosa profile scores_1.fasta scores_2.fasta \
-    --model1-type scores --model2-type scores --metric corr
+    --model1-type scores --model2-type scores --metric cj
 
   # Compare motifs through sequence-derived profiles
   mimosa profile model1.meme model2.ihbcp \
     --model1-type pwm --model2-type bamm \
-    --fasta sequences.fa --metric co --permutations 1000
+    --fasta sequences.fa --promoters promoters.fa --metric co --min-logfpr 2
 
   # Direct motif comparison (former tomtom-like mode)
   mimosa motif model1.meme model2.pfm \
@@ -99,13 +99,17 @@ def _add_profile_parser(subparsers: argparse._SubParsersAction) -> None:
         default=200,
         help="Length of random sequences generated for motif scanning. (default: %(default)s)",
     )
+    io_group.add_argument(
+        "--promoters",
+        help="Path to FASTA promoter sequences used for threshold-table calibration of profile values.",
+    )
 
     profile_group = parser.add_argument_group("Profile Comparison Options")
     profile_group.add_argument(
         "--metric",
-        choices=["cj", "co", "corr"],
+        choices=["cj", "co"],
         default="cj",
-        help="Profile similarity metric. Choices: cj, co, corr. (default: %(default)s)",
+        help="Profile similarity metric. Choices: cj, co. (default: %(default)s)",
     )
     profile_group.add_argument(
         "--permutations",
@@ -136,6 +140,12 @@ def _add_profile_parser(subparsers: argparse._SubParsersAction) -> None:
         type=int,
         default=11,
         help="Maximum surrogate convolution kernel size. (default: %(default)s)",
+    )
+    profile_group.add_argument(
+        "--min-logfpr",
+        type=float,
+        default=None,
+        help="Zero out profile values below this logFPR threshold after normalization/calibration.",
     )
 
     technical_group = parser.add_argument_group("Technical Options")
@@ -355,6 +365,9 @@ def validate_inputs(args) -> None:
 
     if args.mode == "profile":
         validate_kernel_size_range(args.min_kernel_size, args.max_kernel_size)
+        if args.min_logfpr is not None and args.min_logfpr < 0:
+            logger.error("min-logfpr must be non-negative.")
+            sys.exit(1)
 
 
 def map_args_to_comparator_kwargs(args) -> Dict[str, Any]:
@@ -369,6 +382,7 @@ def map_args_to_comparator_kwargs(args) -> Dict[str, Any]:
             "search_range": args.search_range,
             "min_kernel_size": args.min_kernel_size,
             "max_kernel_size": args.max_kernel_size,
+            "min_logfpr": args.min_logfpr,
         }
 
     if args.mode == "motif":
