@@ -116,16 +116,6 @@ def create_comparator_config(**kwargs) -> ComparatorConfig:
     return ComparatorConfig(**config_params)
 
 
-def _apply_profile_floor(profile: RaggedData, min_logfpr: Optional[float]) -> RaggedData:
-    """Zero out weak profile positions below the requested logFPR floor."""
-    if min_logfpr is None or float(min_logfpr) <= 0.0:
-        return profile
-
-    floored = profile.data.copy()
-    floored[floored < float(min_logfpr)] = 0.0
-    return RaggedData(floored.astype(np.float32, copy=False), profile.offsets.copy())
-
-
 def _scores_to_profile_signal(
     model: GenericModel,
     scores: RaggedData,
@@ -138,7 +128,7 @@ def _scores_to_profile_signal(
     else:
         profile = scores_to_log_fpr(model, scores, cfg.promoters, strand=strand)
 
-    return _apply_profile_floor(profile, cfg.min_logfpr)
+    return profile
 
 
 def _create_surrogate_ragged(frequencies: RaggedData, rng: np.random.Generator, cfg: ComparatorConfig) -> RaggedData:
@@ -435,11 +425,12 @@ def strategy_profile(
 
     def get_score(S1: RaggedData, S2: RaggedData) -> Tuple[float, int]:
         """Compute score and offset for two profiles."""
+        min_value = -1.0 if cfg.min_logfpr is None else float(cfg.min_logfpr)
         if cfg.metric == "cj":
-            sc, off = _fast_cj_kernel_numba(S1.data, S1.offsets, S2.data, S2.offsets, cfg.search_range)
+            sc, off = _fast_cj_kernel_numba(S1.data, S1.offsets, S2.data, S2.offsets, cfg.search_range, min_value)
             return sc, off
         elif cfg.metric == "co":
-            sc, off = _fast_overlap_kernel_numba(S1.data, S1.offsets, S2.data, S2.offsets, cfg.search_range)
+            sc, off = _fast_overlap_kernel_numba(S1.data, S1.offsets, S2.data, S2.offsets, cfg.search_range, min_value)
             return sc, off
         else:
             raise ValueError(f"Unknown metric: {cfg.metric}")
@@ -468,7 +459,6 @@ def strategy_profile(
         def surrogate_gen(rng):
             """Generate one surrogate score."""
             surr = _create_surrogate_ragged(f_final, rng, cfg)
-            surr = _apply_profile_floor(surr, cfg.min_logfpr)
             sc, _ = get_score(freq1_plus, surr)
             return sc
 

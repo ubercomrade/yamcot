@@ -145,7 +145,7 @@ def _add_profile_parser(subparsers: argparse._SubParsersAction) -> None:
         "--min-logfpr",
         type=float,
         default=None,
-        help="Zero out profile values below this logFPR threshold after normalization/calibration.",
+        help="Ignore aligned positions only when both profile values are below this logFPR threshold.",
     )
 
     technical_group = parser.add_argument_group("Technical Options")

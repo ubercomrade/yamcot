@@ -19,6 +19,8 @@ from mimosa.comparison import (
 )
 from mimosa.comparison import registry as comparison_registry
 from mimosa.functions import (
+    _fast_cj_kernel_numba,
+    _fast_overlap_kernel_numba,
     batch_all_scores,
     cut_prc,
     cut_roc,
@@ -385,6 +387,30 @@ def test_batch_all_scores_with_simple_data():
     assert hasattr(result, "data") and hasattr(result, "offsets")
 
 
+def test_cj_pairwise_threshold_mask_keeps_real_values():
+    """CJ masking should ignore only dual-below-threshold pairs."""
+    data1 = np.array([2.0], dtype=np.float32)
+    data2 = np.array([0.8], dtype=np.float32)
+    offsets = np.array([0, 1], dtype=np.int64)
+
+    score, offset = _fast_cj_kernel_numba(data1, offsets, data2, offsets, 0, 1.0)
+
+    assert score == pytest.approx(0.4)
+    assert offset == 0
+
+
+def test_overlap_pairwise_threshold_mask_keeps_real_values():
+    """Overlap masking should use the true sub-threshold value when paired with a strong one."""
+    data1 = np.array([2.0], dtype=np.float32)
+    data2 = np.array([0.8], dtype=np.float32)
+    offsets = np.array([0, 1], dtype=np.int64)
+
+    score, offset = _fast_overlap_kernel_numba(data1, offsets, data2, offsets, 0, 1.0)
+
+    assert score == pytest.approx(1.0)
+    assert offset == 0
+
+
 def test_strategy_functions_exist():
     """Test that all strategy functions are properly defined"""
     # Test that strategy functions exist and are callable
@@ -536,8 +562,8 @@ def test_strategy_profile_rejects_promoters_with_scores_inputs():
 
 
 @pytest.mark.parametrize("metric", ["cj", "co"])
-def test_strategy_profile_handles_all_zero_profiles_after_threshold(metric):
-    """Hard thresholding should not crash when it zeroes every profile value."""
+def test_strategy_profile_handles_all_positions_masked_by_threshold(metric):
+    """Pairwise threshold masking should not crash when every aligned pair is filtered out."""
     scores_1 = RaggedData(np.array([0.1, 0.2, 0.3], dtype=np.float32), np.array([0, 3], dtype=np.int64))
     scores_2 = RaggedData(np.array([0.1, 0.2, 0.4], dtype=np.float32), np.array([0, 3], dtype=np.int64))
     model1 = GenericModel(type_key="scores", name="s1", representation=None, length=0, config={"scores_data": scores_1})

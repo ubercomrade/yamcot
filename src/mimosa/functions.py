@@ -360,7 +360,7 @@ def scores_to_frequencies(ragged_scores: RaggedData) -> RaggedData:
 
 
 @njit(fastmath=True, cache=True)
-def _fast_overlap_kernel_numba(data1, offsets1, data2, offsets2, search_range):
+def _fast_overlap_kernel_numba(data1, offsets1, data2, offsets2, search_range, min_value):
     """Fast overlap coefficient kernel for RaggedData using JIT compilation."""
     n_seq = len(offsets1) - 1
     n_offsets = 2 * search_range + 1
@@ -394,6 +394,8 @@ def _fast_overlap_kernel_numba(data1, offsets1, data2, offsets2, search_range):
             for j in range(overlap):
                 v1 = s1[idx1_start + j]
                 v2 = s2[idx2_start + j]
+                if min_value > 0.0 and v1 < min_value and v2 < min_value:
+                    continue
                 local_s1 += v1
                 local_s2 += v2
 
@@ -424,7 +426,7 @@ def _fast_overlap_kernel_numba(data1, offsets1, data2, offsets2, search_range):
 
 
 @njit(fastmath=True, cache=True)
-def _fast_cj_kernel_numba(data1, offsets1, data2, offsets2, search_range):
+def _fast_cj_kernel_numba(data1, offsets1, data2, offsets2, search_range, min_value):
     """Compute Continuous Jaccard scores over RaggedData with JIT."""
     n_seq = len(offsets1) - 1
     n_offsets = 2 * search_range + 1
@@ -456,6 +458,8 @@ def _fast_cj_kernel_numba(data1, offsets1, data2, offsets2, search_range):
             for j in range(overlap):
                 v1 = s1[idx1_start + j]
                 v2 = s2[idx2_start + j]
+                if min_value > 0.0 and v1 < min_value and v2 < min_value:
+                    continue
                 local_sum += v1 + v2
                 local_diff += abs(v1 - v2)
 
