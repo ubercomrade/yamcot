@@ -139,6 +139,22 @@ def _score_bounds_from_representation(representation: np.ndarray) -> tuple[float
     return minimum, maximum
 
 
+def _get_float32_representation(model: GenericModel) -> np.ndarray:
+    """Return a cached float32 representation for repeated scans."""
+    representation = np.asarray(model.representation)
+    meta = (id(representation), representation.shape, representation.dtype.str)
+
+    cached_meta = model.config.get("_representation_float32_meta")
+    cached = model.config.get("_representation_float32")
+    if cached_meta == meta and cached is not None:
+        return cached
+
+    converted = np.asarray(representation, dtype=np.float32)
+    model.config["_representation_float32_meta"] = meta
+    model.config["_representation_float32"] = converted
+    return converted
+
+
 def _get_threshold_tables(model: GenericModel) -> Dict[str, np.ndarray]:
     """Return cached threshold tables keyed by strand mode."""
     tables = model.config.get("_threshold_tables")
@@ -208,7 +224,7 @@ def scores_to_log_fpr(
     """Convert scores to logFPR values using a precomputed threshold table."""
     flat = ragged_scores.data
     if flat.size == 0:
-        return RaggedData(np.zeros(0, dtype=np.float32), ragged_scores.offsets.copy())
+        return RaggedData(np.zeros(0, dtype=np.float32), ragged_scores.offsets)
 
     threshold_table = calculate_threshold_table(model, promoters, strand=strand)
     scores_col = threshold_table[:, 0]
@@ -217,7 +233,7 @@ def scores_to_log_fpr(
     idx = np.searchsorted(-scores_col, -flat, side="left")
     idx = np.clip(idx, 0, len(logfpr_col) - 1)
 
-    return RaggedData(logfpr_col[idx].astype(np.float32), ragged_scores.offsets.copy())
+    return RaggedData(logfpr_col[idx].astype(np.float32), ragged_scores.offsets)
 
 
 def get_frequencies(model: GenericModel, sequences: RaggedData, strand: Optional[StrandMode] = None) -> RaggedData:
@@ -428,7 +444,7 @@ class PwmStrategy:
     @staticmethod
     def scan(model: GenericModel, sequences: RaggedData, strand: StrandMode) -> RaggedData:
         """Scan sequences with PWM model."""
-        representation = model.representation.astype(np.float32)
+        representation = _get_float32_representation(model)
         kmer = model.config.get("kmer", 1)
 
         if strand == "+":
@@ -474,7 +490,7 @@ class PwmStrategy:
 
         pwm = pfm_to_pwm(pfm)
 
-        pwm_ext = np.concatenate((pwm, np.min(pwm, axis=0, keepdims=True)), axis=0)
+        pwm_ext = np.concatenate((pwm, np.min(pwm, axis=0, keepdims=True)), axis=0).astype(np.float32, copy=False)
 
         return GenericModel(
             type_key="pwm", name=name, length=int(length), representation=pwm_ext, config={"kmer": 1, "_pfm": pfm}
@@ -488,7 +504,7 @@ class SitegaStrategy:
     @staticmethod
     def scan(model: GenericModel, sequences: RaggedData, strand: StrandMode) -> RaggedData:
         """Scan sequences with PWM model."""
-        representation = model.representation.astype(np.float32)
+        representation = _get_float32_representation(model)
         kmer = model.config.get("kmer", 2)
 
         if strand == "+":
@@ -533,7 +549,7 @@ class SitegaStrategy:
             type_key="sitega",
             name=name,
             length=int(length),
-            representation=representation,
+            representation=np.asarray(representation, dtype=np.float32),
             config={"kmer": 2, "minimum": float(minimum), "maximum": float(maximum)},
         )
 
@@ -545,7 +561,7 @@ class BammStrategy:
     @staticmethod
     def scan(model: GenericModel, sequences: RaggedData, strand: StrandMode) -> RaggedData:
         """Scan sequences with BaMM model."""
-        representation = model.representation.astype(np.float32)
+        representation = _get_float32_representation(model)
         kmer = model.config.get("kmer", 2)
 
         if strand == "+":
@@ -601,7 +617,7 @@ class BammStrategy:
             type_key="bamm",
             name=name,
             length=representation.shape[-1],
-            representation=representation,
+            representation=np.asarray(representation, dtype=np.float32),
             config={"kmer": 2},
         )
 

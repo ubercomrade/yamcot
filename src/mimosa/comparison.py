@@ -14,6 +14,7 @@ Key Features:
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from dataclasses import dataclass, replace
@@ -24,6 +25,7 @@ import numpy as np
 from joblib import Parallel, delayed
 from scipy.ndimage import convolve1d
 
+from mimosa.cache import fingerprint_ragged, load_profile_cache, store_profile_cache
 from mimosa.execute import run_motali
 from mimosa.functions import (
     fast_profile_score,
@@ -40,6 +42,8 @@ from mimosa.models import (
     write_model,
 )
 from mimosa.ragged import RaggedData
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -69,6 +73,8 @@ class ComparatorConfig:
     motali_shift: int = 50
     tmp_directory: str = "."
     fasta_path: Optional[str] = None
+    cache_mode: str = "off"
+    cache_dir: str = ".mimosa-cache"
     promoters: Optional[RaggedData] = dc_field(default=None, compare=False, hash=False, repr=False)
 
 
@@ -90,6 +96,8 @@ def create_comparator_config(**kwargs) -> ComparatorConfig:
         "motali_err": 0.002,
         "motali_shift": 50,
         "tmp_directory": ".",
+        "cache_mode": "off",
+        "cache_dir": ".mimosa-cache",
     }
 
     config_params = {**defaults, **kwargs}
@@ -111,6 +119,10 @@ def create_comparator_config(**kwargs) -> ComparatorConfig:
     min_logfpr = config_params.get("min_logfpr")
     if min_logfpr is not None and float(min_logfpr) < 0.0:
         raise ValueError("min_logfpr must be non-negative.")
+    cache_mode = str(config_params.get("cache_mode", "off")).lower()
+    if cache_mode not in {"off", "on"}:
+        raise ValueError("cache_mode must be either 'off' or 'on'.")
+    config_params["cache_mode"] = cache_mode
 
     return ComparatorConfig(**config_params)
 
@@ -126,6 +138,58 @@ def _scores_to_profile_signal(
         profile = scores_to_frequencies(scores)
     else:
         profile = scores_to_log_fpr(model, scores, cfg.promoters, strand=strand)
+
+    return profile
+
+
+def _get_profile_runtime_cache(model: GenericModel) -> dict:
+    """Return the per-model in-memory cache for derived profile signals."""
+    cache = model.config.get("_profile_runtime_cache")
+    if cache is None:
+        cache = {}
+        model.config["_profile_runtime_cache"] = cache
+    return cache
+
+
+def _resolve_profile_signal(
+    model: GenericModel,
+    sequences: Optional[RaggedData],
+    cfg: ComparatorConfig,
+    strand: str,
+    role: str,
+) -> RaggedData:
+    """Resolve a model to the profile signal used in profile comparisons."""
+    profile_kind = "logfpr" if cfg.promoters is not None else "empirical"
+    sequence_fp = fingerprint_ragged(sequences) or "no-sequences"
+    promoter_fp = fingerprint_ragged(cfg.promoters)
+    runtime_key = (profile_kind, strand, sequence_fp, promoter_fp)
+    runtime_cache = _get_profile_runtime_cache(model)
+
+    cached = runtime_cache.get(runtime_key)
+    if cached is not None:
+        return cached
+
+    use_disk_cache = role == "target" and cfg.cache_mode == "on"
+    if use_disk_cache:
+        cached = load_profile_cache(model, sequences, cfg.promoters, strand, profile_kind, cfg.cache_dir)
+        if cached is not None:
+            runtime_cache[runtime_key] = cached
+            logger.debug("Profile cache hit for target '%s' (%s strand).", model.name, strand)
+            return cached
+
+    if model.type_key == "scores":
+        scores = scan_model(model, None, strand)
+    else:
+        if sequences is None:
+            raise ValueError("Profile strategy requires sequences when comparing motif models.")
+        scores = scan_model(model, sequences, strand)
+
+    profile = _scores_to_profile_signal(model, scores, cfg, strand)
+    runtime_cache[runtime_key] = profile
+
+    if use_disk_cache:
+        store_profile_cache(model, sequences, cfg.promoters, strand, profile_kind, cfg.cache_dir, profile)
+        logger.debug("Stored profile cache for target '%s' (%s strand).", model.name, strand)
 
     return profile
 
@@ -410,17 +474,9 @@ def strategy_profile(
     if cfg.promoters is not None and ("scores" in {model1.type_key, model2.type_key}):
         raise ValueError("Profile strategy with promoters requires motif models for both inputs.")
 
-    def resolve_scores(model: GenericModel, strand: str) -> RaggedData:
-        """Resolve an input model to positional scores."""
-        if model.type_key == "scores":
-            return scan_model(model, None, strand)
-        if sequences is None:
-            raise ValueError("Profile strategy requires sequences when comparing motif models.")
-        return scan_model(model, sequences, strand)
-
-    freq1_plus = _scores_to_profile_signal(model1, resolve_scores(model1, "+"), cfg, "+")
-    freq2_plus = _scores_to_profile_signal(model2, resolve_scores(model2, "+"), cfg, "+")
-    freq2_minus = _scores_to_profile_signal(model2, resolve_scores(model2, "-"), cfg, "-")
+    freq1_plus = _resolve_profile_signal(model1, sequences, cfg, "+", role="query")
+    freq2_plus = _resolve_profile_signal(model2, sequences, cfg, "+", role="target")
+    freq2_minus = _resolve_profile_signal(model2, sequences, cfg, "-", role="target")
 
     def get_score(S1: RaggedData, S2: RaggedData) -> Tuple[float, int]:
         """Compute score and offset for two profiles."""

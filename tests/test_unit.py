@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from mimosa.api import compare_motifs, create_config, run_comparison
+from mimosa.cache import clear_cache
 from mimosa.comparison import (
     create_comparator_config,
     strategy_motali,
@@ -274,6 +275,15 @@ def test_create_comparator_config_validates_min_logfpr():
         create_comparator_config(min_logfpr=-0.1)
 
 
+def test_create_comparator_config_validates_cache_mode():
+    """Target cache mode should accept only explicit on/off values."""
+    with pytest.raises(ValueError, match="cache_mode"):
+        create_comparator_config(cache_mode="targets")
+
+    config = create_comparator_config(cache_mode="on")
+    assert config.cache_mode == "on"
+
+
 def test_comparison_registry():
     """Test comparison registry functionality"""
     # Test that we can get registered strategies
@@ -386,6 +396,62 @@ def test_batch_all_scores_with_simple_data():
     assert hasattr(result, "data") and hasattr(result, "offsets")
 
 
+def _manual_reverse_scores(seq: np.ndarray, matrix: np.ndarray, kmer: int, with_context: bool) -> np.ndarray:
+    """Reproduce reverse-complement scoring with the legacy per-window logic."""
+    motif_len = matrix.shape[-1]
+    context_len = kmer - 1
+    window_size = motif_len + context_len
+    rc_table = np.array([3, 2, 1, 0, 4], dtype=np.int8)
+    n_scores = max(0, seq.size - motif_len + 1)
+    scores = np.zeros(n_scores, dtype=np.float32)
+
+    for pos in range(n_scores):
+        if with_context:
+            window = np.full(window_size, 4, dtype=np.int8)
+            for t in range(window_size):
+                data_idx = pos + (window_size - 1 - t)
+                if 0 <= data_idx < seq.size:
+                    window[t] = rc_table[seq[data_idx]]
+        else:
+            window = rc_table[seq[pos : pos + motif_len][::-1]]
+        scores[pos] = score_seq(window, kmer, matrix)
+
+    return scores
+
+
+def test_batch_all_scores_reverse_complement_preserves_positions():
+    """Reverse-complement PWM scan should remain aligned to forward coordinates."""
+    seq = np.array([0, 1, 2, 3, 0, 1], dtype=np.int8)
+    sequences = ragged_from_list([seq], dtype=np.int8)
+    representation = np.array(
+        [
+            [1.0, 0.1, 0.3],
+            [0.2, 1.1, 0.2],
+            [0.3, 0.2, 1.2],
+            [0.4, 0.5, 0.6],
+            [0.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    result = batch_all_scores(sequences, representation, kmer=1, is_revcomp=True)
+    expected = _manual_reverse_scores(seq, representation, kmer=1, with_context=False)
+
+    np.testing.assert_allclose(result.get_slice(0), expected)
+
+
+def test_batch_all_scores_reverse_complement_with_context_preserves_positions():
+    """Reverse-complement BaMM scan should keep the same coordinate convention."""
+    seq = np.array([0, 1, 2, 3, 0, 1], dtype=np.int8)
+    sequences = ragged_from_list([seq], dtype=np.int8)
+    representation = np.arange(25 * 3, dtype=np.float32).reshape(25, 3) / 10.0
+
+    result = batch_all_scores(sequences, representation, kmer=2, is_revcomp=True, with_context=True)
+    expected = _manual_reverse_scores(seq, representation, kmer=2, with_context=True)
+
+    np.testing.assert_allclose(result.get_slice(0), expected)
+
+
 @pytest.mark.parametrize(
     ("metric", "expected"),
     [
@@ -476,6 +542,78 @@ def test_strategy_profile_uses_motif_offset_convention():
     assert res_profile_minus["orientation"] == "+-"
     assert res_motif_minus["orientation"] == "+-"
     assert res_profile_minus["offset"] == res_motif_minus["offset"] == 1
+
+
+def test_strategy_profile_uses_target_disk_cache(tmp_path, monkeypatch):
+    """A cached target profile should be reused across repeated comparisons."""
+
+    def make_model(name: str) -> GenericModel:
+        representation = np.array(
+            [
+                [0.9, 0.2, 0.1],
+                [0.2, 0.8, 0.3],
+                [0.1, 0.3, 0.9],
+                [0.3, 0.2, 0.1],
+                [0.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        return GenericModel(type_key="pwm", name=name, representation=representation, length=3, config={"kmer": 1})
+
+    sequences = ragged_from_list(
+        [
+            np.array([0, 1, 2, 3, 0, 1, 2], dtype=np.int8),
+            np.array([1, 2, 3, 0, 1, 2, 3], dtype=np.int8),
+        ],
+        dtype=np.int8,
+    )
+    query = make_model("query")
+    target = make_model("target")
+    cfg = create_comparator_config(metric="co", cache_mode="on", cache_dir=str(tmp_path), n_permutations=0)
+
+    first = strategy_profile(query, target, sequences, cfg)
+    assert first["target"] == "target"
+    assert any(tmp_path.rglob("*.npz"))
+
+    fresh_target = make_model("target")
+    original_scan = strategy_profile.__globals__["scan_model"]
+
+    def guarded_scan(model, current_sequences, strand):
+        if model.name == "target":
+            raise AssertionError("target scan should be served from disk cache")
+        return original_scan(model, current_sequences, strand)
+
+    monkeypatch.setitem(strategy_profile.__globals__, "scan_model", guarded_scan)
+    second = strategy_profile(query, fresh_target, sequences, cfg)
+
+    assert second["target"] == "target"
+    assert second["score"] == pytest.approx(first["score"])
+    assert second["orientation"] == first["orientation"]
+
+
+def test_clear_cache_removes_cached_profiles(tmp_path):
+    """Cache cleanup helper should remove stored profile artifacts."""
+    representation = np.array(
+        [
+            [0.9, 0.2, 0.1],
+            [0.2, 0.8, 0.3],
+            [0.1, 0.3, 0.9],
+            [0.3, 0.2, 0.1],
+            [0.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    sequences = ragged_from_list([np.array([0, 1, 2, 3, 0, 1, 2], dtype=np.int8)], dtype=np.int8)
+    query = GenericModel(type_key="pwm", name="query", representation=representation, length=3, config={"kmer": 1})
+    target = GenericModel(type_key="pwm", name="target", representation=representation, length=3, config={"kmer": 1})
+    cfg = create_comparator_config(metric="co", cache_mode="on", cache_dir=str(tmp_path), n_permutations=0)
+
+    strategy_profile(query, target, sequences, cfg)
+
+    removed = clear_cache(str(tmp_path))
+
+    assert removed > 0
+    assert not tmp_path.exists()
 
 
 def test_create_config_builds_unified_config():

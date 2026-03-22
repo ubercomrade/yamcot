@@ -6,6 +6,7 @@ import sys
 from typing import Any, Dict
 
 from mimosa.api import create_config, run_comparison
+from mimosa.cache import clear_cache
 from mimosa.comparison import create_comparator_config
 
 PROFILE_MODEL_TYPES = ["scores", "pwm", "bamm", "sitega"]
@@ -54,6 +55,7 @@ Examples:
     _add_profile_parser(subparsers)
     _add_motif_parser(subparsers)
     _add_motali_parser(subparsers)
+    _add_cache_parser(subparsers)
 
     return parser
 
@@ -166,6 +168,17 @@ def _add_profile_parser(subparsers: argparse._SubParsersAction) -> None:
         type=int,
         default=-1,
         help="Number of parallel jobs. Use -1 for all cores. (default: %(default)s)",
+    )
+    technical_group.add_argument(
+        "--cache",
+        choices=["off", "on"],
+        default="off",
+        help="Enable lazy disk cache for target-derived profiles. (default: %(default)s)",
+    )
+    technical_group.add_argument(
+        "--cache-dir",
+        default=".mimosa-cache",
+        help="Directory used for lazy target profile cache files. (default: %(default)s)",
     )
 
 
@@ -327,9 +340,31 @@ def _add_motali_parser(subparsers: argparse._SubParsersAction) -> None:
     )
 
 
+def _add_cache_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Add the cache management parser."""
+    parser = subparsers.add_parser("cache", help="Manage lazy profile cache artifacts.")
+    nested = parser.add_subparsers(dest="cache_action", required=True)
+
+    clear_parser = nested.add_parser("clear", help="Remove all cached profile artifacts.")
+    clear_parser.add_argument(
+        "--cache-dir",
+        default=".mimosa-cache",
+        help="Directory containing cached profile artifacts. (default: %(default)s)",
+    )
+    clear_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging.",
+    )
+
+
 def validate_inputs(args) -> None:
     """Validate input files and parameters."""
     logger = logging.getLogger(__name__)
+
+    if args.mode == "cache":
+        return
 
     def validate_kernel_size_range(min_kernel_size: int, max_kernel_size: int) -> None:
         """Validate kernel-size bounds used by surrogate generation."""
@@ -383,6 +418,8 @@ def map_args_to_comparator_kwargs(args) -> Dict[str, Any]:
             "min_kernel_size": args.min_kernel_size,
             "max_kernel_size": args.max_kernel_size,
             "min_logfpr": args.min_logfpr,
+            "cache_mode": args.cache,
+            "cache_dir": args.cache_dir,
         }
 
     if args.mode == "motif":
@@ -447,6 +484,19 @@ def run_comparison_from_args(args) -> None:
         raise
 
 
+def run_cache_command_from_args(args) -> None:
+    """Run a cache maintenance command."""
+    logger = logging.getLogger(__name__)
+
+    if args.cache_action == "clear":
+        removed = clear_cache(args.cache_dir)
+        logger.info("Cleared cache directory '%s' (%s entries removed).", args.cache_dir, removed)
+        print(json.dumps({"cache_dir": args.cache_dir, "removed": removed}))
+        return
+
+    raise ValueError(f"Unknown cache action: {args.cache_action}")
+
+
 def main_cli() -> None:
     """Main CLI entry point."""
     parser = create_arg_parser()
@@ -458,7 +508,10 @@ def main_cli() -> None:
     args = parser.parse_args()
     setup_logging(args.verbose)
     validate_inputs(args)
-    run_comparison_from_args(args)
+    if args.mode == "cache":
+        run_cache_command_from_args(args)
+    else:
+        run_comparison_from_args(args)
 
 
 if __name__ == "__main__":

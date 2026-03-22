@@ -3,6 +3,8 @@ from numba import njit, prange
 
 from mimosa.ragged import RaggedData
 
+RC_TABLE = np.array([3, 2, 1, 0, 4], dtype=np.int8)
+
 
 def pfm_to_pwm(pfm):
     """Convert Position Frequency Matrix to Position Weight Matrix."""
@@ -33,13 +35,28 @@ def score_seq(num_site, kmer, model):
     return score
 
 
-@njit(inline="always")
+@njit(inline="always", cache=True)
 def _fill_rc_buffer(data, start, length, buffer):
     """Fill a buffer with reverse-complement values without allocations."""
-    rc_table = np.array([3, 2, 1, 0, 4], dtype=np.int8)
     for j in range(length):
         val = data[start + length - 1 - j]
-        buffer[j] = rc_table[val]
+        buffer[j] = RC_TABLE[val]
+
+
+@njit(inline="always", cache=True)
+def _fill_forward_context_window(seq, seq_len, site_start, motif_len, context_len, buffer):
+    """Fill one forward-scanning context window with N-padding."""
+    buffer[:] = 4
+
+    window_start = site_start - context_len
+    window_end = site_start + motif_len
+    actual_start = 0 if window_start < 0 else window_start
+    actual_end = seq_len if window_end > seq_len else window_end
+    dest_start = 0 if window_start >= 0 else -window_start
+    copy_len = actual_end - actual_start
+
+    if copy_len > 0:
+        buffer[dest_start : dest_start + copy_len] = seq[actual_start:actual_end]
 
 
 @njit(parallel=True, fastmath=True, cache=True)
@@ -62,19 +79,22 @@ def _batch_all_scores_jit(data, offsets, matrix, kmer, is_revcomp):
 
     for i in prange(n_seq):
         start = offsets[i]
+        seq_len = offsets[i + 1] - start
         out_start = new_offsets[i]
         n_scores = new_offsets[i + 1] - out_start
 
         if n_scores > 0:
-            site_buffer = np.empty(m, dtype=data.dtype)
-
-            for k in range(n_scores):
-                if not is_revcomp:
+            if not is_revcomp:
+                for k in range(n_scores):
                     num_site = data[start + k : start + k + m]
                     results[out_start + k] = score_seq(num_site, kmer, matrix)
-                else:
-                    _fill_rc_buffer(data, start + k, m, site_buffer)
-                    results[out_start + k] = score_seq(site_buffer, kmer, matrix)
+            else:
+                rc_seq = np.empty(seq_len, dtype=data.dtype)
+                _fill_rc_buffer(data, start, seq_len, rc_seq)
+
+                for k in range(n_scores):
+                    num_site = rc_seq[k : k + m]
+                    results[out_start + (n_scores - 1 - k)] = score_seq(num_site, kmer, matrix)
 
     return results, new_offsets
 
@@ -86,7 +106,6 @@ def _batch_all_scores_with_context_jit(data, offsets, matrix, kmer, is_revcomp):
     m = matrix.shape[-1]
     context_len = kmer - 1
     window_size = m + context_len
-    rc_table = np.array([3, 2, 1, 0, 4], dtype=np.int8)
 
     new_offsets = np.zeros(n_seq + 1, dtype=np.int64)
     for i in range(n_seq):
@@ -106,34 +125,17 @@ def _batch_all_scores_with_context_jit(data, offsets, matrix, kmer, is_revcomp):
         out_start = new_offsets[i]
         n_scores = new_offsets[i + 1] - out_start
 
-        site_buffer = np.full(window_size, 4, dtype=data.dtype)
-
         if n_scores > 0:
+            seq = data[start : start + seq_len]
+            if is_revcomp:
+                seq = np.empty(seq_len, dtype=data.dtype)
+                _fill_rc_buffer(data, start, seq_len, seq)
+
+            site_buffer = np.full(window_size, 4, dtype=data.dtype)
             for k in range(n_scores):
-                site_buffer[:] = 4
-
-                if not is_revcomp:
-                    s_idx = k - context_len
-                    e_idx = k + m
-
-                    actual_start = max(0, s_idx)
-                    actual_end = min(seq_len, e_idx)
-                    dest_start = max(0, -s_idx)
-
-                    copy_len = actual_end - actual_start
-                    if copy_len > 0:
-                        site_buffer[dest_start : dest_start + copy_len] = data[
-                            start + actual_start : start + actual_end
-                        ]
-                else:
-                    r_start = k
-
-                    for t in range(window_size):
-                        data_idx = start + r_start + (window_size - 1 - t)
-                        if start <= data_idx < start + seq_len:
-                            site_buffer[t] = rc_table[data[data_idx]]
-
-                results[out_start + k] = score_seq(site_buffer, kmer, matrix)
+                _fill_forward_context_window(seq, seq_len, k, m, context_len, site_buffer)
+                result_idx = out_start + k if not is_revcomp else out_start + (n_scores - 1 - k)
+                results[result_idx] = score_seq(site_buffer, kmer, matrix)
 
     return results, new_offsets
 
@@ -347,7 +349,7 @@ def scores_to_frequencies(ragged_scores: RaggedData) -> RaggedData:
     n = flat.size
 
     if n == 0:
-        return RaggedData(np.zeros(0, dtype=np.float32), ragged_scores.offsets.copy())
+        return RaggedData(np.zeros(0, dtype=np.float32), ragged_scores.offsets)
 
     _, inv, cnt = np.unique(flat, return_inverse=True, return_counts=True)
     surv = np.cumsum(cnt[::-1])[::-1]
@@ -356,7 +358,7 @@ def scores_to_frequencies(ragged_scores: RaggedData) -> RaggedData:
     log_p = np.log10(n + eps) - np.log10(surv + eps)
 
     new_data = log_p[inv].astype(np.float32)
-    return RaggedData(new_data, ragged_scores.offsets.copy())
+    return RaggedData(new_data, ragged_scores.offsets)
 
 
 @njit(inline="always", cache=True)
