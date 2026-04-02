@@ -44,7 +44,9 @@ def _fill_rc_buffer(data, start, length, buffer):
 
 
 @njit(inline="always", cache=True)
-def _fill_forward_context_window(seq, seq_len, site_start, motif_len, context_len, buffer):
+def _fill_forward_context_window(
+    seq, seq_len, site_start, motif_len, context_len, buffer
+):
     """Fill one forward-scanning context window with N-padding."""
     buffer[:] = 4
 
@@ -94,7 +96,9 @@ def _batch_all_scores_jit(data, offsets, matrix, kmer, is_revcomp):
 
                 for k in range(n_scores):
                     num_site = rc_seq[k : k + m]
-                    results[out_start + (n_scores - 1 - k)] = score_seq(num_site, kmer, matrix)
+                    results[out_start + (n_scores - 1 - k)] = score_seq(
+                        num_site, kmer, matrix
+                    )
 
     return results, new_offsets
 
@@ -133,41 +137,56 @@ def _batch_all_scores_with_context_jit(data, offsets, matrix, kmer, is_revcomp):
 
             site_buffer = np.full(window_size, 4, dtype=data.dtype)
             for k in range(n_scores):
-                _fill_forward_context_window(seq, seq_len, k, m, context_len, site_buffer)
-                result_idx = out_start + k if not is_revcomp else out_start + (n_scores - 1 - k)
+                _fill_forward_context_window(
+                    seq, seq_len, k, m, context_len, site_buffer
+                )
+                result_idx = (
+                    out_start + k if not is_revcomp else out_start + (n_scores - 1 - k)
+                )
                 results[result_idx] = score_seq(site_buffer, kmer, matrix)
 
     return results, new_offsets
 
 
 def batch_all_scores(
-    sequences: RaggedData, matrix: np.ndarray, kmer: int = 1, is_revcomp: bool = False, with_context: bool = False
+    sequences: RaggedData,
+    matrix: np.ndarray,
+    kmer: int = 1,
+    is_revcomp: bool = False,
+    with_context: bool = False,
 ) -> RaggedData:
     """Compute scores for all sequences in RaggedData."""
     if with_context:
-        data, offsets = _batch_all_scores_with_context_jit(sequences.data, sequences.offsets, matrix, kmer, is_revcomp)
+        data, offsets = _batch_all_scores_with_context_jit(
+            sequences.data, sequences.offsets, matrix, kmer, is_revcomp
+        )
     else:
-        data, offsets = _batch_all_scores_jit(sequences.data, sequences.offsets, matrix, kmer, is_revcomp)
+        data, offsets = _batch_all_scores_jit(
+            sequences.data, sequences.offsets, matrix, kmer, is_revcomp
+        )
     return RaggedData(data, offsets)
 
 
 @njit
 def precision_recall_curve(classification, scores):
     """Compute precision-recall curve (JIT-compiled)."""
-    n = len(scores)
-    if n == 0:
+    if len(scores) == 0:
         return np.array([1.0]), np.array([0.0]), np.array([np.inf])
 
+    # Get indices for sorting scores in descending order
     indexes = np.argsort(scores)[::-1]
     sorted_scores = scores[indexes]
     sorted_classification = classification[indexes]
 
-    max_size = n
+    # Initialize arrays (with +1 buffer for initial point)
+    number_of_uniq_scores = np.unique(scores).shape[0]
+    max_size = number_of_uniq_scores + 1
 
     precision = np.zeros(max_size)
     recall = np.zeros(max_size)
     uniq_scores = np.zeros(max_size)
 
+    # Initial point: (recall=0, precision=1, threshold=inf)
     precision[0] = 1.0
     recall[0] = 0.0
     uniq_scores[0] = np.inf
@@ -188,11 +207,13 @@ def precision_recall_curve(classification, scores):
         _score = sorted_scores[i]
         _flag = sorted_classification[i]
 
+        # Update TP and FP
         if _flag == 1:
             TP += 1
         else:
             FP += 1
 
+        # Check if score changed
         if i == len(scores) - 1 or score != sorted_scores[i + 1]:
             uniq_scores[position] = _score
 
@@ -216,20 +237,23 @@ def precision_recall_curve(classification, scores):
 @njit
 def roc_curve(classification, scores):
     """Compute ROC curve (JIT-compiled)."""
-    n = len(scores)
-    if n == 0:
+    if len(scores) == 0:
         return np.array([0.0]), np.array([0.0]), np.array([np.inf])
 
+    # Get indices for sorting scores in descending order
     indexes = np.argsort(scores)[::-1]
     sorted_scores = scores[indexes]
     sorted_classification = classification[indexes]
 
-    max_size = n + 1
+    # Initialize arrays
+    number_of_uniq_scores = np.unique(scores).shape[0]
+    max_size = number_of_uniq_scores + 1
 
     tpr = np.zeros(max_size)
     fpr = np.zeros(max_size)
     uniq_scores = np.zeros(max_size)
 
+    # Initial point: (fpr=0, tpr=0, threshold=inf)
     tpr[0] = 0.0
     fpr[0] = 0.0
     uniq_scores[0] = np.inf
@@ -244,11 +268,13 @@ def roc_curve(classification, scores):
         _score = sorted_scores[i]
         _flag = sorted_classification[i]
 
+        # Update TP and FP
         if _flag == 1:
             TP += 1
         else:
             FP += 1
 
+        # Check if score changed
         if i == len(scores) - 1 or score != sorted_scores[i + 1]:
             uniq_scores[position] = _score
 
@@ -297,7 +323,9 @@ def cut_roc(tpr: np.ndarray, fpr: np.ndarray, thr: np.ndarray, score_cutoff: flo
 
     tpr_cut = np.concatenate([tpr[: last + 1], np.array([t_cut], dtype=tpr.dtype)])
     fpr_cut = np.concatenate([fpr[: last + 1], np.array([f_cut], dtype=fpr.dtype)])
-    thr_cut = np.concatenate([thr[: last + 1], np.array([score_cutoff], dtype=thr.dtype)])
+    thr_cut = np.concatenate(
+        [thr[: last + 1], np.array([score_cutoff], dtype=thr.dtype)]
+    )
 
     return tpr_cut, fpr_cut, thr_cut
 
@@ -330,7 +358,9 @@ def cut_prc(rec: np.ndarray, prec: np.ndarray, thr: np.ndarray, score_cutoff: fl
 
     rec_cut = np.concatenate([rec[: last + 1], np.array([r_cut], dtype=rec.dtype)])
     prec_cut = np.concatenate([prec[: last + 1], np.array([p_cut], dtype=prec.dtype)])
-    thr_cut = np.concatenate([thr[: last + 1], np.array([score_cutoff], dtype=thr.dtype)])
+    thr_cut = np.concatenate(
+        [thr[: last + 1], np.array([score_cutoff], dtype=thr.dtype)]
+    )
 
     return rec_cut, prec_cut, thr_cut
 
@@ -391,7 +421,9 @@ def _profile_score_from_stats_numba(metric_id, inter, sum1, sum2, valid_count, e
 
 
 @njit(fastmath=True, cache=True)
-def _fast_profile_score_kernel_numba(data1, offsets1, data2, offsets2, search_range, min_value, metric_id):
+def _fast_profile_score_kernel_numba(
+    data1, offsets1, data2, offsets2, search_range, min_value, metric_id
+):
     """Compute overlap-derived profile similarity scores over RaggedData with JIT."""
     n_seq = len(offsets1) - 1
     n_offsets = 2 * search_range + 1
@@ -445,7 +477,9 @@ def _fast_profile_score_kernel_numba(data1, offsets1, data2, offsets2, search_ra
     found_valid = False
 
     for k in range(n_offsets):
-        score = _profile_score_from_stats_numba(metric_id, inters[k], sum1s[k], sum2s[k], valid_counts[k], eps)
+        score = _profile_score_from_stats_numba(
+            metric_id, inters[k], sum1s[k], sum2s[k], valid_counts[k], eps
+        )
         if score >= 0.0:
             found_valid = True
             if score > best_score:
@@ -471,10 +505,14 @@ def _profile_metric_to_id(metric: str) -> int:
     raise ValueError("metric must be one of: 'cj', 'co', 'dice', 'l1sim'")
 
 
-def fast_profile_score(data1, offsets1, data2, offsets2, search_range, min_value=0.0, metric="cj"):
+def fast_profile_score(
+    data1, offsets1, data2, offsets2, search_range, min_value=0.0, metric="cj"
+):
     """Dispatch profile similarity scoring to the shared overlap-based kernel."""
     metric_id = _profile_metric_to_id(metric)
-    return _fast_profile_score_kernel_numba(data1, offsets1, data2, offsets2, search_range, min_value, metric_id)
+    return _fast_profile_score_kernel_numba(
+        data1, offsets1, data2, offsets2, search_range, min_value, metric_id
+    )
 
 
 def format_params(params: dict) -> str:
