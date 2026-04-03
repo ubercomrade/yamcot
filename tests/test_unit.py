@@ -344,7 +344,7 @@ def test_create_comparator_config_validates_min_logfpr():
 
 
 def test_create_comparator_config_validates_cache_mode():
-    """Target cache mode should accept only explicit on/off values."""
+    """Profile cache mode should accept only explicit on/off values."""
     with pytest.raises(ValueError, match="cache_mode"):
         create_comparator_config(cache_mode="targets")
 
@@ -612,8 +612,8 @@ def test_strategy_profile_uses_motif_offset_convention():
     assert res_profile_minus["offset"] == res_motif_minus["offset"] == 1
 
 
-def test_strategy_profile_uses_target_disk_cache(tmp_path, monkeypatch):
-    """A cached target profile should be reused across repeated comparisons."""
+def test_strategy_profile_uses_disk_cache_for_target_and_query(tmp_path, monkeypatch):
+    """Cached query and target profiles should be reused across repeated comparisons."""
 
     def make_model(name: str) -> GenericModel:
         representation = np.array(
@@ -641,18 +641,21 @@ def test_strategy_profile_uses_target_disk_cache(tmp_path, monkeypatch):
 
     first = strategy_profile(query, target, sequences, cfg)
     assert first["target"] == "target"
-    assert any(tmp_path.rglob("*.npz"))
+    assert len(list(tmp_path.rglob("*.npz"))) == 3
 
+    fresh_query = make_model("query")
     fresh_target = make_model("target")
     original_scan = strategy_profile.__globals__["scan_model"]
 
     def guarded_scan(model, current_sequences, strand):
+        if model.name == "query":
+            raise AssertionError("query scan should be served from disk cache")
         if model.name == "target":
             raise AssertionError("target scan should be served from disk cache")
         return original_scan(model, current_sequences, strand)
 
     monkeypatch.setitem(strategy_profile.__globals__, "scan_model", guarded_scan)
-    second = strategy_profile(query, fresh_target, sequences, cfg)
+    second = strategy_profile(fresh_query, fresh_target, sequences, cfg)
 
     assert second["target"] == "target"
     assert second["score"] == pytest.approx(first["score"])

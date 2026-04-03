@@ -156,7 +156,6 @@ def _resolve_profile_signal(
     sequences: Optional[RaggedData],
     cfg: ComparatorConfig,
     strand: str,
-    role: str,
 ) -> RaggedData:
     """Resolve a model to the profile signal used in profile comparisons."""
     profile_kind = "logfpr" if cfg.promoters is not None else "empirical"
@@ -169,12 +168,12 @@ def _resolve_profile_signal(
     if cached is not None:
         return cached
 
-    use_disk_cache = role == "target" and cfg.cache_mode == "on"
+    use_disk_cache = cfg.cache_mode == "on"
     if use_disk_cache:
         cached = load_profile_cache(model, sequences, cfg.promoters, strand, profile_kind, cfg.cache_dir)
         if cached is not None:
             runtime_cache[runtime_key] = cached
-            logger.debug("Profile cache hit for target '%s' (%s strand).", model.name, strand)
+            logger.debug("Profile cache hit for model '%s' (%s strand).", model.name, strand)
             return cached
 
     if model.type_key == "scores":
@@ -189,7 +188,7 @@ def _resolve_profile_signal(
 
     if use_disk_cache:
         store_profile_cache(model, sequences, cfg.promoters, strand, profile_kind, cfg.cache_dir, profile)
-        logger.debug("Stored profile cache for target '%s' (%s strand).", model.name, strand)
+        logger.debug("Stored profile cache for model '%s' (%s strand).", model.name, strand)
 
     return profile
 
@@ -474,9 +473,9 @@ def strategy_profile(
     if cfg.promoters is not None and ("scores" in {model1.type_key, model2.type_key}):
         raise ValueError("Profile strategy with promoters requires motif models for both inputs.")
 
-    freq1_plus = _resolve_profile_signal(model1, sequences, cfg, "+", role="query")
-    freq2_plus = _resolve_profile_signal(model2, sequences, cfg, "+", role="target")
-    freq2_minus = _resolve_profile_signal(model2, sequences, cfg, "-", role="target")
+    freq1_plus = _resolve_profile_signal(model1, sequences, cfg, "+")
+    freq2_plus = _resolve_profile_signal(model2, sequences, cfg, "+")
+    freq2_minus = _resolve_profile_signal(model2, sequences, cfg, "-")
 
     def get_score(S1: RaggedData, S2: RaggedData) -> Tuple[float, int]:
         """Compute score and offset for two profiles."""

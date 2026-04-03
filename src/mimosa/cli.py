@@ -173,12 +173,12 @@ def _add_profile_parser(subparsers: argparse._SubParsersAction) -> None:
         "--cache",
         choices=["off", "on"],
         default="off",
-        help="Enable lazy disk cache for target-derived profiles. (default: %(default)s)",
+        help="Enable lazy disk cache for derived profiles. (default: %(default)s)",
     )
     technical_group.add_argument(
         "--cache-dir",
         default=".mimosa-cache",
-        help="Directory used for lazy target profile cache files. (default: %(default)s)",
+        help="Directory used for lazy profile cache files. (default: %(default)s)",
     )
 
 
