@@ -29,10 +29,12 @@ from mimosa.functions import batch_all_scores, pfm_to_pwm, scores_to_frequencies
 from mimosa.io import (
     parse_file_content,
     read_bamm,
+    read_dimont,
     read_meme,
     read_pfm,
     read_scores,
     read_sitega,
+    read_slim,
     write_sitega,
 )
 from mimosa.ragged import RaggedData
@@ -437,6 +439,29 @@ def _rc_sequence(seq_int: np.ndarray) -> np.ndarray:
     return rc_table[seq_int[::-1]]
 
 
+def _scan_with_batch_kernel(
+    model: GenericModel,
+    sequences: RaggedData,
+    strand: StrandMode,
+    *,
+    with_context: bool = False,
+) -> RaggedData:
+    """Scan a tensor-based motif model with the shared batch scoring kernel."""
+    representation = _get_float32_representation(model)
+    kmer = model.config.get("kmer", 1)
+
+    if strand == "+":
+        return batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=False, with_context=with_context)
+    elif strand == "-":
+        return batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=True, with_context=with_context)
+    elif strand == "best":
+        sf = batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=False, with_context=with_context)
+        sr = batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=True, with_context=with_context)
+        return RaggedData(np.maximum(sf.data, sr.data), sf.offsets)
+    else:
+        raise ValueError(f"Invalid strand mode: {strand}")
+
+
 @registry.register("pwm")
 class PwmStrategy:
     """PWM (Position Weight Matrix) strategy implementation."""
@@ -444,19 +469,7 @@ class PwmStrategy:
     @staticmethod
     def scan(model: GenericModel, sequences: RaggedData, strand: StrandMode) -> RaggedData:
         """Scan sequences with PWM model."""
-        representation = _get_float32_representation(model)
-        kmer = model.config.get("kmer", 1)
-
-        if strand == "+":
-            return batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=False)
-        elif strand == "-":
-            return batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=True)
-        elif strand == "best":
-            sf = batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=False)
-            sr = batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=True)
-            return RaggedData(np.maximum(sf.data, sr.data), sf.offsets)
-        else:
-            raise ValueError(f"Invalid strand mode: {strand}")
+        return _scan_with_batch_kernel(model, sequences, strand, with_context=False)
 
     @staticmethod
     def write(model: GenericModel, path: str) -> None:
@@ -504,19 +517,7 @@ class SitegaStrategy:
     @staticmethod
     def scan(model: GenericModel, sequences: RaggedData, strand: StrandMode) -> RaggedData:
         """Scan sequences with PWM model."""
-        representation = _get_float32_representation(model)
-        kmer = model.config.get("kmer", 2)
-
-        if strand == "+":
-            return batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=False)
-        elif strand == "-":
-            return batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=True)
-        elif strand == "best":
-            sf = batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=False)
-            sr = batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=True)
-            return RaggedData(np.maximum(sf.data, sr.data), sf.offsets)
-        else:
-            raise ValueError(f"Invalid strand mode: {strand}")
+        return _scan_with_batch_kernel(model, sequences, strand, with_context=False)
 
     @staticmethod
     def write(model: GenericModel, path: str) -> None:
@@ -561,19 +562,7 @@ class BammStrategy:
     @staticmethod
     def scan(model: GenericModel, sequences: RaggedData, strand: StrandMode) -> RaggedData:
         """Scan sequences with BaMM model."""
-        representation = _get_float32_representation(model)
-        kmer = model.config.get("kmer", 2)
-
-        if strand == "+":
-            return batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=False, with_context=True)
-        elif strand == "-":
-            return batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=True, with_context=True)
-        elif strand == "best":
-            sf = batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=False, with_context=True)
-            sr = batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=True, with_context=True)
-            return RaggedData(np.maximum(sf.data, sr.data), sf.offsets)
-        else:
-            raise ValueError(f"Invalid strand mode: {strand}")
+        return _scan_with_batch_kernel(model, sequences, strand, with_context=True)
 
     @staticmethod
     def write(model: GenericModel, path: str) -> None:
@@ -619,6 +608,88 @@ class BammStrategy:
             length=representation.shape[-1],
             representation=np.asarray(representation, dtype=np.float32),
             config={"kmer": 2},
+        )
+
+
+@registry.register("dimont")
+class DimontStrategy:
+    """Dimont motif model strategy implementation."""
+
+    @staticmethod
+    def scan(model: GenericModel, sequences: RaggedData, strand: StrandMode) -> RaggedData:
+        """Scan sequences with a Dimont motif model."""
+        return _scan_with_batch_kernel(model, sequences, strand, with_context=model.config.get("kmer", 1) > 1)
+
+    @staticmethod
+    def write(model: GenericModel, path: str) -> None:
+        """Persist Dimont models via pickle serialization."""
+        joblib.dump(model, path)
+
+    @staticmethod
+    def score_bounds(model: GenericModel) -> tuple[float, float]:
+        """Return theoretical min/max score for a Dimont model."""
+        return _score_bounds_from_representation(model.representation)
+
+    @staticmethod
+    def load(path: str, kwargs: dict) -> GenericModel:
+        """Load a Dimont XML model."""
+        _, ext = os.path.splitext(path.lower())
+
+        if ext == ".pkl":
+            return joblib.load(path)
+        elif ext == ".xml":
+            representation, length, span = read_dimont(path)
+        else:
+            raise ValueError(f"Unsupported Dimont format: {path}")
+
+        name = os.path.splitext(os.path.basename(path))[0]
+        return GenericModel(
+            type_key="dimont",
+            name=name,
+            length=length,
+            representation=np.asarray(representation, dtype=np.float32),
+            config={"kmer": span + 1},
+        )
+
+
+@registry.register("slim")
+class SlimStrategy:
+    """Slim motif model strategy implementation."""
+
+    @staticmethod
+    def scan(model: GenericModel, sequences: RaggedData, strand: StrandMode) -> RaggedData:
+        """Scan sequences with a Slim motif model."""
+        return _scan_with_batch_kernel(model, sequences, strand, with_context=model.config.get("kmer", 1) > 1)
+
+    @staticmethod
+    def write(model: GenericModel, path: str) -> None:
+        """Persist Slim models via pickle serialization."""
+        joblib.dump(model, path)
+
+    @staticmethod
+    def score_bounds(model: GenericModel) -> tuple[float, float]:
+        """Return theoretical min/max score for a Slim model."""
+        return _score_bounds_from_representation(model.representation)
+
+    @staticmethod
+    def load(path: str, kwargs: dict) -> GenericModel:
+        """Load a Slim XML model."""
+        _, ext = os.path.splitext(path.lower())
+
+        if ext == ".pkl":
+            return joblib.load(path)
+        elif ext == ".xml":
+            representation, length, span = read_slim(path)
+        else:
+            raise ValueError(f"Unsupported Slim format: {path}")
+
+        name = os.path.splitext(os.path.basename(path))[0]
+        return GenericModel(
+            type_key="slim",
+            name=name,
+            length=length,
+            representation=np.asarray(representation, dtype=np.float32),
+            config={"kmer": span + 1},
         )
 
 

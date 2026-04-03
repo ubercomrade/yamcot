@@ -182,7 +182,7 @@ The `mimosa` tool provides three operation modes.
 `profile` is the universal workflow. It compares score profiles and accepts either:
 
 - precomputed FASTA-like score files via `--model*-type scores`
-- motif models (`pwm`, `bamm`, `sitega`) that are first scanned on sequences to obtain profiles
+- motif models (`pwm`, `bamm`, `sitega`, `dimont`, `slim`) that are first scanned on sequences to obtain profiles
 
 **Example data**: [`examples/scores_1.fasta`](examples/scores_1.fasta), [`examples/pif4.meme`](examples/pif4.meme)
 
@@ -209,8 +209,8 @@ mimosa profile foxa2.meme gata4.meme \
 | :--- | :--- | :--- |
 | `model1` | Path | Path to the first input file. |
 | `model2` | Path | Path to the second input file. |
-| `--model1-type` | `scores`, `pwm`, `bamm`, `sitega` | Format of the first input (required). |
-| `--model2-type` | `scores`, `pwm`, `bamm`, `sitega` | Format of the second input (required). |
+| `--model1-type` | `scores`, `pwm`, `bamm`, `sitega`, `dimont`, `slim` | Format of the first input (required). |
+| `--model2-type` | `scores`, `pwm`, `bamm`, `sitega`, `dimont`, `slim` | Format of the second input (required). |
 | `--fasta` | Path | FASTA file used to scan motif inputs. If omitted when scanning is needed, random sequences are generated. |
 | `--num-sequences` | Integer | Number of generated sequences for scanning mode (default: `1000`). |
 | `--seq-length` | Integer | Length of generated sequences for scanning mode (default: `200`). |
@@ -246,8 +246,8 @@ When `--pfm-mode` is enabled, or when the model types differ, MIMOSA reconstruct
 | :--- | :--- | :--- |
 | `model1` | Path | Path to the first motif model file. |
 | `model2` | Path | Path to the second motif model file. |
-| `--model1-type` | `pwm`, `bamm`, `sitega` | Format of the first model (required). |
-| `--model2-type` | `pwm`, `bamm`, `sitega` | Format of the second model (required). |
+| `--model1-type` | `pwm`, `bamm`, `sitega`, `dimont`, `slim` | Format of the first model (required). |
+| `--model2-type` | `pwm`, `bamm`, `sitega`, `dimont`, `slim` | Format of the second model (required). |
 | `--fasta` | Path | Optional FASTA file for PFM reconstruction. If omitted when reconstruction is needed, random sequences are generated. |
 | `--num-sequences` | Integer | Number of generated sequences for PFM reconstruction (default: `20000`). |
 | `--seq-length` | Integer | Length of generated sequences for PFM reconstruction (default: `100`). |
@@ -460,7 +460,7 @@ from mimosa.comparison import compare, create_comparator_config
 from mimosa.io import read_fasta
 from mimosa.models import read_model
 
-# Load models in supported formats (pwm, bamm, sitega, scores, or custom registered type)
+# Load models in supported formats (pwm, bamm, sitega, dimont, slim, scores, or custom registered type)
 model1 = read_model("examples/pif4.meme", "pwm")
 model2 = read_model("examples/gata2.meme", "pwm")
 

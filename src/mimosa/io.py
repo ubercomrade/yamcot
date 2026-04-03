@@ -4,12 +4,16 @@ import copy
 import itertools
 import logging
 import os
+import re
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Iterable, List, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 
 from mimosa.ragged import RaggedData
+
+_JSTACS_NUMERIC_RE = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[Ee][-+]?\d+)?")
 
 
 def read_fasta(path: str | Path) -> RaggedData:
@@ -306,6 +310,215 @@ def read_bamm(motif_path: str, bg_path: str, target_order: int) -> np.ndarray:
     final_tensor[tuple(slice_objs)] = acgt_tensor
 
     return np.array(final_tensor, dtype=np.float32)
+
+
+def _xml_numeric_value(elem: Optional[ET.Element]) -> Optional[float]:
+    """Extract the last numeric scalar from a Jstacs XML element."""
+    if elem is None:
+        return None
+
+    texts = [text.strip() for text in elem.itertext() if text and text.strip()]
+    for text in reversed(texts):
+        if _JSTACS_NUMERIC_RE.fullmatch(text):
+            return float(text)
+
+    return None
+
+
+def _xml_array(elem: ET.Element):
+    """Recursively convert Jstacs <pos>-based arrays to Python lists."""
+    pos_children = [child for child in elem if child.tag == "pos"]
+    if not pos_children:
+        return _xml_numeric_value(elem)
+
+    return [_xml_array(child) for child in pos_children]
+
+
+def _log_normalize(values: np.ndarray) -> np.ndarray:
+    """Convert unconstrained log-parameters to normalized log-probabilities."""
+    shifted = values - np.max(values)
+    logsumexp = np.max(values) + np.log(np.sum(np.exp(shifted)))
+    return values - logsumexp
+
+
+def _fill_n_axis_with_min(arr: np.ndarray, axis: int) -> None:
+    """Assign the N state on one axis to the minimum over concrete nucleotides."""
+    index = [slice(None)] * arr.ndim
+    index[axis] = 4
+    arr[tuple(index)] = np.min(np.take(arr, [0, 1, 2, 3], axis=axis), axis=axis)
+
+
+def _build_position_tensor(
+    context_log_probs: Dict[Tuple[int, ...], np.ndarray],
+    context_axes: List[int],
+    span: int,
+) -> np.ndarray:
+    """Build one dense 5-ary context tensor for a single motif position."""
+    temp = np.full((5,) * span + (4,), np.inf, dtype=np.float64)
+
+    for context_values, log_probs in context_log_probs.items():
+        assignment = {axis: value for axis, value in zip(context_axes, context_values, strict=False)}
+        index = []
+        for axis in range(span):
+            index.append(assignment.get(axis, slice(None)))
+        index.append(slice(None))
+        temp[tuple(index)] = log_probs
+
+    for axis in context_axes:
+        _fill_n_axis_with_min(temp, axis)
+
+    position_tensor = np.empty((5,) * (span + 1), dtype=np.float64)
+    position_tensor[..., :4] = temp
+    position_tensor[..., 4] = np.min(temp, axis=-1)
+    return position_tensor.astype(np.float32, copy=False)
+
+
+def read_slim(path: str) -> tuple[np.ndarray, int, int]:
+    """Read a Jstacs Slim XML model into a dense context tensor."""
+    root = ET.parse(path).getroot()
+    slim = root.find(".//SLIM")
+    if slim is None:
+        raise ValueError(f"Could not find SLIM model in {path}")
+
+    length = int(_xml_numeric_value(slim.find("length")))
+    distance = int(_xml_numeric_value(slim.find("distance")))
+    component_params = _xml_array(slim.find("componentMixtureParameters"))
+    ancestor_params = _xml_array(slim.find("ancestorMixtureParameters"))
+    dependency_params = _xml_array(slim.find("dependencyParameters"))
+
+    tensor = np.empty((5,) * (distance + 1) + (length,), dtype=np.float32)
+
+    for position in range(length):
+        component_logits = np.asarray(component_params[position], dtype=np.float64)
+        component_log_probs = _log_normalize(component_logits)
+        independent_logits = np.asarray(dependency_params[position][0][0], dtype=np.float64)
+        independent_log_probs = _log_normalize(independent_logits)
+
+        if len(component_log_probs) == 1:
+            context_log_probs = {(): independent_log_probs}
+            context_axes: List[int] = []
+        else:
+            parent_count = len(ancestor_params[position][1])
+            parent_log_probs = _log_normalize(np.asarray(ancestor_params[position][1], dtype=np.float64))
+            dependency_log_probs = np.vstack(
+                [_log_normalize(np.asarray(row, dtype=np.float64)) for row in dependency_params[position][1]]
+            )
+            context_axes = list(range(distance - parent_count, distance))
+            context_log_probs = {}
+
+            for context in itertools.product(range(4), repeat=parent_count):
+                symbol_log_probs = np.empty(4, dtype=np.float64)
+                for symbol in range(4):
+                    dependent_terms = np.empty(parent_count, dtype=np.float64)
+                    for parent_offset in range(parent_count):
+                        parent_nt = context[parent_count - 1 - parent_offset]
+                        dependent_terms[parent_offset] = (
+                            parent_log_probs[parent_offset] + dependency_log_probs[parent_nt, symbol]
+                        )
+
+                    independent_score = component_log_probs[0] + independent_log_probs[symbol]
+                    dependent_score = component_log_probs[1] + (
+                        np.max(dependent_terms) + np.log(np.sum(np.exp(dependent_terms - np.max(dependent_terms))))
+                    )
+                    symbol_log_probs[symbol] = np.logaddexp(independent_score, dependent_score)
+
+                context_log_probs[context] = symbol_log_probs
+
+        tensor[..., position] = _build_position_tensor(context_log_probs, context_axes, distance)
+
+    return tensor, length, distance
+
+
+def _parse_dimont_treeelement(elem: ET.Element) -> dict:
+    """Parse one recursive MarkovModelDiffSM tree element."""
+    node = {"context_pos": int(_xml_numeric_value(elem.find("contextPos")))}
+    pars = elem.find("pars")
+    pars_pos = [child for child in pars if child.tag == "pos"] if pars is not None else []
+
+    if pars_pos:
+        logits = np.asarray(
+            [_xml_numeric_value(pos.find("parameter/value")) for pos in pars_pos],
+            dtype=np.float64,
+        )
+        node["log_probs"] = _log_normalize(logits)
+        return node
+
+    children_elem = elem.find("children")
+    if children_elem is None:
+        raise ValueError("Malformed Dimont tree: expected children or parameters")
+
+    node["children"] = [_parse_dimont_treeelement(pos.find("treeElement")) for pos in children_elem if pos.tag == "pos"]
+    return node
+
+
+def _collect_dimont_leaves(
+    node: dict, assignment: Dict[int, int], out: List[Tuple[Dict[int, int], np.ndarray]]
+) -> None:
+    """Collect all leaf conditional distributions from a Dimont tree."""
+    if "log_probs" in node:
+        out.append((assignment.copy(), node["log_probs"]))
+        return
+
+    context_pos = node["context_pos"]
+    for nucleotide, child in enumerate(node["children"]):
+        assignment[context_pos] = nucleotide
+        _collect_dimont_leaves(child, assignment, out)
+        del assignment[context_pos]
+
+
+def read_dimont(path: str) -> tuple[np.ndarray, int, int]:
+    """Read a Jstacs Dimont XML model into a dense context tensor."""
+    root = ET.parse(path).getroot()
+    model = root.find(".//ThresholdedStrandChIPper/function/pos/MarkovModelDiffSM")
+    if model is None:
+        raise ValueError(f"Could not find Dimont motif model in {path}")
+
+    trees = model.find("bayesianNetworkSF/trees")
+    if trees is None:
+        raise ValueError(f"Malformed Dimont model in {path}: missing trees")
+
+    tree_elements = [pos for pos in trees if pos.tag == "pos"]
+    length = len(tree_elements)
+    context_positions: List[List[int]] = []
+    nodes = []
+
+    for pos in tree_elements:
+        parameter_tree = pos.find("parameterTree")
+        if parameter_tree is None:
+            raise ValueError(f"Malformed Dimont model in {path}: missing parameter tree")
+
+        context_pos_elem = parameter_tree.find("contextPoss")
+        current_context_positions = (
+            [int(_xml_numeric_value(child)) for child in context_pos_elem if child.tag == "pos"]
+            if context_pos_elem is not None
+            else []
+        )
+        context_positions.append(current_context_positions)
+        nodes.append(_parse_dimont_treeelement(parameter_tree.find("root/treeElement")))
+
+    span = 0
+    for position, positions in enumerate(context_positions):
+        if positions:
+            span = max(span, max(position - parent for parent in positions))
+
+    tensor = np.empty((5,) * (span + 1) + (length,), dtype=np.float32)
+
+    for position, node in enumerate(nodes):
+        leaves: List[Tuple[Dict[int, int], np.ndarray]] = []
+        _collect_dimont_leaves(node, {}, leaves)
+
+        absolute_positions = list(range(position - span, position))
+        used_positions = set(context_positions[position])
+        context_axes = [axis for axis, abs_pos in enumerate(absolute_positions) if abs_pos in used_positions]
+        context_log_probs = {}
+
+        for assignment, log_probs in leaves:
+            context_values = tuple(assignment[abs_pos] for abs_pos in absolute_positions if abs_pos in used_positions)
+            context_log_probs[context_values] = log_probs
+
+        tensor[..., position] = _build_position_tensor(context_log_probs, context_axes, span)
+
+    return tensor, length, span
 
 
 def write_sitega(model, path: str) -> None:

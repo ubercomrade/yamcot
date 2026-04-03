@@ -7,6 +7,8 @@ These tests validate the correctness of individual functions from:
 - mimosa/models.py
 """
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -38,11 +40,20 @@ from mimosa.models import (
     GenericModel,
     calculate_threshold_table,
     get_frequencies,
+    read_model,
     scan_model,
     scores_to_log_fpr,
 )
 from mimosa.models import registry as model_registry
 from mimosa.ragged import RaggedData, ragged_from_list
+
+FIXTURES_ROOT = Path(__file__).resolve().parent / "fixtures" / "models"
+_DNA_TO_INT = {"A": 0, "C": 1, "G": 2, "T": 3}
+
+
+def _encode_sequence(sequence: str) -> np.ndarray:
+    """Encode an ACGT string as the project's integer alphabet."""
+    return np.array([_DNA_TO_INT[symbol] for symbol in sequence], dtype=np.int8)
 
 
 def test_pfm_to_pwm_basic():
@@ -239,6 +250,63 @@ def test_model_registry():
 
     bamm_strategy = model_registry.get("bamm")
     assert bamm_strategy is not None
+
+    dimont_strategy = model_registry.get("dimont")
+    assert dimont_strategy is not None
+
+    slim_strategy = model_registry.get("slim")
+    assert slim_strategy is not None
+
+
+def test_read_model_supports_dimont_xml_and_matches_example_score():
+    """Dimont XML models should load and reproduce exact strand-aware site scores."""
+    model = read_model(str(FIXTURES_ROOT / "dimont" / "exampleD-model-1.xml"), "dimont")
+    plus_sequence = ragged_from_list([_encode_sequence("TTCCAGGGAACCC")], dtype=np.int8)
+    minus_sequence = ragged_from_list([_encode_sequence("GGGTTCCCTGGAA")], dtype=np.int8)
+
+    plus_scores = scan_model(model, plus_sequence, "+")
+    minus_scores = scan_model(model, minus_sequence, "-")
+
+    assert model.type_key == "dimont"
+    assert model.length == 13
+    assert model.config["kmer"] == 1
+    assert model.representation.shape == (5, 13)
+    assert plus_scores.get_slice(0)[0] == pytest.approx(-11.370793931934642)
+    assert minus_scores.get_slice(0)[0] == pytest.approx(-11.370793931934642)
+
+
+def test_read_model_supports_higher_order_dimont_xml():
+    """Higher-order Dimont XML models should scan via the shared context kernel."""
+    model = read_model(str(FIXTURES_ROOT / "dimont" / "stat_dimont-model-1.xml"), "dimont")
+    plus_sequence = ragged_from_list([_encode_sequence("AACCC")], dtype=np.int8)
+    minus_sequence = ragged_from_list([_encode_sequence("GGGTT")], dtype=np.int8)
+
+    plus_scores = scan_model(model, plus_sequence, "+")
+    minus_scores = scan_model(model, minus_sequence, "-")
+
+    assert model.type_key == "dimont"
+    assert model.length == 5
+    assert model.config["kmer"] == 4
+    assert model.representation.shape == (5, 5, 5, 5, 5)
+    assert plus_scores.get_slice(0)[0] == pytest.approx(-7.622432197747987)
+    assert minus_scores.get_slice(0)[0] == pytest.approx(-7.622432197747987)
+
+
+def test_read_model_supports_slim_xml_and_matches_example_score():
+    """Slim XML models should reproduce the exact published site scores."""
+    model = read_model(str(FIXTURES_ROOT / "slim" / "example-model-1.xml"), "slim")
+    plus_sequence = ragged_from_list([_encode_sequence("TTCCTCGGAACTGAG")], dtype=np.int8)
+    minus_sequence = ragged_from_list([_encode_sequence("CTCAGTTCCGAGGAA")], dtype=np.int8)
+
+    plus_scores = scan_model(model, plus_sequence, "+")
+    minus_scores = scan_model(model, minus_sequence, "-")
+
+    assert model.type_key == "slim"
+    assert model.length == 15
+    assert model.config["kmer"] == 6
+    assert model.representation.shape == (5, 5, 5, 5, 5, 5, 15)
+    assert plus_scores.get_slice(0)[0] == pytest.approx(-14.550483500732756)
+    assert minus_scores.get_slice(0)[0] == pytest.approx(-14.550483500732756)
 
 
 def test_create_comparator_config():

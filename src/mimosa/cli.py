@@ -9,8 +9,8 @@ from mimosa.api import create_config, run_comparison
 from mimosa.cache import clear_cache
 from mimosa.comparison import create_comparator_config
 
-PROFILE_MODEL_TYPES = ["scores", "pwm", "bamm", "sitega"]
-MOTIF_MODEL_TYPES = ["pwm", "bamm", "sitega"]
+PROFILE_MODEL_TYPES = ["scores", "pwm", "bamm", "sitega", "dimont", "slim"]
+MOTIF_MODEL_TYPES = ["pwm", "bamm", "sitega", "dimont", "slim"]
 MOTALI_MODEL_TYPES = ["pwm", "sitega"]
 
 
@@ -74,13 +74,13 @@ def _add_profile_parser(subparsers: argparse._SubParsersAction) -> None:
         "--model1-type",
         choices=PROFILE_MODEL_TYPES,
         required=True,
-        help="Format of the first input. Choices: scores, pwm, bamm, sitega.",
+        help="Format of the first input. Choices: scores, pwm, bamm, sitega, dimont, slim.",
     )
     io_group.add_argument(
         "--model2-type",
         choices=PROFILE_MODEL_TYPES,
         required=True,
-        help="Format of the second input. Choices: scores, pwm, bamm, sitega.",
+        help="Format of the second input. Choices: scores, pwm, bamm, sitega, dimont, slim.",
     )
     io_group.add_argument(
         "--fasta",
@@ -196,13 +196,13 @@ def _add_motif_parser(subparsers: argparse._SubParsersAction) -> None:
         "--model1-type",
         choices=MOTIF_MODEL_TYPES,
         required=True,
-        help="Format of the first motif. Choices: pwm, bamm, sitega.",
+        help="Format of the first motif. Choices: pwm, bamm, sitega, dimont, slim.",
     )
     io_group.add_argument(
         "--model2-type",
         choices=MOTIF_MODEL_TYPES,
         required=True,
-        help="Format of the second motif. Choices: pwm, bamm, sitega.",
+        help="Format of the second motif. Choices: pwm, bamm, sitega, dimont, slim.",
     )
     io_group.add_argument(
         "--fasta",
