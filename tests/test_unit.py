@@ -23,6 +23,7 @@ from mimosa.comparison import (
 from mimosa.comparison import registry as comparison_registry
 from mimosa.functions import (
     batch_all_scores,
+    build_profile_support,
     cut_prc,
     cut_roc,
     fast_profile_score,
@@ -54,6 +55,59 @@ _DNA_TO_INT = {"A": 0, "C": 1, "G": 2, "T": 3}
 def _encode_sequence(sequence: str) -> np.ndarray:
     """Encode an ACGT string as the project's integer alphabet."""
     return np.array([_DNA_TO_INT[symbol] for symbol in sequence], dtype=np.int8)
+
+
+def _reference_fast_profile_score(data1, offsets1, data2, offsets2, search_range, min_value=0.0, metric="co"):
+    """Reference implementation of profile scoring for validation tests."""
+    inters = np.zeros(2 * search_range + 1, dtype=np.float64)
+    sum1s = np.zeros(2 * search_range + 1, dtype=np.float64)
+    sum2s = np.zeros(2 * search_range + 1, dtype=np.float64)
+
+    for i in range(len(offsets1) - 1):
+        seq1 = data1[offsets1[i] : offsets1[i + 1]]
+        seq2 = data2[offsets2[i] : offsets2[i + 1]]
+
+        for k, offset in enumerate(range(-search_range, search_range + 1)):
+            idx1_start = 0 if offset < 0 else offset
+            idx2_start = -offset if offset < 0 else 0
+
+            if idx1_start >= seq1.size or idx2_start >= seq2.size:
+                continue
+
+            overlap = min(seq1.size - idx1_start, seq2.size - idx2_start)
+            if overlap <= 0:
+                continue
+
+            for j in range(overlap):
+                v1 = float(seq1[idx1_start + j])
+                v2 = float(seq2[idx2_start + j])
+                if min_value > 0.0 and v1 < min_value and v2 < min_value:
+                    continue
+                sum1s[k] += v1
+                sum2s[k] += v2
+                inters[k] += min(v1, v2)
+
+    best_score = -1.0
+    best_offset = 0
+
+    for k, offset in enumerate(range(-search_range, search_range + 1)):
+        if metric == "co":
+            denom = min(sum1s[k], sum2s[k])
+            score = inters[k] / denom if denom > 1e-6 else -1.0
+        elif metric == "dice":
+            denom = sum1s[k] + sum2s[k]
+            score = (2.0 * inters[k]) / denom if denom > 1e-6 else -1.0
+        else:
+            raise ValueError(metric)
+
+        if score > best_score:
+            best_score = score
+            best_offset = offset
+
+    if best_score < 0.0:
+        return 0.0, 0
+
+    return float(best_score), int(best_offset)
 
 
 def test_pfm_to_pwm_basic():
@@ -546,6 +600,80 @@ def test_fast_profile_score_rejects_unknown_metric():
 
     with pytest.raises(ValueError, match="'co', 'dice'"):
         fast_profile_score(data, offsets, data, offsets, 0, metric="corr")
+
+
+@pytest.mark.parametrize("metric", ["co", "dice"])
+@pytest.mark.parametrize("min_value", [0.0, 1.0])
+def test_fast_profile_score_matches_reference_for_ragged_inputs(metric, min_value):
+    """Optimized profile scorer should match the dense reference on ragged inputs."""
+    rng = np.random.default_rng(42)
+    lengths = np.array([2, 5, 7, 4], dtype=np.int64)
+    offsets = np.zeros(lengths.size + 1, dtype=np.int64)
+    offsets[1:] = np.cumsum(lengths)
+    data1 = rng.gamma(shape=1.5, scale=1.0, size=int(offsets[-1])).astype(np.float32)
+    data2 = rng.gamma(shape=1.7, scale=0.9, size=int(offsets[-1])).astype(np.float32)
+
+    score, offset = fast_profile_score(data1, offsets, data2, offsets, 3, min_value=min_value, metric=metric)
+    expected_score, expected_offset = _reference_fast_profile_score(
+        data1, offsets, data2, offsets, 3, min_value=min_value, metric=metric
+    )
+
+    assert score == pytest.approx(expected_score)
+    assert offset == expected_offset
+
+
+@pytest.mark.parametrize("metric", ["co", "dice"])
+def test_fast_profile_score_normalizes_non_contiguous_inputs(metric):
+    """Profile scorer should normalize dtype and contiguity before dispatch."""
+    base1 = np.array([0.0, 0.6, 0.0, 1.2, 0.0, 0.8, 0.0, 0.4], dtype=np.float64)
+    base2 = np.array([0.0, 0.5, 0.0, 0.7, 0.0, 1.1, 0.0, 0.3], dtype=np.float64)
+    data1 = base1[1::2]
+    data2 = base2[1::2]
+    offsets = np.array([0, 2, 4], dtype=np.int32)
+
+    score, offset = fast_profile_score(data1, offsets, data2, offsets, 1, min_value=0.5, metric=metric)
+    expected_score, expected_offset = _reference_fast_profile_score(
+        np.ascontiguousarray(data1, dtype=np.float32),
+        np.ascontiguousarray(offsets, dtype=np.int64),
+        np.ascontiguousarray(data2, dtype=np.float32),
+        np.ascontiguousarray(offsets, dtype=np.int64),
+        1,
+        min_value=0.5,
+        metric=metric,
+    )
+
+    assert score == pytest.approx(expected_score)
+    assert offset == expected_offset
+
+
+@pytest.mark.parametrize("metric", ["co", "dice"])
+def test_fast_profile_score_accepts_precomputed_sparse_support(metric):
+    """Profile scorer should accept externally prepared sparse support."""
+    data1 = np.array([0.2, 1.3, 0.4, 1.1, 0.1, 0.9], dtype=np.float32)
+    data2 = np.array([0.3, 0.7, 1.4, 0.2, 1.2, 0.1], dtype=np.float32)
+    offsets = np.array([0, 3, 6], dtype=np.int64)
+    support1 = build_profile_support(data1, offsets, 1.0)
+    support2 = build_profile_support(data2, offsets, 1.0)
+
+    score, offset = fast_profile_score(
+        data1,
+        offsets,
+        data2,
+        offsets,
+        1,
+        min_value=1.0,
+        metric=metric,
+        active_idx1=support1[0],
+        active_ptr1=support1[1],
+        active_idx2=support2[0],
+        active_ptr2=support2[1],
+    )
+    expected_score, expected_offset = _reference_fast_profile_score(
+        data1, offsets, data2, offsets, 1, min_value=1.0, metric=metric
+    )
+
+    assert score == pytest.approx(expected_score)
+    assert offset == expected_offset
 
 
 def test_strategy_functions_exist():

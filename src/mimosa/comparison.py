@@ -28,6 +28,7 @@ from scipy.ndimage import convolve1d
 from mimosa.cache import fingerprint_ragged, load_profile_cache, store_profile_cache
 from mimosa.execute import run_motali
 from mimosa.functions import (
+    build_profile_support,
     fast_profile_score,
     scores_to_frequencies,
 )
@@ -191,6 +192,36 @@ def _resolve_profile_signal(
         logger.debug("Stored profile cache for model '%s' (%s strand).", model.name, strand)
 
     return profile
+
+
+def _resolve_profile_support(
+    model: GenericModel,
+    profile: RaggedData,
+    sequences: Optional[RaggedData],
+    cfg: ComparatorConfig,
+    strand: str,
+):
+    """Resolve cached sparse support for thresholded profile comparisons."""
+    if cfg.min_logfpr is None:
+        return None
+
+    min_value = float(cfg.min_logfpr)
+    if min_value <= 0.0:
+        return None
+
+    profile_kind = "logfpr" if cfg.promoters is not None else "empirical"
+    sequence_fp = fingerprint_ragged(sequences) or "no-sequences"
+    promoter_fp = fingerprint_ragged(cfg.promoters)
+    runtime_key = ("support", np.float32(min_value), profile_kind, strand, sequence_fp, promoter_fp)
+    runtime_cache = _get_profile_runtime_cache(model)
+
+    cached = runtime_cache.get(runtime_key)
+    if cached is not None:
+        return cached
+
+    support = build_profile_support(profile.data, profile.offsets, min_value)
+    runtime_cache[runtime_key] = support
+    return support
 
 
 def _create_surrogate_ragged(frequencies: RaggedData, rng: np.random.Generator, cfg: ComparatorConfig) -> RaggedData:
@@ -476,10 +507,18 @@ def strategy_profile(
     freq1_plus = _resolve_profile_signal(model1, sequences, cfg, "+")
     freq2_plus = _resolve_profile_signal(model2, sequences, cfg, "+")
     freq2_minus = _resolve_profile_signal(model2, sequences, cfg, "-")
+    support1_plus = _resolve_profile_support(model1, freq1_plus, sequences, cfg, "+")
+    support2_plus = _resolve_profile_support(model2, freq2_plus, sequences, cfg, "+")
+    support2_minus = _resolve_profile_support(model2, freq2_minus, sequences, cfg, "-")
 
-    def get_score(S1: RaggedData, S2: RaggedData) -> Tuple[float, int]:
+    def get_score(S1: RaggedData, S2: RaggedData, support1=None, support2=None) -> Tuple[float, int]:
         """Compute score and offset for two profiles."""
         min_value = -1.0 if cfg.min_logfpr is None else float(cfg.min_logfpr)
+        active_idx1 = active_ptr1 = active_idx2 = active_ptr2 = None
+        if support1 is not None:
+            active_idx1, active_ptr1 = support1
+        if support2 is not None:
+            active_idx2, active_ptr2 = support2
         sc, off = fast_profile_score(
             S1.data,
             S1.offsets,
@@ -488,11 +527,15 @@ def strategy_profile(
             cfg.search_range,
             min_value=min_value,
             metric=cfg.metric,
+            active_idx1=active_idx1,
+            active_ptr1=active_ptr1,
+            active_idx2=active_idx2,
+            active_ptr2=active_ptr2,
         )
         return sc, off
 
-    sc_pp, off_pp = get_score(freq1_plus, freq2_plus)
-    sc_pm, off_pm = get_score(freq1_plus, freq2_minus)
+    sc_pp, off_pp = get_score(freq1_plus, freq2_plus, support1_plus, support2_plus)
+    sc_pm, off_pm = get_score(freq1_plus, freq2_minus, support1_plus, support2_minus)
 
     if sc_pm > sc_pp:
         obs_score, off, orient, f_final = sc_pm, off_pm, "+-", freq2_minus
@@ -515,7 +558,7 @@ def strategy_profile(
         def surrogate_gen(rng):
             """Generate one surrogate score."""
             surr = _create_surrogate_ragged(f_final, rng, cfg)
-            sc, _ = get_score(freq1_plus, surr)
+            sc, _ = get_score(freq1_plus, surr, support1_plus, None)
             return sc
 
         nulls, n_m, n_s = run_montecarlo(lambda x: x, surrogate_gen, cfg.n_permutations, cfg.n_jobs, cfg.seed)
