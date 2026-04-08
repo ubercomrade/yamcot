@@ -34,7 +34,7 @@ def score_seq(num_site, kmer, model):
     return score
 
 
-@njit(inline="always", cache=True)
+@njit(inline="always", cache=False)
 def _fill_rc_buffer(data, start, length, buffer):
     """Fill a buffer with reverse-complement values without allocations."""
     for j in range(length):
@@ -42,7 +42,7 @@ def _fill_rc_buffer(data, start, length, buffer):
         buffer[j] = RC_TABLE[val]
 
 
-@njit(inline="always", cache=True)
+@njit(inline="always", cache=False)
 def _fill_forward_context_window(seq, seq_len, site_start, motif_len, context_len, buffer):
     """Fill one forward-scanning context window with N-padding."""
     buffer[:] = 4
@@ -58,7 +58,7 @@ def _fill_forward_context_window(seq, seq_len, site_start, motif_len, context_le
         buffer[dest_start : dest_start + copy_len] = seq[actual_start:actual_end]
 
 
-@njit(parallel=True, fastmath=True, cache=True)
+@njit(parallel=True, fastmath=True, cache=False)
 def _batch_all_scores_jit(data, offsets, matrix, kmer, is_revcomp):
     """Compute PWM scores in batch with a JIT-compiled kernel."""
     n_seq = len(offsets) - 1
@@ -98,7 +98,7 @@ def _batch_all_scores_jit(data, offsets, matrix, kmer, is_revcomp):
     return results, new_offsets
 
 
-@njit(parallel=True, fastmath=True, cache=True)
+@njit(parallel=True, fastmath=True, cache=False)
 def _batch_all_scores_with_context_jit(data, offsets, matrix, kmer, is_revcomp):
     """Compute BaMM scores in batch with context-aware padding."""
     n_seq = len(offsets) - 1
@@ -374,7 +374,7 @@ def scores_to_frequencies(ragged_scores: RaggedData) -> RaggedData:
     return RaggedData(new_data, ragged_scores.offsets)
 
 
-@njit(parallel=True, fastmath=True, cache=True)
+@njit(parallel=False, fastmath=True, cache=False)
 def _fast_profile_score_co_no_threshold_numba(data1, offsets1, data2, offsets2, search_range):
     """Compute overlap coefficient profile similarity scores without threshold masking."""
     n_seq = len(offsets1) - 1
@@ -383,7 +383,7 @@ def _fast_profile_score_co_no_threshold_numba(data1, offsets1, data2, offsets2, 
     scores[:] = np.float32(-1.0)
     eps = np.float32(1e-6)
 
-    for k in prange(n_offsets):
+    for k in range(n_offsets):
         offset = k - search_range
         inter = np.float32(0.0)
         sum1 = np.float32(0.0)
@@ -422,7 +422,7 @@ def _fast_profile_score_co_no_threshold_numba(data1, offsets1, data2, offsets2, 
     return scores
 
 
-@njit(parallel=True, fastmath=True, cache=True)
+@njit(parallel=False, fastmath=True, cache=False)
 def _fast_profile_score_co_threshold_numba(data1, offsets1, data2, offsets2, search_range, min_value):
     """Compute overlap coefficient profile similarity scores with threshold masking."""
     n_seq = len(offsets1) - 1
@@ -431,7 +431,7 @@ def _fast_profile_score_co_threshold_numba(data1, offsets1, data2, offsets2, sea
     scores[:] = np.float32(-1.0)
     eps = np.float32(1e-6)
 
-    for k in prange(n_offsets):
+    for k in range(n_offsets):
         offset = k - search_range
         inter = np.float32(0.0)
         sum1 = np.float32(0.0)
@@ -472,7 +472,7 @@ def _fast_profile_score_co_threshold_numba(data1, offsets1, data2, offsets2, sea
     return scores
 
 
-@njit(parallel=True, fastmath=True, cache=True)
+@njit(parallel=False, fastmath=True, cache=False)
 def _fast_profile_score_dice_no_threshold_numba(data1, offsets1, data2, offsets2, search_range):
     """Compute Dice profile similarity scores without threshold masking."""
     n_seq = len(offsets1) - 1
@@ -481,7 +481,7 @@ def _fast_profile_score_dice_no_threshold_numba(data1, offsets1, data2, offsets2
     scores[:] = np.float32(-1.0)
     eps = np.float32(1e-6)
 
-    for k in prange(n_offsets):
+    for k in range(n_offsets):
         offset = k - search_range
         inter = np.float32(0.0)
         sum1 = np.float32(0.0)
@@ -520,7 +520,7 @@ def _fast_profile_score_dice_no_threshold_numba(data1, offsets1, data2, offsets2
     return scores
 
 
-@njit(parallel=True, fastmath=True, cache=True)
+@njit(parallel=False, fastmath=True, cache=False)
 def _fast_profile_score_dice_threshold_numba(data1, offsets1, data2, offsets2, search_range, min_value):
     """Compute Dice profile similarity scores with threshold masking."""
     n_seq = len(offsets1) - 1
@@ -570,7 +570,7 @@ def _fast_profile_score_dice_threshold_numba(data1, offsets1, data2, offsets2, s
     return scores
 
 
-@njit(cache=True)
+@njit(cache=False)
 def _pick_best_profile_score(scores, search_range):
     """Select the best non-negative score and convert it back to an offset."""
     best_score = np.float32(-1.0)

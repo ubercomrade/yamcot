@@ -126,6 +126,8 @@ target/
 out/
 bin/
 obj/
+examples/benchmark_fast_profile_score.py
+examples/benchmark_profile_one_to_many.py
 
 # Compiled files
 *.o

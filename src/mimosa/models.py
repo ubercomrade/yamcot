@@ -14,7 +14,6 @@ Key Features:
 
 from __future__ import annotations
 
-import functools
 import logging
 import os
 from dataclasses import dataclass
@@ -185,7 +184,6 @@ def _resolve_threshold_table(model: GenericModel, strand: StrandMode = "best") -
     return None
 
 
-@functools.lru_cache(maxsize=96)
 def calculate_threshold_table(model: GenericModel, promoters: RaggedData, strand: StrandMode = "best") -> np.ndarray:
     """Calculate a score-to-logFPR lookup table on the provided background."""
 
