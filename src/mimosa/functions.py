@@ -8,7 +8,6 @@ RC_TABLE = np.array([3, 2, 1, 0, 4], dtype=np.int8)
 
 def pfm_to_pwm(pfm):
     """Convert Position Frequency Matrix to Position Weight Matrix."""
-
     pwm = np.log((pfm + 0.0001) / 0.25)
     return pwm
 
@@ -44,9 +43,7 @@ def _fill_rc_buffer(data, start, length, buffer):
 
 
 @njit(inline="always", cache=True)
-def _fill_forward_context_window(
-    seq, seq_len, site_start, motif_len, context_len, buffer
-):
+def _fill_forward_context_window(seq, seq_len, site_start, motif_len, context_len, buffer):
     """Fill one forward-scanning context window with N-padding."""
     buffer[:] = 4
 
@@ -96,9 +93,7 @@ def _batch_all_scores_jit(data, offsets, matrix, kmer, is_revcomp):
 
                 for k in range(n_scores):
                     num_site = rc_seq[k : k + m]
-                    results[out_start + (n_scores - 1 - k)] = score_seq(
-                        num_site, kmer, matrix
-                    )
+                    results[out_start + (n_scores - 1 - k)] = score_seq(num_site, kmer, matrix)
 
     return results, new_offsets
 
@@ -137,12 +132,8 @@ def _batch_all_scores_with_context_jit(data, offsets, matrix, kmer, is_revcomp):
 
             site_buffer = np.full(window_size, 4, dtype=data.dtype)
             for k in range(n_scores):
-                _fill_forward_context_window(
-                    seq, seq_len, k, m, context_len, site_buffer
-                )
-                result_idx = (
-                    out_start + k if not is_revcomp else out_start + (n_scores - 1 - k)
-                )
+                _fill_forward_context_window(seq, seq_len, k, m, context_len, site_buffer)
+                result_idx = out_start + k if not is_revcomp else out_start + (n_scores - 1 - k)
                 results[result_idx] = score_seq(site_buffer, kmer, matrix)
 
     return results, new_offsets
@@ -157,13 +148,9 @@ def batch_all_scores(
 ) -> RaggedData:
     """Compute scores for all sequences in RaggedData."""
     if with_context:
-        data, offsets = _batch_all_scores_with_context_jit(
-            sequences.data, sequences.offsets, matrix, kmer, is_revcomp
-        )
+        data, offsets = _batch_all_scores_with_context_jit(sequences.data, sequences.offsets, matrix, kmer, is_revcomp)
     else:
-        data, offsets = _batch_all_scores_jit(
-            sequences.data, sequences.offsets, matrix, kmer, is_revcomp
-        )
+        data, offsets = _batch_all_scores_jit(sequences.data, sequences.offsets, matrix, kmer, is_revcomp)
     return RaggedData(data, offsets)
 
 
@@ -323,9 +310,7 @@ def cut_roc(tpr: np.ndarray, fpr: np.ndarray, thr: np.ndarray, score_cutoff: flo
 
     tpr_cut = np.concatenate([tpr[: last + 1], np.array([t_cut], dtype=tpr.dtype)])
     fpr_cut = np.concatenate([fpr[: last + 1], np.array([f_cut], dtype=fpr.dtype)])
-    thr_cut = np.concatenate(
-        [thr[: last + 1], np.array([score_cutoff], dtype=thr.dtype)]
-    )
+    thr_cut = np.concatenate([thr[: last + 1], np.array([score_cutoff], dtype=thr.dtype)])
 
     return tpr_cut, fpr_cut, thr_cut
 
@@ -358,9 +343,7 @@ def cut_prc(rec: np.ndarray, prec: np.ndarray, thr: np.ndarray, score_cutoff: fl
 
     rec_cut = np.concatenate([rec[: last + 1], np.array([r_cut], dtype=rec.dtype)])
     prec_cut = np.concatenate([prec[: last + 1], np.array([p_cut], dtype=prec.dtype)])
-    thr_cut = np.concatenate(
-        [thr[: last + 1], np.array([score_cutoff], dtype=thr.dtype)]
-    )
+    thr_cut = np.concatenate([thr[: last + 1], np.array([score_cutoff], dtype=thr.dtype)])
 
     return rec_cut, prec_cut, thr_cut
 
@@ -391,59 +374,31 @@ def scores_to_frequencies(ragged_scores: RaggedData) -> RaggedData:
     return RaggedData(new_data, ragged_scores.offsets)
 
 
-@njit(inline="always", cache=True)
-def _profile_score_from_stats_numba(metric_id, inter, sum1, sum2, valid_count, eps):
-    """Compute a profile similarity score from accumulated overlap statistics."""
-    if metric_id == 0:
-        denom = sum1 if sum1 < sum2 else sum2
-        if denom > eps:
-            return inter / denom
-        return np.float32(-1.0)
-
-    if metric_id == 1:
-        denom = sum1 + sum2 - inter
-        if denom > eps:
-            return inter / denom
-        return np.float32(-1.0)
-
-    if metric_id == 2:
-        denom = sum1 + sum2
-        if denom > eps:
-            return (np.float32(2.0) * inter) / denom
-        return np.float32(-1.0)
-
-    if valid_count > 0:
-        denom = sum1 + sum2
-        l1_sum = denom - (np.float32(2.0) * inter)
-        mean_l1 = l1_sum / np.float32(valid_count)
-        return np.float32(1.0) / (np.float32(1.0) + mean_l1)
-    return np.float32(-1.0)
-
-
-@njit(fastmath=True, cache=True)
-def _fast_profile_score_kernel_numba(
-    data1, offsets1, data2, offsets2, search_range, min_value, metric_id
-):
-    """Compute overlap-derived profile similarity scores over RaggedData with JIT."""
+@njit(parallel=True, fastmath=True, cache=True)
+def _fast_profile_score_co_no_threshold_numba(data1, offsets1, data2, offsets2, search_range):
+    """Compute overlap coefficient profile similarity scores without threshold masking."""
     n_seq = len(offsets1) - 1
     n_offsets = 2 * search_range + 1
+    scores = np.empty(n_offsets, dtype=np.float32)
+    scores[:] = np.float32(-1.0)
+    eps = np.float32(1e-6)
 
-    inters = np.zeros(n_offsets, dtype=np.float32)
-    sum1s = np.zeros(n_offsets, dtype=np.float32)
-    sum2s = np.zeros(n_offsets, dtype=np.float32)
-    valid_counts = np.zeros(n_offsets, dtype=np.int32)
+    for k in prange(n_offsets):
+        offset = k - search_range
+        inter = np.float32(0.0)
+        sum1 = np.float32(0.0)
+        sum2 = np.float32(0.0)
 
-    for i in range(n_seq):
-        s1 = data1[offsets1[i] : offsets1[i + 1]]
-        s2 = data2[offsets2[i] : offsets2[i + 1]]
-        vlen1 = s1.size
-        vlen2 = s2.size
+        for i in range(n_seq):
+            start1 = offsets1[i]
+            end1 = offsets1[i + 1]
+            start2 = offsets2[i]
+            end2 = offsets2[i + 1]
+            vlen1 = end1 - start1
+            vlen2 = end2 - start2
 
-        for k in range(n_offsets):
-            offset = k - search_range
             idx1_start = 0 if offset < 0 else offset
             idx2_start = -offset if offset < 0 else 0
-
             if idx1_start >= vlen1 or idx2_start >= vlen2:
                 continue
 
@@ -451,68 +406,209 @@ def _fast_profile_score_kernel_numba(
             if overlap <= 0:
                 continue
 
-            local_inter = np.float32(0.0)
-            local_sum1 = np.float32(0.0)
-            local_sum2 = np.float32(0.0)
-            local_count = 0
-
+            base1 = start1 + idx1_start
+            base2 = start2 + idx2_start
             for j in range(overlap):
-                v1 = s1[idx1_start + j]
-                v2 = s2[idx2_start + j]
-                if min_value > 0.0 and v1 < min_value and v2 < min_value:
+                v1 = data1[base1 + j]
+                v2 = data2[base2 + j]
+                sum1 += v1
+                sum2 += v2
+                inter += v1 if v1 < v2 else v2
+
+        denom = sum1 if sum1 < sum2 else sum2
+        if denom > eps:
+            scores[k] = inter / denom
+
+    return scores
+
+
+@njit(parallel=True, fastmath=True, cache=True)
+def _fast_profile_score_co_threshold_numba(data1, offsets1, data2, offsets2, search_range, min_value):
+    """Compute overlap coefficient profile similarity scores with threshold masking."""
+    n_seq = len(offsets1) - 1
+    n_offsets = 2 * search_range + 1
+    scores = np.empty(n_offsets, dtype=np.float32)
+    scores[:] = np.float32(-1.0)
+    eps = np.float32(1e-6)
+
+    for k in prange(n_offsets):
+        offset = k - search_range
+        inter = np.float32(0.0)
+        sum1 = np.float32(0.0)
+        sum2 = np.float32(0.0)
+
+        for i in range(n_seq):
+            start1 = offsets1[i]
+            end1 = offsets1[i + 1]
+            start2 = offsets2[i]
+            end2 = offsets2[i + 1]
+            vlen1 = end1 - start1
+            vlen2 = end2 - start2
+
+            idx1_start = 0 if offset < 0 else offset
+            idx2_start = -offset if offset < 0 else 0
+            if idx1_start >= vlen1 or idx2_start >= vlen2:
+                continue
+
+            overlap = min(vlen1 - idx1_start, vlen2 - idx2_start)
+            if overlap <= 0:
+                continue
+
+            base1 = start1 + idx1_start
+            base2 = start2 + idx2_start
+            for j in range(overlap):
+                v1 = data1[base1 + j]
+                v2 = data2[base2 + j]
+                if v1 < min_value and v2 < min_value:
                     continue
-                local_sum1 += v1
-                local_sum2 += v2
-                local_inter += np.float32(0.5) * (v1 + v2 - abs(v1 - v2))
-                local_count += 1
+                sum1 += v1
+                sum2 += v2
+                inter += v1 if v1 < v2 else v2
 
-            inters[k] += local_inter
-            sum1s[k] += local_sum1
-            sum2s[k] += local_sum2
-            valid_counts[k] += local_count
+        denom = sum1 if sum1 < sum2 else sum2
+        if denom > eps:
+            scores[k] = inter / denom
 
+    return scores
+
+
+@njit(parallel=True, fastmath=True, cache=True)
+def _fast_profile_score_dice_no_threshold_numba(data1, offsets1, data2, offsets2, search_range):
+    """Compute Dice profile similarity scores without threshold masking."""
+    n_seq = len(offsets1) - 1
+    n_offsets = 2 * search_range + 1
+    scores = np.empty(n_offsets, dtype=np.float32)
+    scores[:] = np.float32(-1.0)
+    eps = np.float32(1e-6)
+
+    for k in prange(n_offsets):
+        offset = k - search_range
+        inter = np.float32(0.0)
+        sum1 = np.float32(0.0)
+        sum2 = np.float32(0.0)
+
+        for i in range(n_seq):
+            start1 = offsets1[i]
+            end1 = offsets1[i + 1]
+            start2 = offsets2[i]
+            end2 = offsets2[i + 1]
+            vlen1 = end1 - start1
+            vlen2 = end2 - start2
+
+            idx1_start = 0 if offset < 0 else offset
+            idx2_start = -offset if offset < 0 else 0
+            if idx1_start >= vlen1 or idx2_start >= vlen2:
+                continue
+
+            overlap = min(vlen1 - idx1_start, vlen2 - idx2_start)
+            if overlap <= 0:
+                continue
+
+            base1 = start1 + idx1_start
+            base2 = start2 + idx2_start
+            for j in range(overlap):
+                v1 = data1[base1 + j]
+                v2 = data2[base2 + j]
+                sum1 += v1
+                sum2 += v2
+                inter += v1 if v1 < v2 else v2
+
+        denom = sum1 + sum2
+        if denom > eps:
+            scores[k] = (np.float32(2.0) * inter) / denom
+
+    return scores
+
+
+@njit(parallel=True, fastmath=True, cache=True)
+def _fast_profile_score_dice_threshold_numba(data1, offsets1, data2, offsets2, search_range, min_value):
+    """Compute Dice profile similarity scores with threshold masking."""
+    n_seq = len(offsets1) - 1
+    n_offsets = 2 * search_range + 1
+    scores = np.empty(n_offsets, dtype=np.float32)
+    scores[:] = np.float32(-1.0)
+    eps = np.float32(1e-6)
+
+    for k in prange(n_offsets):
+        offset = k - search_range
+        inter = np.float32(0.0)
+        sum1 = np.float32(0.0)
+        sum2 = np.float32(0.0)
+
+        for i in range(n_seq):
+            start1 = offsets1[i]
+            end1 = offsets1[i + 1]
+            start2 = offsets2[i]
+            end2 = offsets2[i + 1]
+            vlen1 = end1 - start1
+            vlen2 = end2 - start2
+
+            idx1_start = 0 if offset < 0 else offset
+            idx2_start = -offset if offset < 0 else 0
+            if idx1_start >= vlen1 or idx2_start >= vlen2:
+                continue
+
+            overlap = min(vlen1 - idx1_start, vlen2 - idx2_start)
+            if overlap <= 0:
+                continue
+
+            base1 = start1 + idx1_start
+            base2 = start2 + idx2_start
+            for j in range(overlap):
+                v1 = data1[base1 + j]
+                v2 = data2[base2 + j]
+                if v1 < min_value and v2 < min_value:
+                    continue
+                sum1 += v1
+                sum2 += v2
+                inter += v1 if v1 < v2 else v2
+
+        denom = sum1 + sum2
+        if denom > eps:
+            scores[k] = (np.float32(2.0) * inter) / denom
+
+    return scores
+
+
+@njit(cache=True)
+def _pick_best_profile_score(scores, search_range):
+    """Select the best non-negative score and convert it back to an offset."""
     best_score = np.float32(-1.0)
     best_offset = 0
-    eps = np.float32(1e-6)
-    found_valid = False
 
-    for k in range(n_offsets):
-        score = _profile_score_from_stats_numba(
-            metric_id, inters[k], sum1s[k], sum2s[k], valid_counts[k], eps
-        )
-        if score >= 0.0:
-            found_valid = True
-            if score > best_score:
-                best_score = score
-                best_offset = k - search_range
+    for k in range(scores.size):
+        score = scores[k]
+        if score >= 0.0 and score > best_score:
+            best_score = score
+            best_offset = k - search_range
 
-    if not found_valid:
+    if best_score < 0.0:
         return np.float32(0.0), 0
 
     return best_score, best_offset
 
 
-def _profile_metric_to_id(metric: str) -> int:
-    """Map profile metric names to numba-friendly integer identifiers."""
+def fast_profile_score(data1, offsets1, data2, offsets2, search_range, min_value=0.0, metric="co"):
+    """Dispatch profile similarity scoring to specialized overlap-based kernels."""
+    thresholded = min_value > 0.0
+
     if metric == "co":
-        return 0
-    if metric == "cj":
-        return 1
+        scores = (
+            _fast_profile_score_co_threshold_numba(data1, offsets1, data2, offsets2, search_range, min_value)
+            if thresholded
+            else _fast_profile_score_co_no_threshold_numba(data1, offsets1, data2, offsets2, search_range)
+        )
+        return _pick_best_profile_score(scores, search_range)
+
     if metric == "dice":
-        return 2
-    if metric == "l1sim":
-        return 3
-    raise ValueError("metric must be one of: 'cj', 'co', 'dice', 'l1sim'")
+        scores = (
+            _fast_profile_score_dice_threshold_numba(data1, offsets1, data2, offsets2, search_range, min_value)
+            if thresholded
+            else _fast_profile_score_dice_no_threshold_numba(data1, offsets1, data2, offsets2, search_range)
+        )
+        return _pick_best_profile_score(scores, search_range)
 
-
-def fast_profile_score(
-    data1, offsets1, data2, offsets2, search_range, min_value=0.0, metric="cj"
-):
-    """Dispatch profile similarity scoring to the shared overlap-based kernel."""
-    metric_id = _profile_metric_to_id(metric)
-    return _fast_profile_score_kernel_numba(
-        data1, offsets1, data2, offsets2, search_range, min_value, metric_id
-    )
+    raise ValueError("metric must be one of: 'co', 'dice'")
 
 
 def format_params(params: dict) -> str:

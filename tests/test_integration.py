@@ -86,7 +86,7 @@ def test_profile_comparison_bamm_vs_bamm(examples_dir, temp_dir):
         "--permutations",
         "100",
         "--metric",
-        "cj",
+        "co",
     ]
 
     result = run_cli(cmd)
@@ -237,7 +237,7 @@ def test_profile_comparison_sitega_vs_pwm_second_case(examples_dir, temp_dir):
         "--model2-type",
         "pwm",
         "--metric",
-        "cj",
+        "co",
         "--permutations",
         "100",
     ]
@@ -349,7 +349,7 @@ def test_profile_comparison_basic(examples_dir, temp_dir):
         "--model2-type",
         "scores",
         "--metric",
-        "cj",
+        "co",
         "--permutations",
         "100",
     ]
@@ -391,8 +391,8 @@ def test_profile_comparison_accepts_dice_metric(examples_dir, temp_dir):
     assert "score" in output
 
 
-def test_profile_comparison_accepts_l1sim_metric(examples_dir, temp_dir):
-    """Profile mode should expose the L1-based similarity metric through CLI."""
+def test_profile_comparison_rejects_removed_l1sim_metric(examples_dir, temp_dir):
+    """Profile CLI should reject removed metrics before running a comparison."""
     cmd = [
         "mimosa",
         "profile",
@@ -407,13 +407,8 @@ def test_profile_comparison_accepts_l1sim_metric(examples_dir, temp_dir):
     ]
 
     result = run_cli(cmd)
-    assert result.returncode == 0, f"Command failed with stderr: {result.stderr}"
-
-    import json
-
-    output = json.loads(result.stdout)
-    assert output["metric"] == "l1sim"
-    assert "score" in output
+    assert result.returncode != 0
+    assert "invalid choice" in result.stderr
 
 
 def test_profile_comparison_with_promoter_calibration(examples_dir, temp_dir):
@@ -432,7 +427,7 @@ def test_profile_comparison_with_promoter_calibration(examples_dir, temp_dir):
         "--promoters",
         str(examples_dir / "background.fa"),
         "--metric",
-        "cj",
+        "co",
         "--min-logfpr",
         "2",
     ]
@@ -443,7 +438,7 @@ def test_profile_comparison_with_promoter_calibration(examples_dir, temp_dir):
     import json
 
     output = json.loads(result.stdout)
-    assert output["metric"] == "cj"
+    assert output["metric"] == "co"
     assert "score" in output
 
 

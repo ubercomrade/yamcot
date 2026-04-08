@@ -31,7 +31,7 @@ def create_arg_parser() -> argparse.ArgumentParser:
 Examples:
   # Compare precomputed score profiles directly
   mimosa profile scores_1.fasta scores_2.fasta \
-    --model1-type scores --model2-type scores --metric cj
+    --model1-type scores --model2-type scores --metric co
 
   # Compare motifs through sequence-derived profiles
   mimosa profile model1.meme model2.ihbcp \
@@ -109,9 +109,9 @@ def _add_profile_parser(subparsers: argparse._SubParsersAction) -> None:
     profile_group = parser.add_argument_group("Profile Comparison Options")
     profile_group.add_argument(
         "--metric",
-        choices=["cj", "co", "dice", "l1sim"],
-        default="cj",
-        help="Profile similarity metric. Choices: cj, co, dice, l1sim. (default: %(default)s)",
+        choices=["co", "dice"],
+        default="co",
+        help="Profile similarity metric. Choices: co, dice. (default: %(default)s)",
     )
     profile_group.add_argument(
         "--permutations",

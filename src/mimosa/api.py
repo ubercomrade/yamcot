@@ -21,12 +21,12 @@ _STRATEGY_ALIASES = {
 }
 
 _DEFAULT_METRICS = {
-    "profile": "cj",
+    "profile": "co",
     "motif": "pcc",
 }
 
 _ALLOWED_METRICS = {
-    "profile": {"cj", "co", "dice", "l1sim"},
+    "profile": {"co", "dice"},
     "motif": {"pcc", "ed", "cosine"},
 }
 
@@ -45,7 +45,7 @@ class ComparisonConfig:
     num_sequences: int = 1000
     seq_length: int = 200
     seed: int = 127
-    comparator: ComparatorConfig = field(default_factory=lambda: create_comparator_config(metric="cj"))
+    comparator: ComparatorConfig = field(default_factory=lambda: create_comparator_config(metric="co"))
     model1_kwargs: Dict[str, Any] = field(default_factory=dict)
     model2_kwargs: Dict[str, Any] = field(default_factory=dict)
 

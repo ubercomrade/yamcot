@@ -469,7 +469,7 @@ def strategy_profile(
     sequences: Optional[RaggedData],
     cfg: ComparatorConfig,
 ) -> dict:
-    """RaggedData-based comparison strategy (CJ/CO/Dice/L1 similarity)."""
+    """RaggedData-based comparison strategy (CO/Dice similarity)."""
     if cfg.promoters is not None and ("scores" in {model1.type_key, model2.type_key}):
         raise ValueError("Profile strategy with promoters requires motif models for both inputs.")
 
