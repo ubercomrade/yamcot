@@ -8,11 +8,11 @@ import numpy as np
 
 from mimosa.comparison import ComparatorConfig, compare, create_comparator_config
 from mimosa.io import read_fasta
+from mimosa.matrix import MatrixData, matrix_from_list
 from mimosa.models import GenericModel, read_model
-from mimosa.ragged import RaggedData, ragged_from_list
 
 ModelRef = Union[GenericModel, str, Path]
-SequenceRef = Union[RaggedData, str, Path]
+SequenceRef = Union[MatrixData, str, Path]
 
 _STRATEGY_ALIASES = {
     "profile": "profile",
@@ -227,12 +227,12 @@ def _validate_comparator_for_strategy(strategy: str, comparator: ComparatorConfi
         raise ValueError(f"Strategy '{strategy}' requires one of the following metrics: {options}")
 
 
-def _resolve_sequences(source: Optional[SequenceRef], config: ComparisonConfig) -> Optional[RaggedData]:
-    """Resolve a sequence source to RaggedData."""
+def _resolve_sequences(source: Optional[SequenceRef], config: ComparisonConfig) -> Optional[MatrixData]:
+    """Resolve a sequence source to MatrixData."""
 
     if source is None:
         return _generate_random_sequences(config.num_sequences, config.seq_length, config.seed)
-    if isinstance(source, RaggedData):
+    if isinstance(source, MatrixData):
         return source
     if isinstance(source, (str, Path)):
         path = Path(source)
@@ -242,7 +242,7 @@ def _resolve_sequences(source: Optional[SequenceRef], config: ComparisonConfig) 
     raise TypeError(f"Unsupported sequence source type: {type(source)!r}")
 
 
-def _generate_random_sequences(num_sequences: int, seq_length: int, seed: int) -> RaggedData:
+def _generate_random_sequences(num_sequences: int, seq_length: int, seed: int) -> MatrixData:
     """Generate random A/C/G/T integer-encoded sequences."""
 
     if num_sequences <= 0:
@@ -252,4 +252,4 @@ def _generate_random_sequences(num_sequences: int, seq_length: int, seed: int) -
 
     rng = np.random.default_rng(seed)
     sequences = [rng.integers(0, 4, size=seq_length, dtype=np.int8) for _ in range(num_sequences)]
-    return ragged_from_list(sequences, dtype=np.int8)
+    return matrix_from_list(sequences, dtype=np.int8, pad_value=4)

@@ -1,24 +1,18 @@
-import numpy as np
-from numba import float32, int64, njit, prange, types
+from __future__ import annotations
 
-from mimosa.ragged import RaggedData
+import functools
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax import lax
+
+from mimosa.matrix import MatrixData
 
 RC_TABLE = np.array([3, 2, 1, 0, 4], dtype=np.int8)
 PROFILE_DATA_DTYPE = np.float32
-PROFILE_OFFSETS_DTYPE = np.int64
+PROFILE_LENGTHS_DTYPE = np.int64
 PROFILE_EPS = np.float32(1e-6)
-
-_PROFILE_STATS_SIGNATURE = types.Tuple((float32[::1], float32[::1], float32[::1]))(
-    float32[::1], int64[::1], float32[::1], int64[::1], int64
-)
-_PROFILE_STATS_THRESHOLD_SIGNATURE = types.Tuple((float32[::1], float32[::1], float32[::1]))(
-    float32[::1], int64[::1], float32[::1], int64[::1], int64, float32
-)
-_PROFILE_SUPPORT_SIGNATURE = types.Tuple((int64[::1], int64[::1]))(float32[::1], int64[::1], float32)
-_PROFILE_SPARSE_STATS_SIGNATURE = types.Tuple((float32[::1], float32[::1], float32[::1]))(
-    float32[::1], int64[::1], int64[::1], int64[::1], float32[::1], int64[::1], int64[::1], int64[::1], int64
-)
-_PROFILE_REDUCER_SIGNATURE = types.Tuple((float32, int64))(float32[::1], float32[::1], float32[::1], int64)
 
 
 def pfm_to_pwm(pfm):
@@ -35,152 +29,125 @@ def pcm_to_pfm(pcm):
     return pfm
 
 
-@njit
+def _flatten_scan_matrix(matrix: np.ndarray) -> np.ndarray:
+    """Normalize any motif tensor to a 2D scan matrix of shape [5**k, motif_len]."""
+    arr = np.asarray(matrix, dtype=np.float32)
+    if arr.ndim < 2:
+        raise ValueError("matrix must have at least two dimensions")
+    return np.ascontiguousarray(arr.reshape(-1, arr.shape[-1]), dtype=np.float32)
+
+
 def score_seq(num_site, kmer, model):
     """Compute score for a sequence site using a k-mer model."""
+    matrix = _flatten_scan_matrix(model)
     score = 0.0
     seq_len = num_site.shape[0]
     for i in range(seq_len - kmer + 1):
         score_idx = 0
         for j in range(kmer):
-            score_idx = score_idx * 5 + num_site[i + j]
-        score += model.flat[score_idx * model.shape[-1] + i]
-
+            score_idx = score_idx * 5 + int(num_site[i + j])
+        score += float(matrix[score_idx, i])
     return score
 
 
-@njit(inline="always", cache=False)
-def _fill_rc_buffer(data, start, length, buffer):
-    """Fill a buffer with reverse-complement values without allocations."""
-    for j in range(length):
-        val = data[start + length - 1 - j]
-        buffer[j] = RC_TABLE[val]
+@functools.lru_cache(maxsize=None)
+def _build_batch_score_kernel(max_width: int, motif_len: int, kmer: int, with_context: bool, is_revcomp: bool):
+    """Create a shape-specialized JAX batch-scoring kernel."""
+    max_scores = max(max_width - motif_len + 1, 0)
+    context_len = max(kmer - 1, 0)
+    window_size = motif_len + context_len
+    rc_table = jnp.asarray(RC_TABLE, dtype=jnp.int32)
 
+    def _score_window(window: jnp.ndarray, matrix: jnp.ndarray) -> jnp.ndarray:
+        total = jnp.float32(0.0)
+        for pos in range(motif_len):
+            score_idx = jnp.int32(0)
+            for step in range(kmer):
+                score_idx = score_idx * 5 + window[pos + step].astype(jnp.int32)
+            total = total + matrix[score_idx, pos]
+        return total
 
-@njit(inline="always", cache=False)
-def _fill_forward_context_window(seq, seq_len, site_start, motif_len, context_len, buffer):
-    """Fill one forward-scanning context window with N-padding."""
-    buffer[:] = 4
+    if with_context:
 
-    window_start = site_start - context_len
-    window_end = site_start + motif_len
-    actual_start = 0 if window_start < 0 else window_start
-    actual_end = seq_len if window_end > seq_len else window_end
-    dest_start = 0 if window_start >= 0 else -window_start
-    copy_len = actual_end - actual_start
+        @jax.jit
+        def kernel(sequences: jnp.ndarray, lengths: jnp.ndarray, matrix: jnp.ndarray) -> jnp.ndarray:
+            padded = jnp.pad(sequences, ((0, 0), (context_len, context_len)), constant_values=4)
 
-    if copy_len > 0:
-        buffer[dest_start : dest_start + copy_len] = seq[actual_start:actual_end]
+            def score_row(seq_len: jnp.ndarray, padded_row: jnp.ndarray) -> jnp.ndarray:
+                row_out = jnp.zeros((max_scores,), dtype=jnp.float32)
+                n_scores = jnp.maximum(seq_len - motif_len + 1, 0)
 
+                def body(pos: int, acc: jnp.ndarray) -> jnp.ndarray:
+                    start = pos if not is_revcomp else pos + context_len
+                    window = lax.dynamic_slice(padded_row, (start,), (window_size,))
+                    if is_revcomp:
+                        window = rc_table[jnp.flip(window)]
+                    return acc.at[pos].set(_score_window(window, matrix))
 
-@njit(parallel=True, fastmath=True, cache=False)
-def _batch_all_scores_jit(data, offsets, matrix, kmer, is_revcomp):
-    """Compute PWM scores in batch with a JIT-compiled kernel."""
-    n_seq = len(offsets) - 1
-    m = matrix.shape[-1]
+                return lax.fori_loop(0, n_scores, body, row_out)
 
-    new_offsets = np.zeros(n_seq + 1, dtype=np.int64)
-    for i in range(n_seq):
-        seq_len = offsets[i + 1] - offsets[i]
-        if seq_len >= m:
-            new_offsets[i + 1] = seq_len - m + 1
+            return jax.vmap(score_row)(lengths, padded)
 
-    for i in range(n_seq):
-        new_offsets[i + 1] += new_offsets[i]
+    else:
 
-    total_scores = new_offsets[n_seq]
-    results = np.zeros(total_scores, dtype=np.float32)
+        @jax.jit
+        def kernel(sequences: jnp.ndarray, lengths: jnp.ndarray, matrix: jnp.ndarray) -> jnp.ndarray:
+            def score_row(seq_row: jnp.ndarray, seq_len: jnp.ndarray) -> jnp.ndarray:
+                row_out = jnp.zeros((max_scores,), dtype=jnp.float32)
+                n_scores = jnp.maximum(seq_len - motif_len + 1, 0)
 
-    for i in prange(n_seq):
-        start = offsets[i]
-        seq_len = offsets[i + 1] - start
-        out_start = new_offsets[i]
-        n_scores = new_offsets[i + 1] - out_start
+                def body(pos: int, acc: jnp.ndarray) -> jnp.ndarray:
+                    window = lax.dynamic_slice(seq_row, (pos,), (motif_len,))
+                    if is_revcomp:
+                        window = rc_table[jnp.flip(window)]
+                    return acc.at[pos].set(_score_window(window, matrix))
 
-        if n_scores > 0:
-            if not is_revcomp:
-                for k in range(n_scores):
-                    num_site = data[start + k : start + k + m]
-                    results[out_start + k] = score_seq(num_site, kmer, matrix)
-            else:
-                rc_seq = np.empty(seq_len, dtype=data.dtype)
-                _fill_rc_buffer(data, start, seq_len, rc_seq)
+                return lax.fori_loop(0, n_scores, body, row_out)
 
-                for k in range(n_scores):
-                    num_site = rc_seq[k : k + m]
-                    results[out_start + (n_scores - 1 - k)] = score_seq(num_site, kmer, matrix)
+            return jax.vmap(score_row)(sequences, lengths)
 
-    return results, new_offsets
-
-
-@njit(parallel=True, fastmath=True, cache=False)
-def _batch_all_scores_with_context_jit(data, offsets, matrix, kmer, is_revcomp):
-    """Compute BaMM scores in batch with context-aware padding."""
-    n_seq = len(offsets) - 1
-    m = matrix.shape[-1]
-    context_len = kmer - 1
-    window_size = m + context_len
-
-    new_offsets = np.zeros(n_seq + 1, dtype=np.int64)
-    for i in range(n_seq):
-        seq_len = offsets[i + 1] - offsets[i]
-        if seq_len >= m:
-            new_offsets[i + 1] = seq_len - m + 1
-
-    for i in range(n_seq):
-        new_offsets[i + 1] += new_offsets[i]
-
-    total_scores = new_offsets[n_seq]
-    results = np.zeros(total_scores, dtype=np.float32)
-
-    for i in prange(n_seq):
-        start = offsets[i]
-        seq_len = offsets[i + 1] - start
-        out_start = new_offsets[i]
-        n_scores = new_offsets[i + 1] - out_start
-
-        if n_scores > 0:
-            seq = data[start : start + seq_len]
-            if is_revcomp:
-                seq = np.empty(seq_len, dtype=data.dtype)
-                _fill_rc_buffer(data, start, seq_len, seq)
-
-            site_buffer = np.full(window_size, 4, dtype=data.dtype)
-            for k in range(n_scores):
-                _fill_forward_context_window(seq, seq_len, k, m, context_len, site_buffer)
-                result_idx = out_start + k if not is_revcomp else out_start + (n_scores - 1 - k)
-                results[result_idx] = score_seq(site_buffer, kmer, matrix)
-
-    return results, new_offsets
+    return kernel
 
 
 def batch_all_scores(
-    sequences: RaggedData,
+    sequences: MatrixData,
     matrix: np.ndarray,
     kmer: int = 1,
     is_revcomp: bool = False,
     with_context: bool = False,
-) -> RaggedData:
-    """Compute scores for all sequences in RaggedData."""
-    if with_context:
-        data, offsets = _batch_all_scores_with_context_jit(sequences.data, sequences.offsets, matrix, kmer, is_revcomp)
-    else:
-        data, offsets = _batch_all_scores_jit(sequences.data, sequences.offsets, matrix, kmer, is_revcomp)
-    return RaggedData(data, offsets)
+) -> MatrixData:
+    """Compute scores for all sequence rows in MatrixData."""
+    seq_matrix = np.ascontiguousarray(sequences.matrix, dtype=np.int8)
+    seq_lengths = np.ascontiguousarray(sequences.lengths, dtype=np.int64)
+    scan_matrix = _flatten_scan_matrix(matrix)
+    motif_len = int(scan_matrix.shape[1])
+    out_lengths = np.maximum(seq_lengths - motif_len + 1, 0).astype(np.int64, copy=False)
+
+    if seq_matrix.shape[0] == 0:
+        empty = np.empty((0, int(out_lengths.max(initial=0))), dtype=np.float32)
+        return MatrixData(empty, out_lengths, pad_value=np.float32(0.0))
+
+    kernel = _build_batch_score_kernel(seq_matrix.shape[1], motif_len, int(kmer), bool(with_context), bool(is_revcomp))
+    scores = kernel(
+        jnp.asarray(seq_matrix, dtype=jnp.int32),
+        jnp.asarray(seq_lengths, dtype=jnp.int32),
+        jnp.asarray(scan_matrix, dtype=jnp.float32),
+    )
+    return MatrixData(np.asarray(scores, dtype=np.float32), out_lengths, pad_value=np.float32(0.0))
 
 
-@njit
 def precision_recall_curve(classification, scores):
-    """Compute precision-recall curve (JIT-compiled)."""
+    """Compute precision-recall curve."""
+    classification = np.asarray(classification)
+    scores = np.asarray(scores)
+
     if len(scores) == 0:
         return np.array([1.0]), np.array([0.0]), np.array([np.inf])
 
-    # Get indices for sorting scores in descending order
     indexes = np.argsort(scores)[::-1]
     sorted_scores = scores[indexes]
     sorted_classification = classification[indexes]
 
-    # Initialize arrays (with +1 buffer for initial point)
     number_of_uniq_scores = np.unique(scores).shape[0]
     max_size = number_of_uniq_scores + 1
 
@@ -188,47 +155,32 @@ def precision_recall_curve(classification, scores):
     recall = np.zeros(max_size)
     uniq_scores = np.zeros(max_size)
 
-    # Initial point: (recall=0, precision=1, threshold=inf)
     precision[0] = 1.0
     recall[0] = 0.0
     uniq_scores[0] = np.inf
 
-    TP, FP = 0, 0
+    tp = 0
+    fp = 0
     number_of_true = np.sum(classification == 1)
     number_of_false = np.sum(classification == 0)
-
-    if number_of_false == 0:
-        true_false_ratio = 1.0
-    else:
-        true_false_ratio = number_of_true / number_of_false
+    true_false_ratio = 1.0 if number_of_false == 0 else number_of_true / number_of_false
 
     position = 1
     score = sorted_scores[0]
 
     for i in range(len(scores)):
-        _score = sorted_scores[i]
-        _flag = sorted_classification[i]
+        current_score = sorted_scores[i]
+        current_flag = sorted_classification[i]
 
-        # Update TP and FP
-        if _flag == 1:
-            TP += 1
+        if current_flag == 1:
+            tp += 1
         else:
-            FP += 1
+            fp += 1
 
-        # Check if score changed
         if i == len(scores) - 1 or score != sorted_scores[i + 1]:
-            uniq_scores[position] = _score
-
-            if TP + FP > 0:
-                precision[position] = TP / (TP + true_false_ratio * FP)
-            else:
-                precision[position] = 1.0
-
-            if number_of_true > 0:
-                recall[position] = TP / number_of_true
-            else:
-                recall[position] = 0.0
-
+            uniq_scores[position] = current_score
+            precision[position] = tp / (tp + true_false_ratio * fp) if tp + fp > 0 else 1.0
+            recall[position] = tp / number_of_true if number_of_true > 0 else 0.0
             position += 1
             if i < len(scores) - 1:
                 score = sorted_scores[i + 1]
@@ -236,18 +188,18 @@ def precision_recall_curve(classification, scores):
     return precision[:position], recall[:position], uniq_scores[:position]
 
 
-@njit
 def roc_curve(classification, scores):
-    """Compute ROC curve (JIT-compiled)."""
+    """Compute ROC curve."""
+    classification = np.asarray(classification)
+    scores = np.asarray(scores)
+
     if len(scores) == 0:
         return np.array([0.0]), np.array([0.0]), np.array([np.inf])
 
-    # Get indices for sorting scores in descending order
     indexes = np.argsort(scores)[::-1]
     sorted_scores = scores[indexes]
     sorted_classification = classification[indexes]
 
-    # Initialize arrays
     number_of_uniq_scores = np.unique(scores).shape[0]
     max_size = number_of_uniq_scores + 1
 
@@ -255,41 +207,30 @@ def roc_curve(classification, scores):
     fpr = np.zeros(max_size)
     uniq_scores = np.zeros(max_size)
 
-    # Initial point: (fpr=0, tpr=0, threshold=inf)
     tpr[0] = 0.0
     fpr[0] = 0.0
     uniq_scores[0] = np.inf
 
-    TP, FP = 0, 0
+    tp = 0
+    fp = 0
     number_of_true = np.sum(classification == 1)
     number_of_false = np.sum(classification == 0)
     position = 1
     score = sorted_scores[0]
 
     for i in range(len(scores)):
-        _score = sorted_scores[i]
-        _flag = sorted_classification[i]
+        current_score = sorted_scores[i]
+        current_flag = sorted_classification[i]
 
-        # Update TP and FP
-        if _flag == 1:
-            TP += 1
+        if current_flag == 1:
+            tp += 1
         else:
-            FP += 1
+            fp += 1
 
-        # Check if score changed
         if i == len(scores) - 1 or score != sorted_scores[i + 1]:
-            uniq_scores[position] = _score
-
-            if number_of_true > 0:
-                tpr[position] = TP / number_of_true
-            else:
-                tpr[position] = 0.0
-
-            if number_of_false > 0:
-                fpr[position] = FP / number_of_false
-            else:
-                fpr[position] = 0.0
-
+            uniq_scores[position] = current_score
+            tpr[position] = tp / number_of_true if number_of_true > 0 else 0.0
+            fpr[position] = fp / number_of_false if number_of_false > 0 else 0.0
             position += 1
             if i < len(scores) - 1:
                 score = sorted_scores[i + 1]
@@ -371,332 +312,159 @@ def standardized_pauc(pauc_raw: float, pauc_min: float, pauc_max: float) -> floa
     return 0.5 * (1.0 + (pauc_raw - pauc_min) / denom)
 
 
-def scores_to_frequencies(ragged_scores: RaggedData) -> RaggedData:
+def scores_to_frequencies(scores: MatrixData) -> MatrixData:
     """Convert scores to empirical log-tail frequencies within the current sample."""
-    flat = ragged_scores.data
-    n = flat.size
-
-    if n == 0:
-        return RaggedData(np.zeros(0, dtype=np.float32), ragged_scores.offsets)
+    flat = scores.flatten_valid()
+    if flat.size == 0:
+        empty = np.zeros_like(scores.matrix, dtype=np.float32)
+        return MatrixData(empty, scores.lengths.copy(), pad_value=np.float32(0.0))
 
     _, inv, cnt = np.unique(flat, return_inverse=True, return_counts=True)
     surv = np.cumsum(cnt[::-1])[::-1]
 
     eps = 1e-12
-    log_p = np.log10(n + eps) - np.log10(surv + eps)
+    log_p = np.log10(flat.size + eps) - np.log10(surv + eps)
+    valid_freq = log_p[inv].astype(np.float32)
 
-    new_data = log_p[inv].astype(np.float32)
-    return RaggedData(new_data, ragged_scores.offsets)
-
-
-@njit(_PROFILE_SUPPORT_SIGNATURE, cache=True)
-def _build_profile_support_numba(data, offsets, min_value):
-    """Build sparse local-position support for one profile at the requested threshold."""
-    n_seq = len(offsets) - 1
-    active_ptr = np.zeros(n_seq + 1, dtype=np.int64)
-
-    total_active = np.int64(0)
-    for i in range(n_seq):
-        start = offsets[i]
-        end = offsets[i + 1]
-        count = np.int64(0)
-        for j in range(end - start):
-            if data[start + j] >= min_value:
-                count += 1
-        total_active += count
-        active_ptr[i + 1] = total_active
-
-    active_idx = np.empty(total_active, dtype=np.int64)
-    for i in range(n_seq):
-        start = offsets[i]
-        end = offsets[i + 1]
-        write_pos = active_ptr[i]
-        for j in range(end - start):
-            if data[start + j] >= min_value:
-                active_idx[write_pos] = j
-                write_pos += 1
-
-    return active_idx, active_ptr
+    matrix = np.zeros_like(scores.matrix, dtype=np.float32)
+    matrix[scores.valid_mask()] = valid_freq
+    return MatrixData(matrix, scores.lengths.copy(), pad_value=np.float32(0.0))
 
 
-@njit(inline="always", cache=True)
-def _lower_bound_int64(arr, left, right, value):
-    """Return the first index in arr[left:right] with arr[idx] >= value."""
-    while left < right:
-        mid = left + (right - left) // 2
-        if arr[mid] < value:
-            left = mid + 1
-        else:
-            right = mid
-    return left
-
-
-@njit(_PROFILE_SPARSE_STATS_SIGNATURE, fastmath=True, cache=True)
-def _accumulate_profile_stats_sparse_numba(
-    data1,
-    offsets1,
-    active_idx1,
-    active_ptr1,
-    data2,
-    offsets2,
-    active_idx2,
-    active_ptr2,
-    search_range,
-):
-    """Accumulate exact overlap statistics using sparse threshold support."""
-    n_seq = len(offsets1) - 1
-    n_offsets = 2 * search_range + 1
-    center = search_range
-    inters = np.zeros(n_offsets, dtype=np.float32)
-    sum1s = np.zeros(n_offsets, dtype=np.float32)
-    sum2s = np.zeros(n_offsets, dtype=np.float32)
-    sentinel = np.int64(1 << 60)
-
-    for i in range(n_seq):
-        start1 = offsets1[i]
-        end1 = offsets1[i + 1]
-        start2 = offsets2[i]
-        end2 = offsets2[i + 1]
-        vlen1 = end1 - start1
-        vlen2 = end2 - start2
-
-        a_begin = active_ptr1[i]
-        a_end = active_ptr1[i + 1]
-        b_begin = active_ptr2[i]
-        b_end = active_ptr2[i + 1]
-
-        for neg_shift in range(1, search_range + 1):
-            offset_idx = center - neg_shift
-            overlap = min(vlen1, vlen2 - neg_shift)
-            if overlap <= 0:
-                continue
-
-            a_lo = a_begin
-            a_hi = _lower_bound_int64(active_idx1, a_lo, a_end, overlap)
-            b_lo = _lower_bound_int64(active_idx2, b_begin, b_end, neg_shift)
-            b_hi = _lower_bound_int64(active_idx2, b_lo, b_end, neg_shift + overlap)
-
-            ia = a_lo
-            ib = b_lo
-            while ia < a_hi or ib < b_hi:
-                pos_a = active_idx1[ia] if ia < a_hi else sentinel
-                pos_b = active_idx2[ib] - neg_shift if ib < b_hi else sentinel
-
-                if pos_a < pos_b:
-                    pos = pos_a
-                    ia += 1
-                elif pos_b < pos_a:
-                    pos = pos_b
-                    ib += 1
-                else:
-                    pos = pos_a
-                    ia += 1
-                    ib += 1
-
-                v1 = data1[start1 + pos]
-                v2 = data2[start2 + pos + neg_shift]
-                sum1s[offset_idx] += v1
-                sum2s[offset_idx] += v2
-                inters[offset_idx] += v1 if v1 < v2 else v2
-
-        for pos_shift in range(search_range + 1):
-            offset_idx = center + pos_shift
-            overlap = min(vlen1 - pos_shift, vlen2)
-            if overlap <= 0:
-                continue
-
-            a_lo = _lower_bound_int64(active_idx1, a_begin, a_end, pos_shift)
-            a_hi = _lower_bound_int64(active_idx1, a_lo, a_end, pos_shift + overlap)
-            b_lo = b_begin
-            b_hi = _lower_bound_int64(active_idx2, b_lo, b_end, overlap)
-
-            ia = a_lo
-            ib = b_lo
-            while ia < a_hi or ib < b_hi:
-                pos_a = active_idx1[ia] if ia < a_hi else sentinel
-                pos_b = active_idx2[ib] + pos_shift if ib < b_hi else sentinel
-
-                if pos_a < pos_b:
-                    pos = pos_a
-                    ia += 1
-                elif pos_b < pos_a:
-                    pos = pos_b
-                    ib += 1
-                else:
-                    pos = pos_a
-                    ia += 1
-                    ib += 1
-
-                v1 = data1[start1 + pos]
-                v2 = data2[start2 + pos - pos_shift]
-                sum1s[offset_idx] += v1
-                sum2s[offset_idx] += v2
-                inters[offset_idx] += v1 if v1 < v2 else v2
-
-    return inters, sum1s, sum2s
-
-
-@njit(_PROFILE_STATS_SIGNATURE, fastmath=True, cache=True)
-def _accumulate_profile_stats_no_threshold_numba(data1, offsets1, data2, offsets2, search_range):
-    """Accumulate overlap statistics for all offsets without threshold masking."""
-    n_seq = len(offsets1) - 1
-    n_offsets = 2 * search_range + 1
-    center = search_range
-    inters = np.zeros(n_offsets, dtype=np.float32)
-    sum1s = np.zeros(n_offsets, dtype=np.float32)
-    sum2s = np.zeros(n_offsets, dtype=np.float32)
-
-    for i in range(n_seq):
-        start1 = offsets1[i]
-        end1 = offsets1[i + 1]
-        start2 = offsets2[i]
-        end2 = offsets2[i + 1]
-        vlen1 = end1 - start1
-        vlen2 = end2 - start2
-
-        for neg_shift in range(1, search_range + 1):
-            offset_idx = center - neg_shift
-            overlap = min(vlen1, vlen2 - neg_shift)
-            base1 = start1
-            base2 = start2 + neg_shift
-
-            for j in range(overlap):
-                v1 = data1[base1 + j]
-                v2 = data2[base2 + j]
-                sum1s[offset_idx] += v1
-                sum2s[offset_idx] += v2
-                inters[offset_idx] += v1 if v1 < v2 else v2
-
-        for pos_shift in range(search_range + 1):
-            offset_idx = center + pos_shift
-            overlap = min(vlen1 - pos_shift, vlen2)
-            base1 = start1 + pos_shift
-            base2 = start2
-
-            for j in range(overlap):
-                v1 = data1[base1 + j]
-                v2 = data2[base2 + j]
-                sum1s[offset_idx] += v1
-                sum2s[offset_idx] += v2
-                inters[offset_idx] += v1 if v1 < v2 else v2
-
-    return inters, sum1s, sum2s
-
-
-@njit(_PROFILE_STATS_THRESHOLD_SIGNATURE, fastmath=True, cache=True)
-def _accumulate_profile_stats_threshold_numba(data1, offsets1, data2, offsets2, search_range, min_value):
-    """Accumulate overlap statistics for all offsets with threshold masking."""
-    n_seq = len(offsets1) - 1
-    n_offsets = 2 * search_range + 1
-    center = search_range
-    inters = np.zeros(n_offsets, dtype=np.float32)
-    sum1s = np.zeros(n_offsets, dtype=np.float32)
-    sum2s = np.zeros(n_offsets, dtype=np.float32)
-
-    for i in range(n_seq):
-        start1 = offsets1[i]
-        end1 = offsets1[i + 1]
-        start2 = offsets2[i]
-        end2 = offsets2[i + 1]
-        vlen1 = end1 - start1
-        vlen2 = end2 - start2
-
-        for neg_shift in range(1, search_range + 1):
-            offset_idx = center - neg_shift
-            overlap = min(vlen1, vlen2 - neg_shift)
-            base1 = start1
-            base2 = start2 + neg_shift
-
-            for j in range(overlap):
-                v1 = data1[base1 + j]
-                v2 = data2[base2 + j]
-                if v1 < min_value and v2 < min_value:
-                    continue
-                sum1s[offset_idx] += v1
-                sum2s[offset_idx] += v2
-                inters[offset_idx] += v1 if v1 < v2 else v2
-
-        for pos_shift in range(search_range + 1):
-            offset_idx = center + pos_shift
-            overlap = min(vlen1 - pos_shift, vlen2)
-            base1 = start1 + pos_shift
-            base2 = start2
-
-            for j in range(overlap):
-                v1 = data1[base1 + j]
-                v2 = data2[base2 + j]
-                if v1 < min_value and v2 < min_value:
-                    continue
-                sum1s[offset_idx] += v1
-                sum2s[offset_idx] += v2
-                inters[offset_idx] += v1 if v1 < v2 else v2
-
-    return inters, sum1s, sum2s
-
-
-@njit(_PROFILE_REDUCER_SIGNATURE, fastmath=True, cache=True)
-def _best_profile_score_co_numba(inters, sum1s, sum2s, search_range):
-    """Reduce accumulated statistics to the best overlap coefficient score."""
-    best_score = np.float32(-1.0)
-    best_offset = np.int64(0)
-
-    for k in range(inters.size):
-        denom = sum1s[k] if sum1s[k] < sum2s[k] else sum2s[k]
-        if denom <= PROFILE_EPS:
-            continue
-        score = inters[k] / denom
-        if score > best_score:
-            best_score = score
-            best_offset = k - search_range
-
-    if best_score < 0.0:
-        return np.float32(0.0), np.int64(0)
-
-    return best_score, best_offset
-
-
-@njit(_PROFILE_REDUCER_SIGNATURE, fastmath=True, cache=True)
-def _best_profile_score_dice_numba(inters, sum1s, sum2s, search_range):
-    """Reduce accumulated statistics to the best Dice score."""
-    best_score = np.float32(-1.0)
-    best_offset = np.int64(0)
-
-    for k in range(inters.size):
-        denom = sum1s[k] + sum2s[k]
-        if denom <= PROFILE_EPS:
-            continue
-        score = (np.float32(2.0) * inters[k]) / denom
-        if score > best_score:
-            best_score = score
-            best_offset = k - search_range
-
-    if best_score < 0.0:
-        return np.float32(0.0), np.int64(0)
-
-    return best_score, best_offset
-
-
-def _normalize_profile_score_inputs(data, offsets):
-    """Return profile-score inputs as contiguous float32 and int64 arrays."""
+def _normalize_profile_score_inputs(data, lengths):
+    """Return profile-score inputs as contiguous matrix and lengths arrays."""
+    matrix_data = data if isinstance(data, MatrixData) and lengths is None else MatrixData(data, lengths)
     return (
-        np.ascontiguousarray(data, dtype=PROFILE_DATA_DTYPE),
-        np.ascontiguousarray(offsets, dtype=PROFILE_OFFSETS_DTYPE),
+        np.ascontiguousarray(matrix_data.matrix, dtype=PROFILE_DATA_DTYPE),
+        np.ascontiguousarray(matrix_data.lengths, dtype=PROFILE_LENGTHS_DTYPE),
     )
 
 
-def _normalize_profile_support_inputs(active_idx, active_ptr):
-    """Return sparse profile support as contiguous int64 arrays."""
-    return (
-        np.ascontiguousarray(active_idx, dtype=PROFILE_OFFSETS_DTYPE),
-        np.ascontiguousarray(active_ptr, dtype=PROFILE_OFFSETS_DTYPE),
-    )
+def _legacy_support_to_mask(active_idx, active_ptr, lengths, width):
+    """Convert the former sparse support tuple to a matrix mask."""
+    support = np.zeros((lengths.size, width), dtype=bool)
+    active_idx = np.asarray(active_idx, dtype=np.int64)
+    active_ptr = np.asarray(active_ptr, dtype=np.int64)
+
+    for i in range(lengths.size):
+        begin = int(active_ptr[i])
+        end = int(active_ptr[i + 1])
+        if end <= begin:
+            continue
+        positions = active_idx[begin:end]
+        positions = positions[(positions >= 0) & (positions < lengths[i])]
+        support[i, positions] = True
+
+    return support
 
 
-def build_profile_support(data, offsets, min_value):
-    """Build sparse support for profile positions that meet the threshold."""
-    data, offsets = _normalize_profile_score_inputs(data, offsets)
-    min_value = np.float32(min_value)
-    return _build_profile_support_numba(data, offsets, min_value)
+def _normalize_profile_support_inputs(active_idx, active_ptr, lengths, width):
+    """Return support as a valid boolean matrix or None."""
+    if active_idx is None or active_ptr is None:
+        return None
+
+    support = np.asarray(active_idx)
+    if support.ndim == 2:
+        mask = np.ascontiguousarray(support, dtype=bool)
+    elif support.ndim == 1:
+        mask = _legacy_support_to_mask(active_idx, active_ptr, lengths, width)
+    else:
+        raise ValueError("Unsupported support representation")
+
+    valid = np.arange(width, dtype=np.int64)[None, :] < lengths[:, None]
+    return np.logical_and(mask, valid)
+
+
+def build_profile_support(data, lengths, min_value):
+    """Build threshold support as a boolean matrix with explicit row lengths."""
+    matrix, norm_lengths = _normalize_profile_score_inputs(data, lengths)
+    valid = np.arange(matrix.shape[1], dtype=np.int64)[None, :] < norm_lengths[:, None]
+    support = np.logical_and(matrix >= np.float32(min_value), valid)
+    return support, norm_lengths.copy()
+
+
+@functools.lru_cache(maxsize=None)
+def _build_profile_stats_kernel(width1: int, width2: int, search_range: int, mode: str):
+    """Create a shape-specialized JAX kernel for profile overlap statistics."""
+    n_offsets = 2 * search_range + 1
+
+    @jax.jit
+    def kernel(matrix1, lengths1, matrix2, lengths2, support1, support2, min_value):
+        def seq_body(i, state):
+            inters, sum1s, sum2s = state
+            row1 = matrix1[i]
+            row2 = matrix2[i]
+            len1 = lengths1[i]
+            len2 = lengths2[i]
+            sup1 = support1[i]
+            sup2 = support2[i]
+
+            def offset_body(k, current):
+                current_inters, current_sum1s, current_sum2s = current
+                offset = k - search_range
+                idx1 = jnp.maximum(offset, 0)
+                idx2 = jnp.maximum(-offset, 0)
+                overlap = jnp.minimum(len1 - idx1, len2 - idx2)
+                overlap = jnp.maximum(overlap, 0)
+
+                def pos_body(j, accum):
+                    inter, sum1, sum2 = accum
+                    v1 = row1[idx1 + j]
+                    v2 = row2[idx2 + j]
+
+                    if mode == "all":
+                        active = jnp.bool_(True)
+                    elif mode == "threshold":
+                        active = jnp.logical_or(v1 >= min_value, v2 >= min_value)
+                    else:
+                        active = jnp.logical_or(sup1[idx1 + j], sup2[idx2 + j])
+
+                    inter = inter + jnp.where(active, jnp.minimum(v1, v2), jnp.float32(0.0))
+                    sum1 = sum1 + jnp.where(active, v1, jnp.float32(0.0))
+                    sum2 = sum2 + jnp.where(active, v2, jnp.float32(0.0))
+                    return inter, sum1, sum2
+
+                inter, sum1, sum2 = lax.fori_loop(
+                    0,
+                    overlap,
+                    pos_body,
+                    (jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0)),
+                )
+                current_inters = current_inters.at[k].add(inter)
+                current_sum1s = current_sum1s.at[k].add(sum1)
+                current_sum2s = current_sum2s.at[k].add(sum2)
+                return current_inters, current_sum1s, current_sum2s
+
+            return lax.fori_loop(0, n_offsets, offset_body, (inters, sum1s, sum2s))
+
+        initial = (
+            jnp.zeros((n_offsets,), dtype=jnp.float32),
+            jnp.zeros((n_offsets,), dtype=jnp.float32),
+            jnp.zeros((n_offsets,), dtype=jnp.float32),
+        )
+        return lax.fori_loop(0, matrix1.shape[0], seq_body, initial)
+
+    return kernel
+
+
+def _reduce_profile_score(inters, sum1s, sum2s, search_range, metric):
+    """Reduce accumulated overlap statistics to the best score and offset."""
+    if metric == "co":
+        denom = np.minimum(sum1s, sum2s)
+        scores = np.full_like(inters, -1.0, dtype=np.float32)
+        np.divide(inters, denom, out=scores, where=denom > PROFILE_EPS)
+    elif metric == "dice":
+        denom = sum1s + sum2s
+        scores = np.full_like(inters, -1.0, dtype=np.float32)
+        np.divide(2.0 * inters, denom, out=scores, where=denom > PROFILE_EPS)
+    else:
+        raise ValueError("metric must be one of: 'co', 'dice'")
+
+    best_idx = int(np.argmax(scores))
+    best_score = float(scores[best_idx])
+    if best_score < 0.0:
+        return np.float32(0.0), np.int64(0)
+    return np.float32(best_score), np.int64(best_idx - search_range)
 
 
 def fast_profile_score(
@@ -712,50 +480,48 @@ def fast_profile_score(
     active_idx2=None,
     active_ptr2=None,
 ):
-    """Dispatch profile similarity scoring to specialized overlap-based kernels."""
-    data1, offsets1 = _normalize_profile_score_inputs(data1, offsets1)
-    data2, offsets2 = _normalize_profile_score_inputs(data2, offsets2)
-    search_range = np.int64(search_range)
+    """Dispatch profile similarity scoring to matrix-based JAX overlap kernels."""
+    matrix1, lengths1 = _normalize_profile_score_inputs(data1, offsets1)
+    matrix2, lengths2 = _normalize_profile_score_inputs(data2, offsets2)
+    search_range = int(search_range)
     min_value = np.float32(min_value)
-    thresholded = min_value > np.float32(0.0)
 
-    use_sparse = (
-        active_idx1 is not None and active_ptr1 is not None and active_idx2 is not None and active_ptr2 is not None
-    )
-    if thresholded and not use_sparse:
-        active_idx1, active_ptr1 = build_profile_support(data1, offsets1, min_value)
-        active_idx2, active_ptr2 = build_profile_support(data2, offsets2, min_value)
-        use_sparse = True
+    if matrix1.shape[0] != matrix2.shape[0]:
+        raise ValueError("Both profiles must contain the same number of sequences")
 
-    if use_sparse:
-        active_idx1, active_ptr1 = _normalize_profile_support_inputs(active_idx1, active_ptr1)
-        active_idx2, active_ptr2 = _normalize_profile_support_inputs(active_idx2, active_ptr2)
-        inters, sum1s, sum2s = _accumulate_profile_stats_sparse_numba(
-            data1,
-            offsets1,
-            active_idx1,
-            active_ptr1,
-            data2,
-            offsets2,
-            active_idx2,
-            active_ptr2,
-            search_range,
-        )
-    elif thresholded:
-        inters, sum1s, sum2s = _accumulate_profile_stats_threshold_numba(
-            data1, offsets1, data2, offsets2, search_range, min_value
-        )
+    support1 = _normalize_profile_support_inputs(active_idx1, active_ptr1, lengths1, matrix1.shape[1])
+    support2 = _normalize_profile_support_inputs(active_idx2, active_ptr2, lengths2, matrix2.shape[1])
+
+    if support1 is not None and support2 is not None:
+        mode = "support"
+    elif min_value > np.float32(0.0):
+        mode = "threshold"
     else:
-        inters, sum1s, sum2s = _accumulate_profile_stats_no_threshold_numba(
-            data1, offsets1, data2, offsets2, search_range
-        )
+        mode = "all"
 
-    if metric == "co":
-        return _best_profile_score_co_numba(inters, sum1s, sum2s, search_range)
-    if metric == "dice":
-        return _best_profile_score_dice_numba(inters, sum1s, sum2s, search_range)
+    if support1 is None:
+        support1 = np.zeros(matrix1.shape, dtype=bool)
+    if support2 is None:
+        support2 = np.zeros(matrix2.shape, dtype=bool)
 
-    raise ValueError("metric must be one of: 'co', 'dice'")
+    kernel = _build_profile_stats_kernel(matrix1.shape[1], matrix2.shape[1], search_range, mode)
+    inters, sum1s, sum2s = kernel(
+        jnp.asarray(matrix1, dtype=jnp.float32),
+        jnp.asarray(lengths1, dtype=jnp.int32),
+        jnp.asarray(matrix2, dtype=jnp.float32),
+        jnp.asarray(lengths2, dtype=jnp.int32),
+        jnp.asarray(support1, dtype=jnp.bool_),
+        jnp.asarray(support2, dtype=jnp.bool_),
+        jnp.asarray(min_value, dtype=jnp.float32),
+    )
+
+    return _reduce_profile_score(
+        np.asarray(inters, dtype=np.float32),
+        np.asarray(sum1s, dtype=np.float32),
+        np.asarray(sum2s, dtype=np.float32),
+        search_range,
+        metric,
+    )
 
 
 def format_params(params: dict) -> str:

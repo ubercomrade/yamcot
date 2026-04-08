@@ -116,7 +116,7 @@ To estimate the statistical significance (p-values) of observed similarity score
     * **Random kernel draw**: kernel coefficients are sampled from a normal distribution and smoothed with a short filter.
     * **Identity mixing**: the random kernel is mixed with an identity (delta) kernel using the distortion coefficient `alpha` (`--distortion`), where `alpha=0` keeps identity and `alpha=1` gives fully random distortion.
     * **Optional sign flip**: the final kernel can be negated with probability 0.5.
-    * **Segment-wise convolution**: each ragged sequence segment is convolved independently, then converted back to frequency space.
+    * **Row-wise convolution**: each valid matrix row is convolved independently using its explicit row length, then converted back to frequency space.
 
 2. **Permutation**: for matrix-based comparisons (`motif`), the tool performs random column-wise permutations.
    For $R$ permutations, the empirical p-value is computed as:
@@ -161,10 +161,10 @@ pip install -e .
 When installing via `pip`, the following dependencies are resolved automatically:
 
 * `numpy` (>= 2.0, < 2.4)
-* `numba` (>= 0.62.0)
 * `scipy` (>= 1.14.1)
 * `pandas` (>= 2.2.3)
 * `joblib` (>= 1.5.3)
+* `jax` (>= 0.6.2)
 
 ### Build Requirements (Source only)
 
@@ -191,7 +191,7 @@ The `mimosa` tool provides three operation modes.
 mimosa profile scores_1.fasta scores_2.fasta \
   --model1-type scores \
   --model2-type scores \
-  --metric cj \
+  --metric co \
   --permutations 1000
 
 # Compare two motifs through sequence-derived profiles
@@ -214,7 +214,7 @@ mimosa profile foxa2.meme gata4.meme \
 | `--fasta` | Path | FASTA file used to scan motif inputs. If omitted when scanning is needed, random sequences are generated. |
 | `--num-sequences` | Integer | Number of generated sequences for scanning mode (default: `1000`). |
 | `--seq-length` | Integer | Length of generated sequences for scanning mode (default: `200`). |
-| `--metric` | `cj`, `co`, `dice`, `l1sim` | Similarity metric for profile comparison (default: `cj`). |
+| `--metric` | `co`, `dice` | Similarity metric for profile comparison (default: `co`). |
 | `--permutations` | Integer | Number of permutations for p-value calculation (default: `0`). |
 | `--distortion` | Float | Distortion level for surrogate profile generation (default: `0.4`). |
 | `--search-range` | Integer | Maximum offset range explored during alignment (default: `10`). |
@@ -308,12 +308,12 @@ import os
 import joblib
 import numpy as np
 
+from mimosa.matrix import MatrixData, matrix_from_list
 from mimosa.models import GenericModel
 from mimosa.models import registry as model_registry
-from mimosa.ragged import RaggedData, ragged_from_list
 
 
-def scan_dinuc_scores(sequences: RaggedData, matrix: np.ndarray, strand: str) -> RaggedData:
+def scan_dinuc_scores(sequences: MatrixData, matrix: np.ndarray, strand: str) -> MatrixData:
     """Scan sequences with a dinucleotide matrix of shape (16, motif_length-1)."""
     motif_len = matrix.shape[1] + 1
     rc_table = np.array([3, 2, 1, 0, 4], dtype=np.int8)
@@ -344,7 +344,7 @@ def scan_dinuc_scores(sequences: RaggedData, matrix: np.ndarray, strand: str) ->
 
         result.append(scores)
 
-    return ragged_from_list(result, dtype=np.float32)
+    return matrix_from_list(result, dtype=np.float32)
 
 
 @model_registry.register("dinuc")
@@ -352,7 +352,7 @@ class DinucStrategy:
     """Example custom strategy for a dinucleotide model."""
 
     @staticmethod
-    def scan(model: GenericModel, sequences: RaggedData, strand: str) -> RaggedData:
+    def scan(model: GenericModel, sequences: MatrixData, strand: str) -> MatrixData:
         representation = model.representation.astype(np.float32)
         if strand == "+":
             return scan_dinuc_scores(sequences, representation, "+")
@@ -361,7 +361,7 @@ class DinucStrategy:
         if strand == "best":
             sf = scan_dinuc_scores(sequences, representation, "+")
             sr = scan_dinuc_scores(sequences, representation, "-")
-            return RaggedData(np.maximum(sf.data, sr.data), sf.offsets)
+            return MatrixData(np.maximum(sf.matrix, sr.matrix), sf.lengths)
         raise ValueError(f"Invalid strand mode: {strand}")
 
     @staticmethod
@@ -424,7 +424,7 @@ A model strategy registered in `mimosa.models.registry` must provide:
 
 | Method | Description |
 | :--- | :--- |
-| `scan(model, sequences, strand)` | Required. Returns `RaggedData` with positional scores. |
+| `scan(model, sequences, strand)` | Required. Returns `MatrixData` with positional scores. |
 | `write(model, path)` | Required. Serializes model data. |
 | `score_bounds(model)` | Required for threshold table generation. |
 | `load(path, kwargs)` | Required. Builds and returns a `GenericModel`. |
@@ -468,7 +468,7 @@ model2 = read_model("examples/gata2.meme", "pwm")
 sequences = read_fasta("examples/foreground.fa")
 
 config = create_comparator_config(
-    metric="cj",
+    metric="co",
     n_permutations=100,
     seed=42,
     search_range=10,

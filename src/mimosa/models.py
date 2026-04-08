@@ -36,7 +36,7 @@ from mimosa.io import (
     read_slim,
     write_sitega,
 )
-from mimosa.ragged import RaggedData
+from mimosa.matrix import MatrixData
 
 StrandMode = Literal["best", "+", "-"]
 
@@ -102,7 +102,7 @@ class ModelRegistry:
 registry = ModelRegistry()
 
 
-def scan_model(model: GenericModel, sequences: Optional[RaggedData], strand: Optional[StrandMode] = None) -> RaggedData:
+def scan_model(model: GenericModel, sequences: Optional[MatrixData], strand: Optional[StrandMode] = None) -> MatrixData:
     """Universal scanning function that dispatches to the appropriate strategy."""
     strategy_cls = registry.get(model.type_key)
     strand_mode = strand or model.config.get("strand_mode", "best")
@@ -184,12 +184,11 @@ def _resolve_threshold_table(model: GenericModel, strand: StrandMode = "best") -
     return None
 
 
-def calculate_threshold_table(model: GenericModel, promoters: RaggedData, strand: StrandMode = "best") -> np.ndarray:
+def calculate_threshold_table(model: GenericModel, promoters: MatrixData, strand: StrandMode = "best") -> np.ndarray:
     """Calculate a score-to-logFPR lookup table on the provided background."""
 
-    ragged_scores = scan_model(model, promoters, strand=strand)
-
-    flat_scores = ragged_scores.data
+    score_data = scan_model(model, promoters, strand=strand)
+    flat_scores = score_data.flatten_valid()
 
     if flat_scores.size == 0:
         return np.array([[0.0, 0.0]], dtype=np.float64)
@@ -217,14 +216,14 @@ def calculate_threshold_table(model: GenericModel, promoters: RaggedData, strand
 
 def scores_to_log_fpr(
     model: GenericModel,
-    ragged_scores: RaggedData,
-    promoters: RaggedData,
+    score_data: MatrixData,
+    promoters: MatrixData,
     strand: StrandMode = "best",
-) -> RaggedData:
+) -> MatrixData:
     """Convert scores to logFPR values using a precomputed threshold table."""
-    flat = ragged_scores.data
+    flat = score_data.flatten_valid()
     if flat.size == 0:
-        return RaggedData(np.zeros(0, dtype=np.float32), ragged_scores.offsets)
+        return MatrixData(np.zeros_like(score_data.matrix, dtype=np.float32), score_data.lengths.copy())
 
     threshold_table = calculate_threshold_table(model, promoters, strand=strand)
     scores_col = threshold_table[:, 0]
@@ -233,24 +232,26 @@ def scores_to_log_fpr(
     idx = np.searchsorted(-scores_col, -flat, side="left")
     idx = np.clip(idx, 0, len(logfpr_col) - 1)
 
-    return RaggedData(logfpr_col[idx].astype(np.float32), ragged_scores.offsets)
+    matrix = np.zeros_like(score_data.matrix, dtype=np.float32)
+    matrix[score_data.valid_mask()] = logfpr_col[idx].astype(np.float32)
+    return MatrixData(matrix, score_data.lengths.copy(), pad_value=np.float32(0.0))
 
 
-def get_frequencies(model: GenericModel, sequences: RaggedData, strand: Optional[StrandMode] = None) -> RaggedData:
+def get_frequencies(model: GenericModel, sequences: MatrixData, strand: Optional[StrandMode] = None) -> MatrixData:
     """Calculate per-position hit frequencies using pure functions."""
     scores = scan_model(model, sequences, strand)
 
     return scores_to_frequencies(scores)
 
 
-def get_scores(model: GenericModel, sequences: RaggedData, strand: Optional[StrandMode] = None) -> RaggedData:
+def get_scores(model: GenericModel, sequences: MatrixData, strand: Optional[StrandMode] = None) -> MatrixData:
     """Calculate motif scores for each position using pure functions."""
     return scan_model(model, sequences, strand)
 
 
 def get_sites(
     model: GenericModel,
-    sequences: RaggedData,
+    sequences: MatrixData,
     mode: str = "best",
     fpr_threshold: Optional[float] = None,
 ) -> pd.DataFrame:
@@ -295,14 +296,14 @@ def get_sites(
 
     results = []
 
-    s_fwd_ragged = scan_model(model, sequences, strand="+")
-    s_rev_ragged = scan_model(model, sequences, strand="-")
+    s_fwd_scores = scan_model(model, sequences, strand="+")
+    s_rev_scores = scan_model(model, sequences, strand="-")
     n_seq = sequences.num_sequences
 
     for seq_idx in range(n_seq):
         seq = sequences.get_slice(seq_idx)
-        s_fwd = s_fwd_ragged.get_slice(seq_idx)
-        s_rev = s_rev_ragged.get_slice(seq_idx)
+        s_fwd = s_fwd_scores.get_slice(seq_idx)
+        s_rev = s_rev_scores.get_slice(seq_idx)
 
         if mode == "best":
             f_max = s_fwd.max() if s_fwd.size > 0 else -1e9
@@ -337,7 +338,7 @@ def get_sites(
 
 def get_pfm(
     model: GenericModel,
-    sequences: RaggedData,
+    sequences: MatrixData,
     mode: str = "best",
     fpr_threshold: Optional[float] = None,
     top_fraction: Optional[float] = None,
@@ -439,11 +440,11 @@ def _rc_sequence(seq_int: np.ndarray) -> np.ndarray:
 
 def _scan_with_batch_kernel(
     model: GenericModel,
-    sequences: RaggedData,
+    sequences: MatrixData,
     strand: StrandMode,
     *,
     with_context: bool = False,
-) -> RaggedData:
+) -> MatrixData:
     """Scan a tensor-based motif model with the shared batch scoring kernel."""
     representation = _get_float32_representation(model)
     kmer = model.config.get("kmer", 1)
@@ -455,7 +456,7 @@ def _scan_with_batch_kernel(
     elif strand == "best":
         sf = batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=False, with_context=with_context)
         sr = batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=True, with_context=with_context)
-        return RaggedData(np.maximum(sf.data, sr.data), sf.offsets)
+        return MatrixData(np.maximum(sf.matrix, sr.matrix), sf.lengths.copy(), pad_value=np.float32(0.0))
     else:
         raise ValueError(f"Invalid strand mode: {strand}")
 
@@ -465,7 +466,7 @@ class PwmStrategy:
     """PWM (Position Weight Matrix) strategy implementation."""
 
     @staticmethod
-    def scan(model: GenericModel, sequences: RaggedData, strand: StrandMode) -> RaggedData:
+    def scan(model: GenericModel, sequences: MatrixData, strand: StrandMode) -> MatrixData:
         """Scan sequences with PWM model."""
         return _scan_with_batch_kernel(model, sequences, strand, with_context=False)
 
@@ -513,7 +514,7 @@ class SitegaStrategy:
     """SiteGA strategy implementation."""
 
     @staticmethod
-    def scan(model: GenericModel, sequences: RaggedData, strand: StrandMode) -> RaggedData:
+    def scan(model: GenericModel, sequences: MatrixData, strand: StrandMode) -> MatrixData:
         """Scan sequences with PWM model."""
         return _scan_with_batch_kernel(model, sequences, strand, with_context=False)
 
@@ -558,7 +559,7 @@ class BammStrategy:
     """BaMM (Bayesian Markov Model) strategy implementation."""
 
     @staticmethod
-    def scan(model: GenericModel, sequences: RaggedData, strand: StrandMode) -> RaggedData:
+    def scan(model: GenericModel, sequences: MatrixData, strand: StrandMode) -> MatrixData:
         """Scan sequences with BaMM model."""
         return _scan_with_batch_kernel(model, sequences, strand, with_context=True)
 
@@ -614,7 +615,7 @@ class DimontStrategy:
     """Dimont motif model strategy implementation."""
 
     @staticmethod
-    def scan(model: GenericModel, sequences: RaggedData, strand: StrandMode) -> RaggedData:
+    def scan(model: GenericModel, sequences: MatrixData, strand: StrandMode) -> MatrixData:
         """Scan sequences with a Dimont motif model."""
         return _scan_with_batch_kernel(model, sequences, strand, with_context=model.config.get("kmer", 1) > 1)
 
@@ -655,7 +656,7 @@ class SlimStrategy:
     """Slim motif model strategy implementation."""
 
     @staticmethod
-    def scan(model: GenericModel, sequences: RaggedData, strand: StrandMode) -> RaggedData:
+    def scan(model: GenericModel, sequences: MatrixData, strand: StrandMode) -> MatrixData:
         """Scan sequences with a Slim motif model."""
         return _scan_with_batch_kernel(model, sequences, strand, with_context=model.config.get("kmer", 1) > 1)
 
@@ -696,7 +697,7 @@ class ScoresStrategy:
     """Numerical score-profile strategy implementation."""
 
     @staticmethod
-    def scan(model: GenericModel, sequences: Optional[RaggedData] = None, strand: StrandMode = "best") -> RaggedData:
+    def scan(model: GenericModel, sequences: Optional[MatrixData] = None, strand: StrandMode = "best") -> MatrixData:
         """Return stored score profiles directly."""
         return model.config["scores_data"]
 
@@ -709,9 +710,10 @@ class ScoresStrategy:
     def score_bounds(model: GenericModel) -> tuple[float, float]:
         """Return score bounds for numerical score profiles."""
         scores_data = model.config["scores_data"]
-        if scores_data.data.size == 0:
+        flat = scores_data.flatten_valid()
+        if flat.size == 0:
             return 0.0, 0.0
-        return float(np.min(scores_data.data)), float(np.max(scores_data.data))
+        return float(np.min(flat)), float(np.max(flat))
 
     @staticmethod
     def load(path: str, kwargs: dict) -> GenericModel:

@@ -11,12 +11,12 @@ from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 
-from mimosa.ragged import RaggedData
+from mimosa.matrix import MatrixData, matrix_from_list
 
 _JSTACS_NUMERIC_RE = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[Ee][-+]?\d+)?")
 
 
-def read_fasta(path: str | Path) -> RaggedData:
+def read_fasta(path: str | Path) -> MatrixData:
     """Read a FASTA file and return integer-encoded sequences."""
 
     trans_table = bytearray([4] * 256)
@@ -43,23 +43,11 @@ def read_fasta(path: str | Path) -> RaggedData:
             encoded = np.frombuffer(current_seq_bytes.translate(trans_table), dtype=np.int8).copy()
             sequences.append(encoded)
 
-    if not sequences:
-        return RaggedData(np.empty(0, dtype=np.int8), np.zeros(1, dtype=np.int64))
-
-    n = len(sequences)
-    offsets = np.zeros(n + 1, dtype=np.int64)
-    for i, seq in enumerate(sequences):
-        offsets[i + 1] = offsets[i] + len(seq)
-
-    total_data = np.empty(offsets[-1], dtype=np.int8)
-    for i, seq in enumerate(sequences):
-        total_data[offsets[i] : offsets[i + 1]] = seq
-
-    return RaggedData(total_data, offsets)
+    return matrix_from_list(sequences, dtype=np.int8, pad_value=4)
 
 
-def read_scores(path: str | Path) -> RaggedData:
-    """Read FASTA-like numerical score profiles into RaggedData."""
+def read_scores(path: str | Path) -> MatrixData:
+    """Read FASTA-like numerical score profiles into MatrixData."""
 
     profiles: List[np.ndarray] = []
     current_values: List[float] = []
@@ -84,28 +72,16 @@ def read_scores(path: str | Path) -> RaggedData:
     if current_values:
         profiles.append(np.asarray(current_values, dtype=np.float32))
 
-    if not profiles:
-        return RaggedData(np.empty(0, dtype=np.float32), np.zeros(1, dtype=np.int64))
-
-    n = len(profiles)
-    offsets = np.zeros(n + 1, dtype=np.int64)
-    for i, profile in enumerate(profiles):
-        offsets[i + 1] = offsets[i] + len(profile)
-
-    total_data = np.empty(offsets[-1], dtype=np.float32)
-    for i, profile in enumerate(profiles):
-        total_data[offsets[i] : offsets[i + 1]] = profile
-
-    return RaggedData(total_data, offsets)
+    return matrix_from_list(profiles, dtype=np.float32, pad_value=np.float32(0.0))
 
 
-def write_fasta(sequences: Union[RaggedData, Iterable[np.ndarray]], path: str) -> None:
+def write_fasta(sequences: Union[MatrixData, Iterable[np.ndarray]], path: str) -> None:
     """Write integer-encoded sequences to a FASTA file."""
 
     decoder = np.array(["A", "C", "G", "T", "N"], dtype="U1")
 
     with open(path, "w") as out:
-        if isinstance(sequences, RaggedData):
+        if isinstance(sequences, MatrixData):
             for i in range(sequences.num_sequences):
                 seq_int = sequences.get_slice(i)
                 safe_seq = np.clip(seq_int, 0, 4)

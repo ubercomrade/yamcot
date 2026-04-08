@@ -25,7 +25,7 @@ import numpy as np
 from joblib import Parallel, delayed
 from scipy.ndimage import convolve1d
 
-from mimosa.cache import fingerprint_ragged, load_profile_cache, store_profile_cache
+from mimosa.cache import fingerprint_matrix_data, load_profile_cache, store_profile_cache
 from mimosa.execute import run_motali
 from mimosa.functions import (
     build_profile_support,
@@ -33,6 +33,7 @@ from mimosa.functions import (
     scores_to_frequencies,
 )
 from mimosa.io import write_dist, write_fasta
+from mimosa.matrix import MatrixData
 from mimosa.models import (
     GenericModel,
     calculate_threshold_table,
@@ -42,7 +43,6 @@ from mimosa.models import (
     scores_to_log_fpr,
     write_model,
 )
-from mimosa.ragged import RaggedData
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,7 @@ class ComparatorConfig:
     fasta_path: Optional[str] = None
     cache_mode: str = "off"
     cache_dir: str = ".mimosa-cache"
-    promoters: Optional[RaggedData] = dc_field(default=None, compare=False, hash=False, repr=False)
+    promoters: Optional[MatrixData] = dc_field(default=None, compare=False, hash=False, repr=False)
 
 
 def create_comparator_config(**kwargs) -> ComparatorConfig:
@@ -130,10 +130,10 @@ def create_comparator_config(**kwargs) -> ComparatorConfig:
 
 def _scores_to_profile_signal(
     model: GenericModel,
-    scores: RaggedData,
+    scores: MatrixData,
     cfg: ComparatorConfig,
     strand: str,
-) -> RaggedData:
+) -> MatrixData:
     """Convert raw scores to the profile scale used for comparison."""
     if cfg.promoters is None:
         profile = scores_to_frequencies(scores)
@@ -154,14 +154,14 @@ def _get_profile_runtime_cache(model: GenericModel) -> dict:
 
 def _resolve_profile_signal(
     model: GenericModel,
-    sequences: Optional[RaggedData],
+    sequences: Optional[MatrixData],
     cfg: ComparatorConfig,
     strand: str,
-) -> RaggedData:
+) -> MatrixData:
     """Resolve a model to the profile signal used in profile comparisons."""
     profile_kind = "logfpr" if cfg.promoters is not None else "empirical"
-    sequence_fp = fingerprint_ragged(sequences) or "no-sequences"
-    promoter_fp = fingerprint_ragged(cfg.promoters)
+    sequence_fp = fingerprint_matrix_data(sequences) or "no-sequences"
+    promoter_fp = fingerprint_matrix_data(cfg.promoters)
     runtime_key = (profile_kind, strand, sequence_fp, promoter_fp)
     runtime_cache = _get_profile_runtime_cache(model)
 
@@ -196,8 +196,8 @@ def _resolve_profile_signal(
 
 def _resolve_profile_support(
     model: GenericModel,
-    profile: RaggedData,
-    sequences: Optional[RaggedData],
+    profile: MatrixData,
+    sequences: Optional[MatrixData],
     cfg: ComparatorConfig,
     strand: str,
 ):
@@ -210,8 +210,8 @@ def _resolve_profile_support(
         return None
 
     profile_kind = "logfpr" if cfg.promoters is not None else "empirical"
-    sequence_fp = fingerprint_ragged(sequences) or "no-sequences"
-    promoter_fp = fingerprint_ragged(cfg.promoters)
+    sequence_fp = fingerprint_matrix_data(sequences) or "no-sequences"
+    promoter_fp = fingerprint_matrix_data(cfg.promoters)
     runtime_key = ("support", np.float32(min_value), profile_kind, strand, sequence_fp, promoter_fp)
     runtime_cache = _get_profile_runtime_cache(model)
 
@@ -219,16 +219,16 @@ def _resolve_profile_support(
     if cached is not None:
         return cached
 
-    support = build_profile_support(profile.data, profile.offsets, min_value)
+    support = build_profile_support(profile.matrix, profile.lengths, min_value)
     runtime_cache[runtime_key] = support
     return support
 
 
-def _create_surrogate_ragged(frequencies: RaggedData, rng: np.random.Generator, cfg: ComparatorConfig) -> RaggedData:
+def _create_surrogate_matrix(frequencies: MatrixData, rng: np.random.Generator, cfg: ComparatorConfig) -> MatrixData:
     """Surrogate generation: random kernel + delta-spike at a random offset, then smoothing + normalization."""
 
-    data = frequencies.data
-    offsets = frequencies.offsets
+    matrix = frequencies.matrix
+    lengths = frequencies.lengths
 
     min_kernel_size = int(cfg.min_kernel_size)
     max_kernel_size = int(cfg.max_kernel_size)
@@ -265,18 +265,16 @@ def _create_surrogate_ragged(frequencies: RaggedData, rng: np.random.Generator, 
 
     final_kernel /= np.linalg.norm(final_kernel) + 1e-8
 
-    # apply convolution per ragged segment
-    convolved = np.empty_like(data, dtype=np.float32)
-    for i in range(len(offsets) - 1):
-        start = int(offsets[i])
-        end = int(offsets[i + 1])
-        segment = data[start:end]
-        if segment.size == 0:
+    # apply convolution per matrix row using explicit row lengths
+    convolved = np.zeros_like(matrix, dtype=np.float32)
+    for i in range(frequencies.num_sequences):
+        length = int(lengths[i])
+        if length == 0:
             continue
-        convolved[start:end] = convolve1d(segment, final_kernel, axis=0, mode="constant", cval=0.0).astype(np.float32)
+        segment = matrix[i, :length]
+        convolved[i, :length] = convolve1d(segment, final_kernel, axis=0, mode="constant", cval=0.0).astype(np.float32)
 
-    convolved_ragged = RaggedData(data=convolved, offsets=offsets)
-    return scores_to_frequencies(convolved_ragged)
+    return scores_to_frequencies(MatrixData(convolved, lengths.copy(), pad_value=np.float32(0.0)))
 
 
 def run_montecarlo(
@@ -336,7 +334,7 @@ registry = ComparatorRegistry()
 def strategy_motif(
     model1: GenericModel,
     model2: GenericModel,
-    sequences: Optional[RaggedData],
+    sequences: Optional[MatrixData],
     cfg: ComparatorConfig,
 ) -> dict:
     """Matrix-based comparison strategy (PCC/ED/Cosine)."""
@@ -497,10 +495,10 @@ def strategy_motif(
 def strategy_profile(
     model1: GenericModel,
     model2: GenericModel,
-    sequences: Optional[RaggedData],
+    sequences: Optional[MatrixData],
     cfg: ComparatorConfig,
 ) -> dict:
-    """RaggedData-based comparison strategy (CO/Dice similarity)."""
+    """Matrix-based profile comparison strategy (CO/Dice similarity)."""
     if cfg.promoters is not None and ("scores" in {model1.type_key, model2.type_key}):
         raise ValueError("Profile strategy with promoters requires motif models for both inputs.")
 
@@ -511,7 +509,7 @@ def strategy_profile(
     support2_plus = _resolve_profile_support(model2, freq2_plus, sequences, cfg, "+")
     support2_minus = _resolve_profile_support(model2, freq2_minus, sequences, cfg, "-")
 
-    def get_score(S1: RaggedData, S2: RaggedData, support1=None, support2=None) -> Tuple[float, int]:
+    def get_score(S1: MatrixData, S2: MatrixData, support1=None, support2=None) -> Tuple[float, int]:
         """Compute score and offset for two profiles."""
         min_value = -1.0 if cfg.min_logfpr is None else float(cfg.min_logfpr)
         active_idx1 = active_ptr1 = active_idx2 = active_ptr2 = None
@@ -520,10 +518,10 @@ def strategy_profile(
         if support2 is not None:
             active_idx2, active_ptr2 = support2
         sc, off = fast_profile_score(
-            S1.data,
-            S1.offsets,
-            S2.data,
-            S2.offsets,
+            S1.matrix,
+            S1.lengths,
+            S2.matrix,
+            S2.lengths,
             cfg.search_range,
             min_value=min_value,
             metric=cfg.metric,
@@ -557,7 +555,7 @@ def strategy_profile(
 
         def surrogate_gen(rng):
             """Generate one surrogate score."""
-            surr = _create_surrogate_ragged(f_final, rng, cfg)
+            surr = _create_surrogate_matrix(f_final, rng, cfg)
             sc, _ = get_score(freq1_plus, surr, support1_plus, None)
             return sc
 
@@ -575,7 +573,7 @@ def strategy_profile(
 def strategy_motali(
     model1: GenericModel,
     model2: GenericModel,
-    sequences: Optional[RaggedData],
+    sequences: Optional[MatrixData],
     cfg: ComparatorConfig,
 ) -> dict:
     """External Motali tool wrapper."""
@@ -647,8 +645,8 @@ def compare(
     model2: GenericModel,
     strategy: str,
     config: ComparatorConfig,
-    sequences: Optional[RaggedData] = None,
-    promoters: Optional[RaggedData] = None,
+    sequences: Optional[MatrixData] = None,
+    promoters: Optional[MatrixData] = None,
 ) -> dict:
     """Main entry point for motif comparison."""
     strategy_fn = registry.get(strategy)
