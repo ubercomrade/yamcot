@@ -1,15 +1,5 @@
 """
-Functional Models Module
-========================
-
-This module provides a functional programming approach to motif models,
-replacing class hierarchies with immutable data structures and registry-based polymorphism.
-
-Key Features:
-- Immutable data containers using frozen dataclasses
-- Registry-based strategy pattern using decorators
-- Pure functions for all operations
-- Dependency injection for all dependencies
+Model utilities and registry-backed motif strategies.
 """
 
 from __future__ import annotations
@@ -24,7 +14,16 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from mimosa.functions import batch_all_scores, pfm_to_pwm, scores_to_frequencies
+from mimosa.functions import (
+    apply_score_log_tail_table,
+    batch_all_scores,
+    build_score_log_tail_table,
+    lookup_log_tail,
+    lookup_score_for_tail_probability,
+    pcm_to_pfm,
+    pfm_to_pwm,
+    scores_to_empirical_log_tail,
+)
 from mimosa.io import (
     parse_file_content,
     read_bamm,
@@ -41,36 +40,15 @@ from mimosa.ragged import RaggedData
 StrandMode = Literal["best", "+", "-"]
 
 
-@dataclass(frozen=True)
+@dataclass(eq=False)
 class GenericModel:
-    """Immutable motif model container.
-
-    This dataclass provides immutability but the representation field
-    is excluded from hashing due to numpy array unhashability.
-
-    Attributes
-    ----------
-    type_key : str
-        Model type identifier for registry dispatch
-    name : str
-        Human-readable name
-    representation : Any
-        Numeric representation of the motif
-    length : int
-        Length of the motif
-    config : dict
-        Additional configuration parameters
-    """
+    """Motif model container with mutable runtime caches in ``config``."""
 
     type_key: str
     name: str
     representation: Any = dc_field(hash=False)
     length: int
     config: dict = dc_field(default_factory=dict, hash=False)
-
-    def __hash__(self):
-        """Custom hash implementation excluding unhashable fields."""
-        return hash((self.type_key, self.name, self.length))
 
 
 class ModelRegistry:
@@ -185,28 +163,9 @@ def _resolve_threshold_table(model: GenericModel, strand: StrandMode = "best") -
 
 
 def calculate_threshold_table(model: GenericModel, promoters: RaggedData, strand: StrandMode = "best") -> np.ndarray:
-    """Calculate a score-to-logFPR lookup table on the provided background."""
-
+    """Calculate a score-to-log-tail lookup table on the provided background."""
     ragged_scores = scan_model(model, promoters, strand=strand)
-
-    flat_scores = ragged_scores.data
-
-    if flat_scores.size == 0:
-        return np.array([[0.0, 0.0]], dtype=np.float64)
-
-    scores_sorted = np.sort(flat_scores)[::-1]
-    n_total = flat_scores.size
-
-    unique_scores, inverse, counts = np.unique(scores_sorted, return_inverse=True, return_counts=True)
-    unique_scores = unique_scores[::-1]
-    counts = counts[::-1]
-
-    cum_counts = np.cumsum(counts)
-    fpr_values = cum_counts / n_total
-    log_fpr_values = -np.log10(fpr_values)
-
-    table = np.column_stack([unique_scores, np.abs(log_fpr_values)])
-    table = table.astype(np.float64)
+    table = build_score_log_tail_table(ragged_scores.data)
     tables = _get_threshold_tables(model)
     tables[strand] = table
     if strand == "best":
@@ -215,32 +174,33 @@ def calculate_threshold_table(model: GenericModel, promoters: RaggedData, strand
     return table.astype(np.float64)
 
 
+def scores_to_background_log_tail(
+    model: GenericModel,
+    ragged_scores: RaggedData,
+    promoters: RaggedData,
+    strand: StrandMode = "best",
+) -> RaggedData:
+    """Convert scores to background-calibrated log-tail values using both strands."""
+    del strand
+    threshold_table = calculate_threshold_table(model, promoters, strand="best")
+    return apply_score_log_tail_table(ragged_scores, threshold_table)
+
+
 def scores_to_log_fpr(
     model: GenericModel,
     ragged_scores: RaggedData,
     promoters: RaggedData,
     strand: StrandMode = "best",
 ) -> RaggedData:
-    """Convert scores to logFPR values using a precomputed threshold table."""
-    flat = ragged_scores.data
-    if flat.size == 0:
-        return RaggedData(np.zeros(0, dtype=np.float32), ragged_scores.offsets)
-
-    threshold_table = calculate_threshold_table(model, promoters, strand=strand)
-    scores_col = threshold_table[:, 0]
-    logfpr_col = threshold_table[:, 1]
-
-    idx = np.searchsorted(-scores_col, -flat, side="left")
-    idx = np.clip(idx, 0, len(logfpr_col) - 1)
-
-    return RaggedData(logfpr_col[idx].astype(np.float32), ragged_scores.offsets)
+    """Backward-compatible alias for background-calibrated log-tail conversion."""
+    return scores_to_background_log_tail(model, ragged_scores, promoters, strand=strand)
 
 
 def get_frequencies(model: GenericModel, sequences: RaggedData, strand: Optional[StrandMode] = None) -> RaggedData:
-    """Calculate per-position hit frequencies using pure functions."""
+    """Calculate per-position empirical log-tail values."""
     scores = scan_model(model, sequences, strand)
 
-    return scores_to_frequencies(scores)
+    return scores_to_empirical_log_tail(scores)
 
 
 def get_scores(model: GenericModel, sequences: RaggedData, strand: Optional[StrandMode] = None) -> RaggedData:
@@ -255,7 +215,7 @@ def get_sites(
     fpr_threshold: Optional[float] = None,
 ) -> pd.DataFrame:
     """Find motif binding sites in sequences."""
-    threshold_table = _resolve_threshold_table(model)
+    threshold_table = _resolve_threshold_table(model, "best")
     if mode not in ["best", "threshold"]:
         raise ValueError(f"mode must be 'best' or 'threshold', got {mode!r}")
     if mode == "threshold" and fpr_threshold is None:
@@ -264,7 +224,9 @@ def get_sites(
         raise ValueError("Model has no threshold table")
 
     score_threshold = (
-        _frequency_to_score(model, fpr_threshold) if mode == "threshold" and fpr_threshold is not None else None
+        _tail_probability_to_score(model, fpr_threshold, strand="best")
+        if mode == "threshold" and fpr_threshold is not None
+        else None
     )
     if score_threshold is not None:
         logger = logging.getLogger(__name__)
@@ -288,7 +250,7 @@ def get_sites(
                 "end": int(pos + model.length),
                 "strand": strand,
                 "score": score,
-                "frequency": _score_to_frequency(model, score),
+                "log_tail": _score_to_log_tail(model, score, strand="best"),
                 "site": _int_to_seq(site_seq),
             }
         )
@@ -305,9 +267,11 @@ def get_sites(
         s_rev = s_rev_ragged.get_slice(seq_idx)
 
         if mode == "best":
-            f_max = s_fwd.max() if s_fwd.size > 0 else -1e9
-            r_max = s_rev.max() if s_rev.size > 0 else -1e9
+            f_max = s_fwd.max() if s_fwd.size > 0 else -np.inf
+            r_max = s_rev.max() if s_rev.size > 0 else -np.inf
 
+            if not np.isfinite(f_max) and not np.isfinite(r_max):
+                continue
             if f_max >= r_max:
                 best_pos = int(np.argmax(s_fwd))
                 best_score = float(f_max)
@@ -345,11 +309,21 @@ def get_pfm(
     force_recompute: bool = False,
 ) -> np.ndarray:
     """Construct Position Frequency Matrix (PFM) from binding sites."""
-
-    cached_pfm = model.config.get("_pfm")
-    if cached_pfm is not None and not force_recompute:
+    cache_key = (
+        id(sequences.data),
+        id(sequences.offsets),
+        sequences.data.shape,
+        sequences.offsets.shape,
+        mode,
+        None if fpr_threshold is None else float(fpr_threshold),
+        None if top_fraction is None else float(top_fraction),
+        float(pseudocount),
+    )
+    cached_pfm = model.config.get("_derived_pfm")
+    cached_key = model.config.get("_derived_pfm_key")
+    if cached_pfm is not None and cached_key == cache_key and not force_recompute:
         logger = logging.getLogger(__name__)
-        logger.info(f"Returning cached PFM for model: {model.name}")
+        logger.info(f"Returning cached derived PFM for model: {model.name}")
         return cached_pfm
 
     logger = logging.getLogger(__name__)
@@ -367,61 +341,38 @@ def get_pfm(
         logger = logging.getLogger(__name__)
         logger.info(f"Selected top {top_fraction * 100:.1f}%: {n_keep} sites")
 
-    pfm = np.full((4, model.length), pseudocount, dtype=np.float32)
+    pcm = np.zeros((4, model.length), dtype=np.float32)
     nuc_map = {"A": 0, "C": 1, "G": 2, "T": 3}
 
     for site_str in sites_df["site"]:
         for pos, nuc in enumerate(site_str):
             if nuc in nuc_map:
-                pfm[nuc_map[nuc], pos] += 1.0
+                pcm[nuc_map[nuc], pos] += 1.0
 
-    pfm = (pfm + 1) / pfm.sum(axis=0, keepdims=True)
+    pfm = pcm_to_pfm(pcm, pseudocount=pseudocount).astype(np.float32, copy=False)
 
-    model.config["_pfm"] = pfm
+    model.config["_derived_pfm"] = pfm
+    model.config["_derived_pfm_key"] = cache_key
 
     return pfm
 
 
-def _score_to_frequency(model: GenericModel, score: float, strand: StrandMode = "best") -> float:
-    """Convert score to frequency using threshold table."""
+def _score_to_log_tail(model: GenericModel, score: float, strand: StrandMode = "best") -> float:
+    """Convert score to log-tail value using a cached lookup table."""
     threshold_table = _resolve_threshold_table(model, strand)
     if threshold_table is None:
         return np.nan
 
-    scores_col = threshold_table[:, 0]
-    logfpr_col = threshold_table[:, 1]
-
-    if score >= scores_col[0]:
-        return float(logfpr_col[0])
-    if score <= scores_col[-1]:
-        return float(logfpr_col[-1])
-
-    idx = np.searchsorted(-scores_col, -score, side="left")
-    if idx >= len(logfpr_col):
-        return float(logfpr_col[-1])
-    return float(logfpr_col[idx])
+    return lookup_log_tail(threshold_table, score)
 
 
-def _frequency_to_score(model: GenericModel, frequency: float, strand: StrandMode = "best") -> float:
-    """Convert frequency to score using threshold table."""
+def _tail_probability_to_score(model: GenericModel, tail_probability: float, strand: StrandMode = "best") -> float:
+    """Convert a tail-probability threshold to the corresponding score cutoff."""
     threshold_table = _resolve_threshold_table(model, strand)
     if threshold_table is None:
         raise ValueError("Model has no threshold table")
 
-    if frequency <= 0:
-        return float(threshold_table[0, 0])
-
-    target_logfpr = -np.log10(frequency)
-
-    scores_col = threshold_table[:, 0]
-    logfpr_col = threshold_table[:, 1]
-
-    mask = logfpr_col >= target_logfpr
-    if not np.any(mask):
-        return float(scores_col[-1])
-
-    last_valid = np.where(mask)[0][-1]
-    return float(scores_col[last_valid])
+    return lookup_score_for_tail_probability(threshold_table, tail_probability)
 
 
 def _int_to_seq(seq_int: np.ndarray) -> str:
@@ -472,7 +423,7 @@ class PwmStrategy:
     @staticmethod
     def write(model: GenericModel, path: str) -> None:
         """Write PWM model to file."""
-        pfm = model.config.get("_pfm")
+        pfm = model.config.get("_source_pfm")
         if pfm is not None:
             with open(path, "w") as f:
                 f.write(f">{model.name}\n")
@@ -504,7 +455,11 @@ class PwmStrategy:
         pwm_ext = np.concatenate((pwm, np.min(pwm, axis=0, keepdims=True)), axis=0).astype(np.float32, copy=False)
 
         return GenericModel(
-            type_key="pwm", name=name, length=int(length), representation=pwm_ext, config={"kmer": 1, "_pfm": pfm}
+            type_key="pwm",
+            name=name,
+            length=int(length),
+            representation=pwm_ext,
+            config={"kmer": 1, "_source_pfm": pfm},
         )
 
 
@@ -578,26 +533,18 @@ class BammStrategy:
 
         if not path.endswith(".ihbcp") and not os.path.exists(path):
             ihbcp_path = f"{path}.ihbcp"
-            hbcp_path = f"{path}.hbcp"
             if os.path.exists(ihbcp_path):
                 path = ihbcp_path
-                bg_path = hbcp_path if os.path.exists(hbcp_path) else None
             else:
                 raise FileNotFoundError(f"BaMM file not found: {path}")
-        else:
-            bg_path = kwargs.get("bg_path")
-            if bg_path is None:
-                base_path = path.replace(".ihbcp", "")
-                hbcp_path = f"{base_path}.hbcp"
-                if os.path.exists(hbcp_path):
-                    bg_path = hbcp_path
 
-        target_order = kwargs.get("order", 2)
-        _, max_order, length = parse_file_content(path)
+        target_order = kwargs.get("order")
+        target_order = 0 if target_order is None else int(target_order)
+        _, max_order, _ = parse_file_content(path)
         if target_order > max_order:
             target_order = max_order
 
-        representation = read_bamm(path, bg_path, target_order)
+        representation = read_bamm(path, target_order)
         name = os.path.splitext(os.path.basename(path))[0]
 
         return GenericModel(
@@ -605,7 +552,7 @@ class BammStrategy:
             name=name,
             length=representation.shape[-1],
             representation=np.asarray(representation, dtype=np.float32),
-            config={"kmer": 2},
+            config={"kmer": representation.ndim - 1},
         )
 
 

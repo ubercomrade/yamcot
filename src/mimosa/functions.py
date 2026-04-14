@@ -27,12 +27,76 @@ def pfm_to_pwm(pfm):
     return pwm
 
 
-def pcm_to_pfm(pcm):
+def pcm_to_pfm(pcm, pseudocount: float = 0.25):
     """Convert Position Count Matrix to Position Frequency Matrix."""
     number_of_sites = pcm.sum(axis=0)
-    nuc_pseudo = 0.25
-    pfm = (pcm + nuc_pseudo) / (number_of_sites + 1)
+    nuc_pseudo = float(pseudocount)
+    pfm = (pcm + nuc_pseudo) / (number_of_sites + 4.0 * nuc_pseudo)
     return pfm
+
+
+def build_score_log_tail_table(scores: np.ndarray) -> np.ndarray:
+    """Build a score-to-log-tail lookup table from one score sample."""
+    flat = np.asarray(scores, dtype=np.float64).ravel()
+    if flat.size == 0:
+        return np.array([[0.0, 0.0]], dtype=np.float64)
+
+    scores_sorted = np.sort(flat)[::-1]
+    unique_scores, counts = np.unique(scores_sorted, return_counts=True)
+    unique_scores = unique_scores[::-1]
+    counts = counts[::-1]
+
+    cum_counts = np.cumsum(counts)
+    tail_probabilities = cum_counts / flat.size
+    log_tail = -np.log10(tail_probabilities)
+    return np.column_stack([unique_scores, log_tail]).astype(np.float64)
+
+
+def apply_score_log_tail_table(ragged_scores: RaggedData, table: np.ndarray) -> RaggedData:
+    """Map raw scores to log-tail values using a lookup table."""
+    flat = ragged_scores.data
+    if flat.size == 0:
+        return RaggedData(np.zeros(0, dtype=np.float32), ragged_scores.offsets)
+
+    scores_col = table[:, 0]
+    log_tail_col = table[:, 1]
+
+    idx = np.searchsorted(-scores_col, -flat, side="left")
+    idx = np.clip(idx, 0, len(log_tail_col) - 1)
+    return RaggedData(log_tail_col[idx].astype(np.float32), ragged_scores.offsets)
+
+
+def lookup_log_tail(table: np.ndarray, score: float) -> float:
+    """Convert a score to the corresponding log-tail value."""
+    scores_col = table[:, 0]
+    log_tail_col = table[:, 1]
+
+    if score >= scores_col[0]:
+        return float(log_tail_col[0])
+    if score <= scores_col[-1]:
+        return float(log_tail_col[-1])
+
+    idx = np.searchsorted(-scores_col, -score, side="left")
+    if idx >= len(log_tail_col):
+        return float(log_tail_col[-1])
+    return float(log_tail_col[idx])
+
+
+def lookup_score_for_tail_probability(table: np.ndarray, tail_probability: float) -> float:
+    """Convert a tail probability threshold to the corresponding score cutoff."""
+    if tail_probability <= 0:
+        return float(table[0, 0])
+
+    target_log_tail = -np.log10(tail_probability)
+    scores_col = table[:, 0]
+    log_tail_col = table[:, 1]
+
+    mask = log_tail_col >= target_log_tail
+    if not np.any(mask):
+        return float(scores_col[-1])
+
+    last_valid = np.where(mask)[0][-1]
+    return float(scores_col[last_valid])
 
 
 @njit
@@ -371,22 +435,15 @@ def standardized_pauc(pauc_raw: float, pauc_min: float, pauc_max: float) -> floa
     return 0.5 * (1.0 + (pauc_raw - pauc_min) / denom)
 
 
+def scores_to_empirical_log_tail(ragged_scores: RaggedData) -> RaggedData:
+    """Convert scores to empirical log-tail values within the current sample."""
+    table = build_score_log_tail_table(ragged_scores.data)
+    return apply_score_log_tail_table(ragged_scores, table)
+
+
 def scores_to_frequencies(ragged_scores: RaggedData) -> RaggedData:
-    """Convert scores to empirical log-tail frequencies within the current sample."""
-    flat = ragged_scores.data
-    n = flat.size
-
-    if n == 0:
-        return RaggedData(np.zeros(0, dtype=np.float32), ragged_scores.offsets)
-
-    _, inv, cnt = np.unique(flat, return_inverse=True, return_counts=True)
-    surv = np.cumsum(cnt[::-1])[::-1]
-
-    eps = 1e-12
-    log_p = np.log10(n + eps) - np.log10(surv + eps)
-
-    new_data = log_p[inv].astype(np.float32)
-    return RaggedData(new_data, ragged_scores.offsets)
+    """Backward-compatible alias for empirical score-to-log-tail conversion."""
+    return scores_to_empirical_log_tail(ragged_scores)
 
 
 @njit(_PROFILE_SUPPORT_SIGNATURE, cache=True)

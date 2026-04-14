@@ -98,12 +98,13 @@ When `--pfm-mode` is enabled (or model types are different), MIMOSA uses the fol
    (negative sign makes higher values better for all metrics).
 
 5. **Best offset and strand orientation**  
-   MIMOSA evaluates direct (`++`) and reverse-complement (`+-`) orientations and returns:
+   MIMOSA evaluates all oriented query/target pairs (`++`, `+-`, `-+`, `--`), where the first sign is the query strand and the second sign is the target strand. It returns:
    $$
-   S^* = \max_{\omega \in \{++, +-\}} \max_{\delta:\,L_{\delta}\ge \frac{1}{2}\min(L_1,L_2)}
+   S^* = \max_{\omega \in \{++, +-, -+, --\}} \max_{\delta:\,L_{\delta}\ge \frac{1}{2}\min(L_1,L_2)}
    S(\delta,\omega)
    $$
    i.e., the best score among admissible overlaps (at least half of the shorter motif length).
+   The reported `offset` is always the target start relative to the query start after both motifs/profiles are oriented according to `orientation`.
 
 This design preserves the Tomtom-style matrix comparison logic [22], while enabling comparisons for heterogeneous model classes through sequence-driven PFM reconstruction.
 

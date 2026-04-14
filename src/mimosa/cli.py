@@ -247,6 +247,12 @@ def _add_motif_parser(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Force sequence-driven PFM reconstruction before direct motif comparison.",
     )
+    motif_group.add_argument(
+        "--pfm-top-fraction",
+        type=float,
+        default=0.05,
+        help="Fraction of top-scoring reconstructed sites used for cross-type PFM comparison. (default: %(default)s)",
+    )
 
     technical_group = parser.add_argument_group("Technical Options")
     technical_group.add_argument(
@@ -430,6 +436,7 @@ def map_args_to_comparator_kwargs(args) -> Dict[str, Any]:
             "n_jobs": args.jobs,
             "seed": args.seed,
             "pfm_mode": args.pfm_mode,
+            "pfm_top_fraction": args.pfm_top_fraction,
         }
 
     if args.mode == "motali":

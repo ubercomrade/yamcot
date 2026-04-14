@@ -257,14 +257,10 @@ def parse_file_content(filepath: str) -> tuple[dict[int, list[np.ndarray]], int,
     return data_by_order, max_order, num_positions
 
 
-def read_bamm(motif_path: str, bg_path: str, target_order: int) -> np.ndarray:
-    """Read BaMM files, apply ramp-up logic, and add padding for 'N' (index 4)."""
+def read_bamm(motif_path: str, target_order: int) -> np.ndarray:
+    """Read a BaMM motif and convert it to log-odds against a uniform background."""
 
     motif_raw, max_order_file, motif_length = parse_file_content(motif_path)
-    bg_raw, max_order_bg, _ = parse_file_content(bg_path)
-
-    if max_order_file > max_order_bg:
-        max_order_file = max_order_bg
     if target_order > max_order_file:
         target_order = max_order_file
         logger = logging.getLogger(__name__)
@@ -278,10 +274,10 @@ def read_bamm(motif_path: str, bg_path: str, target_order: int) -> np.ndarray:
         current_k = min(pos, target_order)
 
         p_motif = motif_raw[current_k][pos]
-        p_bg = bg_raw[current_k][0]
+        uniform_bg = np.full_like(p_motif, 0.25 ** (current_k + 1), dtype=np.float32)
 
         epsilon = 1e-10
-        log_odds = np.log2((p_motif + epsilon) / (p_bg + epsilon))
+        log_odds = np.log((p_motif + epsilon) / (uniform_bg + epsilon))
 
         shape_k = [4] * (current_k + 1)
         tensor_k = log_odds.reshape(shape_k)
@@ -374,7 +370,7 @@ def _build_position_tensor(
 
 
 def read_slim(path: str) -> tuple[np.ndarray, int, int]:
-    """Read a Jstacs Slim XML model into a dense context tensor."""
+    """Read a Jstacs Slim XML model into a dense log-odds tensor."""
     root = ET.parse(path).getroot()
     slim = root.find(".//SLIM")
     if slim is None:
@@ -385,6 +381,7 @@ def read_slim(path: str) -> tuple[np.ndarray, int, int]:
     component_params = _xml_array(slim.find("componentMixtureParameters"))
     ancestor_params = _xml_array(slim.find("ancestorMixtureParameters"))
     dependency_params = _xml_array(slim.find("dependencyParameters"))
+    uniform_log_odds_offset = np.log(4.0)
 
     tensor = np.empty((5,) * (distance + 1) + (length,), dtype=np.float32)
 
@@ -395,7 +392,7 @@ def read_slim(path: str) -> tuple[np.ndarray, int, int]:
         independent_log_probs = _log_normalize(independent_logits)
 
         if len(component_log_probs) == 1:
-            context_log_probs = {(): independent_log_probs}
+            context_log_probs = {(): independent_log_probs + uniform_log_odds_offset}
             context_axes: List[int] = []
         else:
             parent_count = len(ancestor_params[position][1])
@@ -420,7 +417,7 @@ def read_slim(path: str) -> tuple[np.ndarray, int, int]:
                     dependent_score = component_log_probs[1] + (
                         np.max(dependent_terms) + np.log(np.sum(np.exp(dependent_terms - np.max(dependent_terms))))
                     )
-                    symbol_log_probs[symbol] = np.logaddexp(independent_score, dependent_score)
+                    symbol_log_probs[symbol] = np.logaddexp(independent_score, dependent_score) + uniform_log_odds_offset
 
                 context_log_probs[context] = symbol_log_probs
 
@@ -467,11 +464,12 @@ def _collect_dimont_leaves(
 
 
 def read_dimont(path: str) -> tuple[np.ndarray, int, int]:
-    """Read a Jstacs Dimont XML model into a dense context tensor."""
+    """Read a Jstacs Dimont XML model into a dense log-odds tensor."""
     root = ET.parse(path).getroot()
     model = root.find(".//ThresholdedStrandChIPper/function/pos/MarkovModelDiffSM")
     if model is None:
         raise ValueError(f"Could not find Dimont motif model in {path}")
+    uniform_log_odds_offset = np.log(4.0)
 
     trees = model.find("bayesianNetworkSF/trees")
     if trees is None:
@@ -514,7 +512,7 @@ def read_dimont(path: str) -> tuple[np.ndarray, int, int]:
 
         for assignment, log_probs in leaves:
             context_values = tuple(assignment[abs_pos] for abs_pos in absolute_positions if abs_pos in used_positions)
-            context_log_probs[context_values] = log_probs
+            context_log_probs[context_values] = log_probs + uniform_log_odds_offset
 
         tensor[..., position] = _build_position_tensor(context_log_probs, context_axes, span)
 

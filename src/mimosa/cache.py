@@ -14,7 +14,7 @@ import numpy as np
 from mimosa.models import GenericModel
 from mimosa.ragged import RaggedData
 
-CACHE_VERSION = "v1"
+CACHE_VERSION = "v2"
 
 
 def _hash_array(array: np.ndarray) -> bytes:

@@ -28,9 +28,11 @@ from scipy.ndimage import convolve1d
 from mimosa.cache import fingerprint_ragged, load_profile_cache, store_profile_cache
 from mimosa.execute import run_motali
 from mimosa.functions import (
+    apply_score_log_tail_table,
+    build_score_log_tail_table,
     build_profile_support,
     fast_profile_score,
-    scores_to_frequencies,
+    scores_to_empirical_log_tail,
 )
 from mimosa.io import write_dist, write_fasta
 from mimosa.models import (
@@ -39,12 +41,14 @@ from mimosa.models import (
     get_pfm,
     get_score_bounds,
     scan_model,
-    scores_to_log_fpr,
+    scores_to_background_log_tail,
     write_model,
 )
 from mimosa.ragged import RaggedData
 
 logger = logging.getLogger(__name__)
+DEFAULT_CO_MIN_LOGTAIL = 1.0
+ORIENTATION_TIEBREAK = {"++": 0, "+-": 1, "-+": 2, "--": 3}
 
 
 @dataclass(frozen=True)
@@ -63,6 +67,7 @@ class ComparatorConfig:
 
     permute_rows: bool = False
     pfm_mode: bool = False
+    pfm_top_fraction: Optional[float] = 0.05
 
     distortion_level: float = 0.4
     search_range: int = 10
@@ -89,6 +94,7 @@ def create_comparator_config(**kwargs) -> ComparatorConfig:
         "n_jobs": -1,
         "permute_rows": False,
         "pfm_mode": False,
+        "pfm_top_fraction": 0.05,
         "distortion_level": 0.4,
         "search_range": 10,
         "min_kernel_size": 3,
@@ -120,12 +126,31 @@ def create_comparator_config(**kwargs) -> ComparatorConfig:
     min_logfpr = config_params.get("min_logfpr")
     if min_logfpr is not None and float(min_logfpr) < 0.0:
         raise ValueError("min_logfpr must be non-negative.")
+    pfm_top_fraction = config_params.get("pfm_top_fraction")
+    if pfm_top_fraction is not None:
+        pfm_top_fraction = float(pfm_top_fraction)
+        if pfm_top_fraction <= 0.0 or pfm_top_fraction > 1.0:
+            raise ValueError("pfm_top_fraction must be in the (0, 1] range.")
+        config_params["pfm_top_fraction"] = pfm_top_fraction
     cache_mode = str(config_params.get("cache_mode", "off")).lower()
     if cache_mode not in {"off", "on"}:
         raise ValueError("cache_mode must be either 'off' or 'on'.")
     config_params["cache_mode"] = cache_mode
 
     return ComparatorConfig(**config_params)
+
+
+def _select_best_orientation(candidates):
+    """Choose the highest-scoring orientation with deterministic tie-breaking.
+
+    The returned offset is always interpreted in the coordinate system of the
+    oriented query/target pair encoded by the orientation label.
+    """
+
+    return max(
+        candidates,
+        key=lambda candidate: (float(candidate["score"]), -ORIENTATION_TIEBREAK[candidate["orientation"]]),
+    )
 
 
 def _scores_to_profile_signal(
@@ -136,9 +161,9 @@ def _scores_to_profile_signal(
 ) -> RaggedData:
     """Convert raw scores to the profile scale used for comparison."""
     if cfg.promoters is None:
-        profile = scores_to_frequencies(scores)
+        profile = scores_to_empirical_log_tail(scores)
     else:
-        profile = scores_to_log_fpr(model, scores, cfg.promoters, strand=strand)
+        profile = scores_to_background_log_tail(model, scores, cfg.promoters)
 
     return profile
 
@@ -159,7 +184,7 @@ def _resolve_profile_signal(
     strand: str,
 ) -> RaggedData:
     """Resolve a model to the profile signal used in profile comparisons."""
-    profile_kind = "logfpr" if cfg.promoters is not None else "empirical"
+    profile_kind = "background_log_tail" if cfg.promoters is not None else "empirical_best_log_tail"
     sequence_fp = fingerprint_ragged(sequences) or "no-sequences"
     promoter_fp = fingerprint_ragged(cfg.promoters)
     runtime_key = (profile_kind, strand, sequence_fp, promoter_fp)
@@ -184,7 +209,18 @@ def _resolve_profile_signal(
             raise ValueError("Profile strategy requires sequences when comparing motif models.")
         scores = scan_model(model, sequences, strand)
 
-    profile = _scores_to_profile_signal(model, scores, cfg, strand)
+    if cfg.promoters is None and model.type_key != "scores":
+        if sequences is None:
+            raise ValueError("Profile strategy requires sequences when comparing motif models.")
+        empirical_table_key = ("empirical_best_table", sequence_fp)
+        empirical_table = runtime_cache.get(empirical_table_key)
+        if empirical_table is None:
+            best_scores = scan_model(model, sequences, strand="best")
+            empirical_table = build_score_log_tail_table(best_scores.data)
+            runtime_cache[empirical_table_key] = empirical_table
+        profile = apply_score_log_tail_table(scores, empirical_table)
+    else:
+        profile = _scores_to_profile_signal(model, scores, cfg, strand)
     runtime_cache[runtime_key] = profile
 
     if use_disk_cache:
@@ -209,7 +245,7 @@ def _resolve_profile_support(
     if min_value <= 0.0:
         return None
 
-    profile_kind = "logfpr" if cfg.promoters is not None else "empirical"
+    profile_kind = "background_log_tail" if cfg.promoters is not None else "empirical_best_log_tail"
     sequence_fp = fingerprint_ragged(sequences) or "no-sequences"
     promoter_fp = fingerprint_ragged(cfg.promoters)
     runtime_key = ("support", np.float32(min_value), profile_kind, strand, sequence_fp, promoter_fp)
@@ -276,7 +312,7 @@ def _create_surrogate_ragged(frequencies: RaggedData, rng: np.random.Generator, 
         convolved[start:end] = convolve1d(segment, final_kernel, axis=0, mode="constant", cval=0.0).astype(np.float32)
 
     convolved_ragged = RaggedData(data=convolved, offsets=offsets)
-    return scores_to_frequencies(convolved_ragged)
+    return scores_to_empirical_log_tail(convolved_ragged)
 
 
 def run_montecarlo(
@@ -375,9 +411,10 @@ def strategy_motif(
             mat = mat[clean_slice]
 
         k = mat.ndim - 1
-        rc = mat.copy()
-        for i in range(k):
-            rc = np.flip(rc, axis=i)
+        rc_axes = tuple(range(k - 1, -1, -1)) + (k,)
+        rc = np.transpose(mat, axes=rc_axes)
+        for axis in range(k):
+            rc = np.flip(rc, axis=axis)
         rc = np.flip(rc, axis=-1)
         return mat.reshape(-1, mat.shape[-1]), rc.reshape(-1, mat.shape[-1])
 
@@ -440,21 +477,28 @@ def strategy_motif(
         if sequences is None:
             raise ValueError("sequences are required for pfm_mode")
         else:
-            matrix1 = get_pfm(model1, sequences)
-            matrix2 = get_pfm(model2, sequences)
+            matrix1 = get_pfm(model1, sequences, top_fraction=cfg.pfm_top_fraction)
+            matrix2 = get_pfm(model2, sequences, top_fraction=cfg.pfm_top_fraction)
     else:
         matrix1 = model1.representation
         matrix2 = model2.representation
-    f1, _ = _prep_matrix(matrix1)
+    f1, f1_rc = _prep_matrix(matrix1)
     f2, f2_rc = _prep_matrix(matrix2)
 
-    s_pp, off_pp = _align(f1, f2)
-    s_pm, off_pm = _align(f1, f2_rc)
+    candidates = []
+    for orient, query_matrix, target_matrix in (
+        ("++", f1, f2),
+        ("+-", f1, f2_rc),
+        ("-+", f1_rc, f2),
+        ("--", f1_rc, f2_rc),
+    ):
+        score, off = _align(query_matrix, target_matrix)
+        candidates.append({"orientation": orient, "score": score, "offset": off})
 
-    if s_pm > s_pp:
-        obs_score, off, orient = s_pm, off_pm, "+-"
-    else:
-        obs_score, off, orient = s_pp, off_pp, "++"
+    best = _select_best_orientation(candidates)
+    obs_score = best["score"]
+    off = best["offset"]
+    orient = best["orientation"]
 
     result = {
         "query": model1.name,
@@ -479,9 +523,16 @@ def strategy_motif(
                 for axis in range(rnd.ndim - 1):
                     rnd = np.take(rnd, perm, axis=axis)
             rnd_flat, rnd_rc_flat = _prep_matrix(rnd)
-            s1, _ = _align(f1, rnd_flat)
-            s2, _ = _align(f1, rnd_rc_flat)
-            return max(s1, s2)
+            surrogate_candidates = []
+            for query_matrix, target_matrix in (
+                (f1, rnd_flat),
+                (f1, rnd_rc_flat),
+                (f1_rc, rnd_flat),
+                (f1_rc, rnd_rc_flat),
+            ):
+                score, _ = _align(query_matrix, target_matrix)
+                surrogate_candidates.append(score)
+            return max(surrogate_candidates)
 
         nulls, n_m, n_s = run_montecarlo(lambda x: x, gen_surrogate, cfg.n_permutations, cfg.n_jobs, cfg.seed)
 
@@ -505,15 +556,20 @@ def strategy_profile(
         raise ValueError("Profile strategy with promoters requires motif models for both inputs.")
 
     freq1_plus = _resolve_profile_signal(model1, sequences, cfg, "+")
+    freq1_minus = _resolve_profile_signal(model1, sequences, cfg, "-")
     freq2_plus = _resolve_profile_signal(model2, sequences, cfg, "+")
     freq2_minus = _resolve_profile_signal(model2, sequences, cfg, "-")
     support1_plus = _resolve_profile_support(model1, freq1_plus, sequences, cfg, "+")
+    support1_minus = _resolve_profile_support(model1, freq1_minus, sequences, cfg, "-")
     support2_plus = _resolve_profile_support(model2, freq2_plus, sequences, cfg, "+")
     support2_minus = _resolve_profile_support(model2, freq2_minus, sequences, cfg, "-")
 
     def get_score(S1: RaggedData, S2: RaggedData, support1=None, support2=None) -> Tuple[float, int]:
         """Compute score and offset for two profiles."""
-        min_value = -1.0 if cfg.min_logfpr is None else float(cfg.min_logfpr)
+        if cfg.min_logfpr is None:
+            min_value = DEFAULT_CO_MIN_LOGTAIL if cfg.metric == "co" else -1.0
+        else:
+            min_value = float(cfg.min_logfpr)
         active_idx1 = active_ptr1 = active_idx2 = active_ptr2 = None
         if support1 is not None:
             active_idx1, active_ptr1 = support1
@@ -534,14 +590,34 @@ def strategy_profile(
         )
         return sc, off
 
-    sc_pp, off_pp = get_score(freq1_plus, freq2_plus, support1_plus, support2_plus)
-    sc_pm, off_pm = get_score(freq1_plus, freq2_minus, support1_plus, support2_minus)
+    candidates = []
+    for orient, query_profile, target_profile, query_support, target_support in (
+        ("++", freq1_plus, freq2_plus, support1_plus, support2_plus),
+        ("--", freq1_minus, freq2_minus, support1_minus, support2_minus),
+        ("+-", freq1_plus, freq2_minus, support1_plus, support2_minus),
+        ("-+", freq1_minus, freq2_plus, support1_minus, support2_plus),
+    ):
+        score, off = get_score(query_profile, target_profile, query_support, target_support)
+        candidates.append(
+            {
+                "orientation": orient,
+                "score": score,
+                "offset": off,
+                "query_profile": query_profile,
+                "query_support": query_support,
+                "target_profile": target_profile,
+            }
+        )
 
-    if sc_pm > sc_pp:
-        obs_score, off, orient, f_final = sc_pm, off_pm, "+-", freq2_minus
-    else:
-        obs_score, off, orient, f_final = sc_pp, off_pp, "++", freq2_plus
+    best = _select_best_orientation(candidates)
+    obs_score = best["score"]
+    off = best["offset"]
+    orient = best["orientation"]
+    f_final = best["target_profile"]
 
+    # fast_profile_score uses the opposite shift sign convention; flip it so the
+    # reported offset remains "target start relative to query start" for the
+    # oriented pair encoded in `orientation`.
     motif_offset = -off
 
     result = {
@@ -558,8 +634,9 @@ def strategy_profile(
         def surrogate_gen(rng):
             """Generate one surrogate score."""
             surr = _create_surrogate_ragged(f_final, rng, cfg)
-            sc, _ = get_score(freq1_plus, surr, support1_plus, None)
-            return sc
+            sc_plus, _ = get_score(freq1_plus, surr, support1_plus, None)
+            sc_minus, _ = get_score(freq1_minus, surr, support1_minus, None)
+            return max(sc_plus, sc_minus)
 
         nulls, n_m, n_s = run_montecarlo(lambda x: x, surrogate_gen, cfg.n_permutations, cfg.n_jobs, cfg.seed)
 
