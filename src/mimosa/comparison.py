@@ -29,8 +29,8 @@ from mimosa.cache import fingerprint_ragged, load_profile_cache, store_profile_c
 from mimosa.execute import run_motali
 from mimosa.functions import (
     apply_score_log_tail_table,
-    build_score_log_tail_table,
     build_profile_support,
+    build_score_log_tail_table,
     fast_profile_score,
     scores_to_empirical_log_tail,
 )
@@ -41,7 +41,6 @@ from mimosa.models import (
     get_pfm,
     get_score_bounds,
     scan_model,
-    scores_to_background_log_tail,
     write_model,
 )
 from mimosa.ragged import RaggedData
@@ -160,21 +159,8 @@ def _scores_to_profile_signal(
     strand: str,
 ) -> RaggedData:
     """Convert raw scores to the profile scale used for comparison."""
-    if cfg.promoters is None:
-        profile = scores_to_empirical_log_tail(scores)
-    else:
-        profile = scores_to_background_log_tail(model, scores, cfg.promoters)
-
-    return profile
-
-
-def _get_profile_runtime_cache(model: GenericModel) -> dict:
-    """Return the per-model in-memory cache for derived profile signals."""
-    cache = model.config.get("_profile_runtime_cache")
-    if cache is None:
-        cache = {}
-        model.config["_profile_runtime_cache"] = cache
-    return cache
+    del model, cfg, strand
+    return scores_to_empirical_log_tail(scores)
 
 
 def _resolve_profile_signal(
@@ -182,13 +168,13 @@ def _resolve_profile_signal(
     sequences: Optional[RaggedData],
     cfg: ComparatorConfig,
     strand: str,
+    runtime_cache: Optional[dict] = None,
 ) -> RaggedData:
     """Resolve a model to the profile signal used in profile comparisons."""
-    profile_kind = "background_log_tail" if cfg.promoters is not None else "empirical_best_log_tail"
+    profile_kind = "empirical_best_log_tail"
     sequence_fp = fingerprint_ragged(sequences) or "no-sequences"
-    promoter_fp = fingerprint_ragged(cfg.promoters)
-    runtime_key = (profile_kind, strand, sequence_fp, promoter_fp)
-    runtime_cache = _get_profile_runtime_cache(model)
+    runtime_key = (profile_kind, strand, sequence_fp)
+    runtime_cache = {} if runtime_cache is None else runtime_cache
 
     cached = runtime_cache.get(runtime_key)
     if cached is not None:
@@ -196,7 +182,7 @@ def _resolve_profile_signal(
 
     use_disk_cache = cfg.cache_mode == "on"
     if use_disk_cache:
-        cached = load_profile_cache(model, sequences, cfg.promoters, strand, profile_kind, cfg.cache_dir)
+        cached = load_profile_cache(model, sequences, None, strand, profile_kind, cfg.cache_dir)
         if cached is not None:
             runtime_cache[runtime_key] = cached
             logger.debug("Profile cache hit for model '%s' (%s strand).", model.name, strand)
@@ -209,7 +195,7 @@ def _resolve_profile_signal(
             raise ValueError("Profile strategy requires sequences when comparing motif models.")
         scores = scan_model(model, sequences, strand)
 
-    if cfg.promoters is None and model.type_key != "scores":
+    if model.type_key != "scores":
         if sequences is None:
             raise ValueError("Profile strategy requires sequences when comparing motif models.")
         empirical_table_key = ("empirical_best_table", sequence_fp)
@@ -224,7 +210,7 @@ def _resolve_profile_signal(
     runtime_cache[runtime_key] = profile
 
     if use_disk_cache:
-        store_profile_cache(model, sequences, cfg.promoters, strand, profile_kind, cfg.cache_dir, profile)
+        store_profile_cache(model, sequences, None, strand, profile_kind, cfg.cache_dir, profile)
         logger.debug("Stored profile cache for model '%s' (%s strand).", model.name, strand)
 
     return profile
@@ -236,8 +222,10 @@ def _resolve_profile_support(
     sequences: Optional[RaggedData],
     cfg: ComparatorConfig,
     strand: str,
+    runtime_cache: Optional[dict] = None,
 ):
     """Resolve cached sparse support for thresholded profile comparisons."""
+    del model, sequences
     if cfg.min_logfpr is None:
         return None
 
@@ -245,11 +233,8 @@ def _resolve_profile_support(
     if min_value <= 0.0:
         return None
 
-    profile_kind = "background_log_tail" if cfg.promoters is not None else "empirical_best_log_tail"
-    sequence_fp = fingerprint_ragged(sequences) or "no-sequences"
-    promoter_fp = fingerprint_ragged(cfg.promoters)
-    runtime_key = ("support", np.float32(min_value), profile_kind, strand, sequence_fp, promoter_fp)
-    runtime_cache = _get_profile_runtime_cache(model)
+    runtime_key = ("support", np.float32(min_value), strand)
+    runtime_cache = {} if runtime_cache is None else runtime_cache
 
     cached = runtime_cache.get(runtime_key)
     if cached is not None:
@@ -552,17 +537,23 @@ def strategy_profile(
     cfg: ComparatorConfig,
 ) -> dict:
     """RaggedData-based comparison strategy (CO/Dice similarity)."""
-    if cfg.promoters is not None and ("scores" in {model1.type_key, model2.type_key}):
-        raise ValueError("Profile strategy with promoters requires motif models for both inputs.")
+    if cfg.promoters is not None:
+        raise ValueError(
+            "Profile strategy uses empirical normalization on the comparison sequences "
+            "and does not accept promoters."
+        )
 
-    freq1_plus = _resolve_profile_signal(model1, sequences, cfg, "+")
-    freq1_minus = _resolve_profile_signal(model1, sequences, cfg, "-")
-    freq2_plus = _resolve_profile_signal(model2, sequences, cfg, "+")
-    freq2_minus = _resolve_profile_signal(model2, sequences, cfg, "-")
-    support1_plus = _resolve_profile_support(model1, freq1_plus, sequences, cfg, "+")
-    support1_minus = _resolve_profile_support(model1, freq1_minus, sequences, cfg, "-")
-    support2_plus = _resolve_profile_support(model2, freq2_plus, sequences, cfg, "+")
-    support2_minus = _resolve_profile_support(model2, freq2_minus, sequences, cfg, "-")
+    runtime_cache_1: dict = {}
+    runtime_cache_2: dict = {}
+
+    freq1_plus = _resolve_profile_signal(model1, sequences, cfg, "+", runtime_cache_1)
+    freq1_minus = _resolve_profile_signal(model1, sequences, cfg, "-", runtime_cache_1)
+    freq2_plus = _resolve_profile_signal(model2, sequences, cfg, "+", runtime_cache_2)
+    freq2_minus = _resolve_profile_signal(model2, sequences, cfg, "-", runtime_cache_2)
+    support1_plus = _resolve_profile_support(model1, freq1_plus, sequences, cfg, "+", runtime_cache_1)
+    support1_minus = _resolve_profile_support(model1, freq1_minus, sequences, cfg, "-", runtime_cache_1)
+    support2_plus = _resolve_profile_support(model2, freq2_plus, sequences, cfg, "+", runtime_cache_2)
+    support2_minus = _resolve_profile_support(model2, freq2_minus, sequences, cfg, "-", runtime_cache_2)
 
     def get_score(S1: RaggedData, S2: RaggedData, support1=None, support2=None) -> Tuple[float, int]:
         """Compute score and offset for two profiles."""

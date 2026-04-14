@@ -136,66 +136,32 @@ def _get_float32_representation(model: GenericModel) -> np.ndarray:
     return converted
 
 
-def _get_threshold_tables(model: GenericModel) -> Dict[str, np.ndarray]:
-    """Return cached threshold tables keyed by strand mode."""
-    tables = model.config.get("_threshold_tables")
-    if tables is None:
-        tables = {}
-        legacy_table = model.config.get("_threshold_table")
-        if legacy_table is not None:
-            tables["best"] = legacy_table
-        model.config["_threshold_tables"] = tables
-    return tables
-
-
-def _resolve_threshold_table(model: GenericModel, strand: StrandMode = "best") -> Optional[np.ndarray]:
-    """Return a cached threshold table for the requested strand mode."""
-    tables = _get_threshold_tables(model)
-    table = tables.get(strand)
-    if table is not None:
-        return table
-
-    if strand == "best":
-        legacy_table = model.config.get("_threshold_table")
-        if legacy_table is not None:
-            tables["best"] = legacy_table
-            return legacy_table
-
-    return None
-
-
-def calculate_threshold_table(model: GenericModel, promoters: RaggedData, strand: StrandMode = "best") -> np.ndarray:
-    """Calculate a score-to-log-tail lookup table on the provided background."""
-    ragged_scores = scan_model(model, promoters, strand=strand)
-    table = build_score_log_tail_table(ragged_scores.data)
-    tables = _get_threshold_tables(model)
-    tables[strand] = table
-    if strand == "best":
-        model.config["_threshold_table"] = table
-
-    return table.astype(np.float64)
+def calculate_threshold_table(model: GenericModel, sequences: RaggedData, strand: StrandMode = "best") -> np.ndarray:
+    """Calculate a score-to-log-tail lookup table on explicitly provided sequences."""
+    ragged_scores = scan_model(model, sequences, strand=strand)
+    return build_score_log_tail_table(ragged_scores.data).astype(np.float64, copy=False)
 
 
 def scores_to_background_log_tail(
     model: GenericModel,
     ragged_scores: RaggedData,
-    promoters: RaggedData,
+    background_sequences: RaggedData,
     strand: StrandMode = "best",
 ) -> RaggedData:
     """Convert scores to background-calibrated log-tail values using both strands."""
     del strand
-    threshold_table = calculate_threshold_table(model, promoters, strand="best")
+    threshold_table = calculate_threshold_table(model, background_sequences, strand="best")
     return apply_score_log_tail_table(ragged_scores, threshold_table)
 
 
 def scores_to_log_fpr(
     model: GenericModel,
     ragged_scores: RaggedData,
-    promoters: RaggedData,
+    background_sequences: RaggedData,
     strand: StrandMode = "best",
 ) -> RaggedData:
     """Backward-compatible alias for background-calibrated log-tail conversion."""
-    return scores_to_background_log_tail(model, ragged_scores, promoters, strand=strand)
+    return scores_to_background_log_tail(model, ragged_scores, background_sequences, strand=strand)
 
 
 def get_frequencies(model: GenericModel, sequences: RaggedData, strand: Optional[StrandMode] = None) -> RaggedData:
@@ -322,12 +288,8 @@ def _collect_hits(
     return _collect_threshold_hits(sequences, s_fwd_ragged, s_rev_ragged, float(score_threshold))
 
 
-def _scores_to_log_tail_array(model: GenericModel, scores: np.ndarray, strand: StrandMode = "best") -> np.ndarray:
-    """Convert a score array to background log-tail values."""
-    threshold_table = _resolve_threshold_table(model, strand)
-    if threshold_table is None:
-        return np.full(scores.shape, np.nan, dtype=np.float64)
-
+def _scores_to_log_tail_array(scores: np.ndarray, threshold_table: np.ndarray) -> np.ndarray:
+    """Convert a score array to log-tail values using an explicit lookup table."""
     if scores.size == 0:
         return np.empty(0, dtype=np.float64)
 
@@ -336,6 +298,20 @@ def _scores_to_log_tail_array(model: GenericModel, scores: np.ndarray, strand: S
     idx = np.searchsorted(-scores_col, -scores.astype(np.float64, copy=False), side="left")
     idx = np.clip(idx, 0, len(log_tail_col) - 1)
     return log_tail_col[idx]
+
+
+def _resolve_hit_threshold_table(
+    model: GenericModel,
+    sequences: RaggedData,
+    background_sequences: Optional[RaggedData],
+    threshold_table: Optional[np.ndarray],
+) -> np.ndarray:
+    """Resolve the explicit log-tail table used for hit extraction and annotation."""
+    if threshold_table is not None:
+        return np.asarray(threshold_table, dtype=np.float64)
+
+    calibration_sequences = background_sequences if background_sequences is not None else sequences
+    return calculate_threshold_table(model, calibration_sequences, strand="best")
 
 
 def _extract_site_matrix(
@@ -412,18 +388,19 @@ def get_sites(
     sequences: RaggedData,
     mode: str = "best",
     fpr_threshold: Optional[float] = None,
+    background_sequences: Optional[RaggedData] = None,
+    threshold_table: Optional[np.ndarray] = None,
 ) -> pd.DataFrame:
     """Find motif binding sites in sequences."""
-    threshold_table = _resolve_threshold_table(model, "best")
     if mode not in ["best", "threshold"]:
         raise ValueError(f"mode must be 'best' or 'threshold', got {mode}")
     if mode == "threshold" and fpr_threshold is None:
         raise ValueError("fpr_threshold is required for mode='threshold'")
-    if mode == "threshold" and threshold_table is None:
-        raise ValueError("Model has no threshold table")
+
+    resolved_threshold_table = _resolve_hit_threshold_table(model, sequences, background_sequences, threshold_table)
 
     score_threshold = (
-        _tail_probability_to_score(model, fpr_threshold, strand="best")
+        _tail_probability_to_score(float(fpr_threshold), resolved_threshold_table)
         if mode == "threshold" and fpr_threshold is not None
         else None
     )
@@ -461,7 +438,7 @@ def get_sites(
                 "end": hit_arrays["start"] + model.length,
                 "strand": np.where(hit_arrays["strand_idx"] == 0, "+", "-"),
                 "score": hit_arrays["score"],
-                "log_tail": _scores_to_log_tail_array(model, hit_arrays["score"], strand="best"),
+                "log_tail": _scores_to_log_tail_array(hit_arrays["score"], resolved_threshold_table),
                 "site": _site_matrix_to_strings(site_matrix),
             }
         )
@@ -476,42 +453,30 @@ def get_pfm(
     sequences: RaggedData,
     mode: str = "best",
     fpr_threshold: Optional[float] = None,
+    background_sequences: Optional[RaggedData] = None,
+    threshold_table: Optional[np.ndarray] = None,
     top_fraction: Optional[float] = None,
     pseudocount: float = 0.25,
     force_recompute: bool = False,
 ) -> np.ndarray:
     """Construct Position Frequency Matrix (PFM) from binding sites."""
-    cache_key = (
-        id(sequences.data),
-        id(sequences.offsets),
-        sequences.data.shape,
-        sequences.offsets.shape,
-        mode,
-        None if fpr_threshold is None else float(fpr_threshold),
-        None if top_fraction is None else float(top_fraction),
-        float(pseudocount),
-    )
-    cached_pfm = model.config.get("_derived_pfm")
-    cached_key = model.config.get("_derived_pfm_key")
-    if cached_pfm is not None and cached_key == cache_key and not force_recompute:
-        logger = logging.getLogger(__name__)
-        logger.info(f"Returning cached derived PFM for model: {model.name}")
-        return cached_pfm
+    del force_recompute
 
     logger = logging.getLogger(__name__)
     logger.info(f"Computing PFM for model: {model.name}")
 
-    threshold_table = _resolve_threshold_table(model, "best")
     if mode not in ["best", "threshold"]:
         raise ValueError(f"mode must be 'best' or 'threshold', got {mode}")
     if mode == "threshold" and fpr_threshold is None:
         raise ValueError("fpr_threshold is required for mode='threshold'")
-    if mode == "threshold" and threshold_table is None:
-        raise ValueError("Model has no threshold table")
+
+    resolved_threshold_table = None
+    if mode == "threshold":
+        resolved_threshold_table = _resolve_hit_threshold_table(model, sequences, background_sequences, threshold_table)
 
     score_threshold = (
-        _tail_probability_to_score(model, fpr_threshold, strand="best")
-        if mode == "threshold" and fpr_threshold is not None
+        _tail_probability_to_score(float(fpr_threshold), resolved_threshold_table)
+        if mode == "threshold" and fpr_threshold is not None and resolved_threshold_table is not None
         else None
     )
 
@@ -534,27 +499,16 @@ def get_pfm(
 
     pfm = pcm_to_pfm(pcm, pseudocount=pseudocount).astype(np.float32, copy=False)
 
-    model.config["_derived_pfm"] = pfm
-    model.config["_derived_pfm_key"] = cache_key
-
     return pfm
 
 
-def _score_to_log_tail(model: GenericModel, score: float, strand: StrandMode = "best") -> float:
-    """Convert score to log-tail value using a cached lookup table."""
-    threshold_table = _resolve_threshold_table(model, strand)
-    if threshold_table is None:
-        return np.nan
-
+def _score_to_log_tail(score: float, threshold_table: np.ndarray) -> float:
+    """Convert score to a log-tail value using an explicit lookup table."""
     return lookup_log_tail(threshold_table, score)
 
 
-def _tail_probability_to_score(model: GenericModel, tail_probability: float, strand: StrandMode = "best") -> float:
+def _tail_probability_to_score(tail_probability: float, threshold_table: np.ndarray) -> float:
     """Convert a tail-probability threshold to the corresponding score cutoff."""
-    threshold_table = _resolve_threshold_table(model, strand)
-    if threshold_table is None:
-        raise ValueError("Model has no threshold table")
-
     return lookup_score_for_tail_probability(threshold_table, tail_probability)
 
 

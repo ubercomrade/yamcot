@@ -185,6 +185,10 @@ The `mimosa` tool provides three operation modes.
 - precomputed FASTA-like score files via `--model*-type scores`
 - motif models (`pwm`, `bamm`, `sitega`, `dimont`, `slim`) that are first scanned on sequences to obtain profiles
 
+Profile normalization is empirical on the current score sample, using
+`-log10(count(score >= threshold) / total)`. External promoter/background
+sequences are not used in `profile` mode.
+
 **Example data**: [`examples/scores_1.fasta`](examples/scores_1.fasta), [`examples/pif4.meme`](examples/pif4.meme)
 
 ```bash
@@ -192,7 +196,7 @@ The `mimosa` tool provides three operation modes.
 mimosa profile scores_1.fasta scores_2.fasta \
   --model1-type scores \
   --model2-type scores \
-  --metric cj \
+  --metric co \
   --permutations 1000
 
 # Compare two motifs through sequence-derived profiles
@@ -215,7 +219,7 @@ mimosa profile foxa2.meme gata4.meme \
 | `--fasta` | Path | FASTA file used to scan motif inputs. If omitted when scanning is needed, random sequences are generated. |
 | `--num-sequences` | Integer | Number of generated sequences for scanning mode (default: `1000`). |
 | `--seq-length` | Integer | Length of generated sequences for scanning mode (default: `200`). |
-| `--metric` | `cj`, `co`, `dice`, `l1sim` | Similarity metric for profile comparison (default: `cj`). |
+| `--metric` | `co`, `dice` | Similarity metric for profile comparison (default: `co`). |
 | `--permutations` | Integer | Number of permutations for p-value calculation (default: `0`). |
 | `--distortion` | Float | Distortion level for surrogate profile generation (default: `0.4`). |
 | `--search-range` | Integer | Maximum offset range explored during alignment (default: `10`). |
@@ -469,7 +473,7 @@ model2 = read_model("examples/gata2.meme", "pwm")
 sequences = read_fasta("examples/foreground.fa")
 
 config = create_comparator_config(
-    metric="cj",
+    metric="co",
     n_permutations=100,
     seed=42,
     search_range=10,

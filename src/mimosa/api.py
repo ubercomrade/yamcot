@@ -147,8 +147,11 @@ def run_comparison(config: ComparisonConfig) -> dict:
     if config.promoters is not None:
         promoters = _resolve_sequences(config.promoters, config)
 
-    if strategy == "profile" and promoters is not None and ("scores" in {model1.type_key, model2.type_key}):
-        raise ValueError("Profile strategy with promoters requires motif inputs for both models.")
+    if strategy == "profile" and promoters is not None:
+        raise ValueError(
+            "Profile strategy uses empirical normalization on the comparison sequences "
+            "and does not accept promoters."
+        )
 
     needs_sequences = _needs_sequences(strategy, config.comparator, model1, model2)
     if strategy == "motali" and config.sequences is None and promoters is not None:

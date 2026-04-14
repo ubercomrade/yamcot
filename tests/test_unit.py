@@ -761,6 +761,34 @@ def test_scores_to_log_fpr_uses_threshold_table_scale():
     np.testing.assert_array_equal(transformed.offsets, scores.offsets)
 
 
+def test_calculate_threshold_table_does_not_mutate_model_config():
+    """Threshold-table calculation should stay pure and avoid storing runtime lookup tables on the model."""
+    representation = np.array(
+        [
+            [1.0, 0.2],
+            [0.2, 1.0],
+            [0.1, 0.1],
+            [0.1, 0.1],
+            [0.1, 0.1],
+        ],
+        dtype=np.float32,
+    )
+    model = GenericModel(type_key="pwm", name="test_pwm", representation=representation, length=2, config={"kmer": 1})
+    sequences = ragged_from_list(
+        [
+            np.array([0, 1, 0, 1, 0, 1], dtype=np.int8),
+            np.array([1, 0, 1, 0, 1, 0], dtype=np.int8),
+        ],
+        dtype=np.int8,
+    )
+
+    table = calculate_threshold_table(model, sequences, strand="best")
+
+    assert table.shape[1] == 2
+    assert "_threshold_table" not in model.config
+    assert "_threshold_tables" not in model.config
+
+
 def test_get_pfm_reconstructs_pwm_from_sites_with_single_pseudocount():
     """PFM reconstruction should ignore source PFM caches and add the pseudocount only once."""
     representation = np.array(
@@ -796,6 +824,86 @@ def test_get_pfm_reconstructs_pwm_from_sites_with_single_pseudocount():
 
     np.testing.assert_allclose(pfm, expected)
     assert not np.allclose(pfm, source_pfm)
+
+
+def test_get_sites_threshold_uses_current_sequences_by_default():
+    """Thresholded site extraction should use the current sequences unless an external background is passed."""
+    representation = np.array(
+        [
+            [2.0, 0.0],
+            [0.0, 2.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    model = GenericModel(
+        type_key="pwm",
+        name="threshold_pwm",
+        representation=representation,
+        length=2,
+        config={"kmer": 1},
+    )
+    sequences = ragged_from_list(
+        [_encode_sequence("AC"), _encode_sequence("AC"), _encode_sequence("AT"), _encode_sequence("TG")],
+        dtype=np.int8,
+    )
+    background = ragged_from_list(
+        [_encode_sequence("AC"), _encode_sequence("AT"), _encode_sequence("TG"), _encode_sequence("TG")],
+        dtype=np.int8,
+    )
+
+    default_sites = get_sites(model, sequences, mode="threshold", fpr_threshold=0.5)
+    background_sites = get_sites(model, sequences, mode="threshold", fpr_threshold=0.5, background_sequences=background)
+
+    assert default_sites["site"].tolist() == ["AC", "AC"]
+    assert background_sites["site"].tolist() == ["AC", "AC", "AT", "AT"]
+
+
+def test_get_pfm_threshold_accepts_external_background_sequences():
+    """PFM reconstruction should switch to external calibration only when requested."""
+    representation = np.array(
+        [
+            [2.0, 0.0],
+            [0.0, 2.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    model = GenericModel(
+        type_key="pwm",
+        name="threshold_pwm",
+        representation=representation,
+        length=2,
+        config={"kmer": 1},
+    )
+    sequences = ragged_from_list(
+        [_encode_sequence("AC"), _encode_sequence("AC"), _encode_sequence("AT"), _encode_sequence("TG")],
+        dtype=np.int8,
+    )
+    background = ragged_from_list(
+        [_encode_sequence("AC"), _encode_sequence("AT"), _encode_sequence("TG"), _encode_sequence("TG")],
+        dtype=np.int8,
+    )
+
+    default_pfm = get_pfm(model, sequences, mode="threshold", fpr_threshold=0.5, pseudocount=0.25)
+    background_pfm = get_pfm(
+        model,
+        sequences,
+        mode="threshold",
+        fpr_threshold=0.5,
+        background_sequences=background,
+        pseudocount=0.25,
+    )
+
+    expected_default_pcm = np.array([[2.0, 0.0], [0.0, 2.0], [0.0, 0.0], [0.0, 0.0]], dtype=np.float32)
+    expected_background_pcm = np.array([[4.0, 0.0], [0.0, 2.0], [0.0, 0.0], [0.0, 2.0]], dtype=np.float32)
+
+    np.testing.assert_allclose(default_pfm, pcm_to_pfm(expected_default_pcm, pseudocount=0.25).astype(np.float32))
+    np.testing.assert_allclose(background_pfm, pcm_to_pfm(expected_background_pcm, pseudocount=0.25).astype(np.float32))
 
 
 def test_get_sites_best_skips_sequences_shorter_than_motif():
@@ -1325,8 +1433,8 @@ def test_run_comparison_rejects_removed_profile_metrics(metric):
         run_comparison(config)
 
 
-def test_strategy_profile_rejects_promoters_with_scores_inputs():
-    """Calibrated profile mode should reject precomputed numerical profiles."""
+def test_strategy_profile_rejects_promoters_configuration():
+    """Profile strategy should reject external promoter calibration and stay empirical on comparison sequences."""
     scores_1 = RaggedData(np.array([0.1, 0.2, 0.3], dtype=np.float32), np.array([0, 3], dtype=np.int64))
     scores_2 = RaggedData(np.array([0.2, 0.3, 0.4], dtype=np.float32), np.array([0, 3], dtype=np.int64))
     promoters = ragged_from_list([np.array([0, 1, 2, 3, 0, 1], dtype=np.int8)], dtype=np.int8)
@@ -1334,7 +1442,7 @@ def test_strategy_profile_rejects_promoters_with_scores_inputs():
     model2 = GenericModel(type_key="scores", name="s2", representation=None, length=0, config={"scores_data": scores_2})
     cfg = create_comparator_config(metric="co", promoters=promoters)
 
-    with pytest.raises(ValueError, match="requires motif"):
+    with pytest.raises(ValueError, match="does not accept promoters"):
         strategy_profile(model1, model2, None, cfg)
 
 

@@ -36,7 +36,7 @@ Examples:
   # Compare motifs through sequence-derived profiles
   mimosa profile model1.meme model2.ihbcp \
     --model1-type pwm --model2-type bamm \
-    --fasta sequences.fa --promoters promoters.fa --metric co --min-logfpr 2
+    --fasta sequences.fa --metric co --min-logfpr 2
 
   # Direct motif comparison (former tomtom-like mode)
   mimosa motif model1.meme model2.pfm \
@@ -101,11 +101,6 @@ def _add_profile_parser(subparsers: argparse._SubParsersAction) -> None:
         default=200,
         help="Length of random sequences generated for motif scanning. (default: %(default)s)",
     )
-    io_group.add_argument(
-        "--promoters",
-        help="Path to FASTA promoter sequences used for threshold-table calibration of profile values.",
-    )
-
     profile_group = parser.add_argument_group("Profile Comparison Options")
     profile_group.add_argument(
         "--metric",

@@ -411,8 +411,8 @@ def test_profile_comparison_rejects_removed_l1sim_metric(examples_dir, temp_dir)
     assert "invalid choice" in result.stderr
 
 
-def test_profile_comparison_with_promoter_calibration(examples_dir, temp_dir):
-    """Profile mode should support promoter-calibrated logFPR profiles with hard thresholding."""
+def test_profile_comparison_with_empirical_logfpr_thresholding(examples_dir, temp_dir):
+    """Profile mode should apply hard thresholding on empirically normalized profiles."""
     cmd = [
         "mimosa",
         "profile",
@@ -424,8 +424,6 @@ def test_profile_comparison_with_promoter_calibration(examples_dir, temp_dir):
         "pwm",
         "--fasta",
         str(examples_dir / "foreground.fa"),
-        "--promoters",
-        str(examples_dir / "background.fa"),
         "--metric",
         "co",
         "--min-logfpr",
@@ -440,6 +438,26 @@ def test_profile_comparison_with_promoter_calibration(examples_dir, temp_dir):
     output = json.loads(result.stdout)
     assert output["metric"] == "co"
     assert "score" in output
+
+
+def test_profile_comparison_rejects_promoter_argument(examples_dir, temp_dir):
+    """Profile CLI should reject the removed promoter-calibration argument."""
+    cmd = [
+        "mimosa",
+        "profile",
+        str(examples_dir / "gata2.meme"),
+        str(examples_dir / "gata4.meme"),
+        "--model1-type",
+        "pwm",
+        "--model2-type",
+        "pwm",
+        "--promoters",
+        str(examples_dir / "background.fa"),
+    ]
+
+    result = run_cli(cmd)
+    assert result.returncode != 0
+    assert "unrecognized arguments" in result.stderr
 
 
 def test_profile_comparison_invalid_kernel_range(examples_dir, temp_dir):
