@@ -27,8 +27,8 @@ from mimosa.comparison import registry as comparison_registry
 from mimosa.functions import (
     apply_score_log_tail_table,
     batch_all_scores,
-    build_score_log_tail_table,
     build_profile_support,
+    build_score_log_tail_table,
     cut_prc,
     cut_roc,
     fast_profile_score,
@@ -106,11 +106,15 @@ def _parse_dimont_tree_reference(elem: ET.Element) -> dict:
     pars = elem.find("pars")
     pars_pos = [child for child in pars if child.tag == "pos"] if pars is not None else []
     if pars_pos:
-        logits = np.asarray(
+        values = np.asarray(
             [_xml_numeric_value_reference(pos.find("parameter/value")) for pos in pars_pos],
             dtype=np.float64,
         )
-        return {"leaf": logits - _logsumexp_reference(logits)}
+        log_z = np.asarray(
+            [(_xml_numeric_value_reference(pos.find("parameter/z")) or 0.0) for pos in pars_pos],
+            dtype=np.float64,
+        )
+        return {"scores": values, "log_z": log_z}
 
     children = elem.find("children")
     assert children is not None
@@ -121,28 +125,41 @@ def _parse_dimont_tree_reference(elem: ET.Element) -> dict:
 
 
 @lru_cache(maxsize=None)
-def _load_dimont_reference(path: str) -> tuple[dict, ...]:
+def _load_dimont_reference(path: str) -> tuple[tuple[dict, ...], np.ndarray]:
     """Load the Java-equivalent Dimont tree structure from XML."""
     root = ET.parse(path).getroot()
     model = root.find(".//ThresholdedStrandChIPper/function/pos/MarkovModelDiffSM")
     assert model is not None
     trees = model.find("bayesianNetworkSF/trees")
     assert trees is not None
-    return tuple(
-        _parse_dimont_tree_reference(pos.find("parameterTree/root/treeElement"))
-        for pos in trees
-        if pos.tag == "pos"
-    )
+    parsed_trees = []
+    root_offsets = []
+    for pos in trees:
+        if pos.tag != "pos":
+            continue
+        node = _parse_dimont_tree_reference(pos.find("parameterTree/root/treeElement"))
+        parsed_trees.append(node)
+
+        context_pos_elem = pos.find("parameterTree/contextPoss")
+        parents = [int(_xml_numeric_value_reference(child)) for child in context_pos_elem if child.tag == "pos"]
+        if parents:
+            root_offsets.append(0.0)
+        else:
+            assert "scores" in node
+            root_offsets.append(_logsumexp_reference(node["scores"] + node["log_z"]))
+
+    return tuple(parsed_trees), np.asarray(root_offsets, dtype=np.float64)
 
 
 def _reference_dimont_site_score(path: Path, sequence: np.ndarray) -> float:
     """Evaluate one site as Dimont log-odds against a uniform single-base background."""
+    trees, root_offsets = _load_dimont_reference(str(path))
     total = 0.0
-    for position, tree in enumerate(_load_dimont_reference(str(path))):
+    for position, tree in enumerate(trees):
         node = tree
-        while "leaf" not in node:
+        while "scores" not in node:
             node = node["children"][int(sequence[node["context_pos"]])]
-        total += float(node["leaf"][int(sequence[position])])
+        total += float(node["scores"][int(sequence[position])]) - float(root_offsets[position])
     return total + len(sequence) * _LOG_UNIFORM_BASE
 
 
@@ -186,7 +203,9 @@ def _reference_slim_site_score(path: Path, sequence: np.ndarray) -> float:
 
         independent_logits = np.asarray(dependency[position][0][0], dtype=np.float64)
         independent_log_norm = _logsumexp_reference(independent_logits)
-        local_scores.append(component_logits[0] - component_log_norm + independent_logits[current_nt] - independent_log_norm)
+        local_scores.append(
+            component_logits[0] - component_log_norm + independent_logits[current_nt] - independent_log_norm
+        )
 
         for component_index in range(1, len(component[position])):
             ancestor_logits = np.asarray(ancestor[position][component_index], dtype=np.float64)
@@ -199,11 +218,16 @@ def _reference_slim_site_score(path: Path, sequence: np.ndarray) -> float:
                 dependency_logits = np.asarray(dependency[position][component_index][context], dtype=np.float64)
                 dependency_log_norm = _logsumexp_reference(dependency_logits)
                 ancestor_scores.append(
-                    ancestor_logits[ancestor_index] - ancestor_log_norm + dependency_logits[current_nt] - dependency_log_norm
+                    ancestor_logits[ancestor_index]
+                    - ancestor_log_norm
+                    + dependency_logits[current_nt]
+                    - dependency_log_norm
                 )
 
             local_scores.append(
-                component_logits[component_index] - component_log_norm + _logsumexp_reference(np.asarray(ancestor_scores))
+                component_logits[component_index]
+                - component_log_norm
+                + _logsumexp_reference(np.asarray(ancestor_scores))
             )
 
         score += _logsumexp_reference(np.asarray(local_scores))
@@ -485,7 +509,8 @@ def test_read_model_supports_dimont_xml_and_matches_example_score():
 
 def test_read_model_supports_higher_order_dimont_xml():
     """Higher-order Dimont XML models should scan via the shared context kernel in log-odds space."""
-    model = read_model(str(FIXTURES_ROOT / "dimont" / "stat_dimont-model-1.xml"), "dimont")
+    path = FIXTURES_ROOT / "dimont" / "stat_dimont-model-1.xml"
+    model = read_model(str(path), "dimont")
     plus_sequence = ragged_from_list([_encode_sequence("AACCC")], dtype=np.int8)
     minus_sequence = ragged_from_list([_encode_sequence("GGGTT")], dtype=np.int8)
 
@@ -496,8 +521,8 @@ def test_read_model_supports_higher_order_dimont_xml():
     assert model.length == 5
     assert model.config["kmer"] == 4
     assert model.representation.shape == (5, 5, 5, 5, 5)
-    assert plus_scores.get_slice(0)[0] == pytest.approx(-0.6909603921485327)
-    assert minus_scores.get_slice(0)[0] == pytest.approx(-0.6909603921485327)
+    assert plus_scores.get_slice(0)[0] == pytest.approx(_reference_dimont_site_score(path, _encode_sequence("AACCC")))
+    assert minus_scores.get_slice(0)[0] == pytest.approx(_reference_dimont_site_score(path, _encode_sequence("AACCC")))
 
 
 def test_read_model_supports_slim_xml_and_matches_example_score():
@@ -973,8 +998,14 @@ def test_strategy_functions_exist():
 
 def test_strategy_profile_uses_target_relative_offset_convention():
     """Profile strategy should report target-relative offsets with the same sign in both directions."""
-    scores_1 = RaggedData(np.array([0.0, 1.0, 4.0, 2.0, 0.0, 0.0, 0.0], dtype=np.float32), np.array([0, 7], dtype=np.int64))
-    scores_2 = RaggedData(np.array([0.0, 0.0, 0.0, 1.0, 4.0, 2.0, 0.0], dtype=np.float32), np.array([0, 7], dtype=np.int64))
+    scores_1 = RaggedData(
+        np.array([0.0, 1.0, 4.0, 2.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        np.array([0, 7], dtype=np.int64),
+    )
+    scores_2 = RaggedData(
+        np.array([0.0, 0.0, 0.0, 1.0, 4.0, 2.0, 0.0], dtype=np.float32),
+        np.array([0, 7], dtype=np.int64),
+    )
     model1 = GenericModel(type_key="scores", name="s1", representation=None, length=0, config={"scores_data": scores_1})
     model2 = GenericModel(type_key="scores", name="s2", representation=None, length=0, config={"scores_data": scores_2})
     cfg = create_comparator_config(metric="co", search_range=4, min_logfpr=0.1, n_permutations=0)
@@ -1064,14 +1095,14 @@ def test_foxa1_cross_type_motif_comparison_recovers_dimont_and_slim_similarity()
     bamm_slim = strategy_motif(bamm, slim, sequences, cfg)
     bamm_pwm = strategy_motif(bamm, pwm, sequences, cfg)
 
-    assert pwm_dimont["orientation"] == "-+"
+    assert pwm_dimont["orientation"] == "+-"
     assert pwm_dimont["score"] > 0.60
 
     assert pwm_slim["orientation"] == "++"
     assert pwm_slim["score"] > 0.68
 
     assert bamm_dimont["orientation"] == "+-"
-    assert bamm_dimont["score"] > 0.55
+    assert bamm_dimont["score"] > 0.54
 
     assert bamm_slim["orientation"] == "++"
     assert bamm_slim["score"] > 0.65

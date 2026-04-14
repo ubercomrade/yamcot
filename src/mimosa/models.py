@@ -217,7 +217,7 @@ def get_sites(
     """Find motif binding sites in sequences."""
     threshold_table = _resolve_threshold_table(model, "best")
     if mode not in ["best", "threshold"]:
-        raise ValueError(f"mode must be 'best' or 'threshold', got {mode!r}")
+        raise ValueError(f"mode must be 'best' or 'threshold', got {mode}")
     if mode == "threshold" and fpr_threshold is None:
         raise ValueError("fpr_threshold is required for mode='threshold'")
     if mode == "threshold" and threshold_table is None:

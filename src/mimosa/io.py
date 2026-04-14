@@ -332,9 +332,13 @@ def _xml_array(elem: ET.Element):
 
 def _log_normalize(values: np.ndarray) -> np.ndarray:
     """Convert unconstrained log-parameters to normalized log-probabilities."""
+    return values - _logsumexp(values)
+
+
+def _logsumexp(values: np.ndarray) -> float:
+    """Compute a stable float64 log-sum-exp."""
     shifted = values - np.max(values)
-    logsumexp = np.max(values) + np.log(np.sum(np.exp(shifted)))
-    return values - logsumexp
+    return float(np.max(values) + np.log(np.sum(np.exp(shifted))))
 
 
 def _fill_n_axis_with_min(arr: np.ndarray, axis: int) -> None:
@@ -369,6 +373,27 @@ def _build_position_tensor(
     return position_tensor.astype(np.float32, copy=False)
 
 
+def _context_value(full_context: Tuple[int, ...], span: int, position: int, absolute_position: int) -> int:
+    """Map one absolute parent position to the corresponding dense context axis."""
+    if absolute_position < 0:
+        raise ValueError(
+            f"Model references position {absolute_position} before the motif start at position {position}"
+        )
+
+    axis = absolute_position - (position - span)
+    if axis < 0 or axis >= span:
+        raise ValueError(
+            f"Context position {absolute_position} at motif position {position} does not fit span {span}"
+        )
+
+    return full_context[axis]
+
+
+def _iter_full_contexts(span: int) -> Iterable[Tuple[int, ...]]:
+    """Iterate over all concrete A/C/G/T contexts of the requested span."""
+    return itertools.product(range(4), repeat=span)
+
+
 def read_slim(path: str) -> tuple[np.ndarray, int, int]:
     """Read a Jstacs Slim XML model into a dense log-odds tensor."""
     root = ET.parse(path).getroot()
@@ -377,53 +402,89 @@ def read_slim(path: str) -> tuple[np.ndarray, int, int]:
         raise ValueError(f"Could not find SLIM model in {path}")
 
     length = int(_xml_numeric_value(slim.find("length")))
-    distance = int(_xml_numeric_value(slim.find("distance")))
+    _distance = int(_xml_numeric_value(slim.find("distance")))
     component_params = _xml_array(slim.find("componentMixtureParameters"))
     ancestor_params = _xml_array(slim.find("ancestorMixtureParameters"))
     dependency_params = _xml_array(slim.find("dependencyParameters"))
     uniform_log_odds_offset = np.log(4.0)
+    alphabet_size = len(dependency_params[0][0][0])
 
-    tensor = np.empty((5,) * (distance + 1) + (length,), dtype=np.float32)
+    component_log_probs = [
+        _log_normalize(np.asarray(component_params[position], dtype=np.float64)) for position in range(length)
+    ]
+    ancestor_log_probs = [
+        [_log_normalize(np.asarray(component, dtype=np.float64)) for component in ancestor_params[position]]
+        for position in range(length)
+    ]
+    dependency_log_probs = [
+        [
+            np.vstack(
+                [_log_normalize(np.asarray(row, dtype=np.float64)) for row in dependency_params[position][component]]
+            )
+            for component in range(len(dependency_params[position]))
+        ]
+        for position in range(length)
+    ]
+
+    span = 0
+    for position in range(length):
+        for component_index in range(1, len(component_params[position])):
+            ancestor_count = len(ancestor_params[position][component_index])
+            if ancestor_count <= 0:
+                raise ValueError(f"Malformed SLIM model in {path}: empty ancestor mixture at position {position}")
+            span = max(span, component_index + ancestor_count - 1)
+
+    tensor = np.empty((5,) * (span + 1) + (length,), dtype=np.float32)
+    context_axes = list(range(span))
+    full_contexts = list(_iter_full_contexts(span))
 
     for position in range(length):
-        component_logits = np.asarray(component_params[position], dtype=np.float64)
-        component_log_probs = _log_normalize(component_logits)
-        independent_logits = np.asarray(dependency_params[position][0][0], dtype=np.float64)
-        independent_log_probs = _log_normalize(independent_logits)
+        context_log_probs = {}
 
-        if len(component_log_probs) == 1:
-            context_log_probs = {(): independent_log_probs + uniform_log_odds_offset}
-            context_axes: List[int] = []
-        else:
-            parent_count = len(ancestor_params[position][1])
-            parent_log_probs = _log_normalize(np.asarray(ancestor_params[position][1], dtype=np.float64))
-            dependency_log_probs = np.vstack(
-                [_log_normalize(np.asarray(row, dtype=np.float64)) for row in dependency_params[position][1]]
-            )
-            context_axes = list(range(distance - parent_count, distance))
-            context_log_probs = {}
+        for full_context in full_contexts:
+            symbol_log_probs = np.empty(4, dtype=np.float64)
 
-            for context in itertools.product(range(4), repeat=parent_count):
-                symbol_log_probs = np.empty(4, dtype=np.float64)
-                for symbol in range(4):
-                    dependent_terms = np.empty(parent_count, dtype=np.float64)
-                    for parent_offset in range(parent_count):
-                        parent_nt = context[parent_count - 1 - parent_offset]
-                        dependent_terms[parent_offset] = (
-                            parent_log_probs[parent_offset] + dependency_log_probs[parent_nt, symbol]
+            for symbol in range(4):
+                local_scores = np.empty(len(component_log_probs[position]), dtype=np.float64)
+                local_scores[0] = component_log_probs[position][0] + dependency_log_probs[position][0][0, symbol]
+
+                for component_index in range(1, len(component_log_probs[position])):
+                    ancestor_count = len(ancestor_log_probs[position][component_index])
+                    context_index = 0
+
+                    for current_order in range(1, component_index):
+                        parent_position = position - current_order
+                        context_index = (
+                            context_index * alphabet_size
+                            + _context_value(full_context, span, position, parent_position)
                         )
 
-                    independent_score = component_log_probs[0] + independent_log_probs[symbol]
-                    dependent_score = component_log_probs[1] + (
-                        np.max(dependent_terms) + np.log(np.sum(np.exp(dependent_terms - np.max(dependent_terms))))
+                    ancestor_scores = np.empty(ancestor_count, dtype=np.float64)
+                    total_contexts = dependency_log_probs[position][component_index].shape[0]
+                    width = dependency_log_probs[position][component_index].shape[1]
+
+                    for ancestor_index in range(ancestor_count):
+                        parent_position = position - component_index - ancestor_index
+                        context_index = (
+                            context_index * width
+                            + _context_value(full_context, span, position, parent_position)
+                        ) % total_contexts
+                        ancestor_scores[ancestor_index] = (
+                            ancestor_log_probs[position][component_index][ancestor_index]
+                            + dependency_log_probs[position][component_index][context_index, symbol]
+                        )
+
+                    local_scores[component_index] = (
+                        component_log_probs[position][component_index] + _logsumexp(ancestor_scores)
                     )
-                    symbol_log_probs[symbol] = np.logaddexp(independent_score, dependent_score) + uniform_log_odds_offset
 
-                context_log_probs[context] = symbol_log_probs
+                symbol_log_probs[symbol] = _logsumexp(local_scores) + uniform_log_odds_offset
 
-        tensor[..., position] = _build_position_tensor(context_log_probs, context_axes, distance)
+            context_log_probs[full_context] = symbol_log_probs
 
-    return tensor, length, distance
+        tensor[..., position] = _build_position_tensor(context_log_probs, context_axes, span)
+
+    return tensor, length, span
 
 
 def _parse_dimont_treeelement(elem: ET.Element) -> dict:
@@ -433,11 +494,14 @@ def _parse_dimont_treeelement(elem: ET.Element) -> dict:
     pars_pos = [child for child in pars if child.tag == "pos"] if pars is not None else []
 
     if pars_pos:
-        logits = np.asarray(
+        node["scores"] = np.asarray(
             [_xml_numeric_value(pos.find("parameter/value")) for pos in pars_pos],
             dtype=np.float64,
         )
-        node["log_probs"] = _log_normalize(logits)
+        node["log_z"] = np.asarray(
+            [(_xml_numeric_value(pos.find("parameter/z")) or 0.0) for pos in pars_pos],
+            dtype=np.float64,
+        )
         return node
 
     children_elem = elem.find("children")
@@ -446,21 +510,6 @@ def _parse_dimont_treeelement(elem: ET.Element) -> dict:
 
     node["children"] = [_parse_dimont_treeelement(pos.find("treeElement")) for pos in children_elem if pos.tag == "pos"]
     return node
-
-
-def _collect_dimont_leaves(
-    node: dict, assignment: Dict[int, int], out: List[Tuple[Dict[int, int], np.ndarray]]
-) -> None:
-    """Collect all leaf conditional distributions from a Dimont tree."""
-    if "log_probs" in node:
-        out.append((assignment.copy(), node["log_probs"]))
-        return
-
-    context_pos = node["context_pos"]
-    for nucleotide, child in enumerate(node["children"]):
-        assignment[context_pos] = nucleotide
-        _collect_dimont_leaves(child, assignment, out)
-        del assignment[context_pos]
 
 
 def read_dimont(path: str) -> tuple[np.ndarray, int, int]:
@@ -500,19 +549,27 @@ def read_dimont(path: str) -> tuple[np.ndarray, int, int]:
             span = max(span, max(position - parent for parent in positions))
 
     tensor = np.empty((5,) * (span + 1) + (length,), dtype=np.float32)
+    context_axes = list(range(span))
+    full_contexts = list(_iter_full_contexts(span))
+    root_offsets = np.zeros(length, dtype=np.float64)
+
+    for position, positions in enumerate(context_positions):
+        if positions:
+            continue
+        if "scores" not in nodes[position]:
+            raise ValueError(f"Malformed Dimont model in {path}: root position {position} is not a leaf")
+        root_offsets[position] = _logsumexp(nodes[position]["scores"] + nodes[position]["log_z"])
 
     for position, node in enumerate(nodes):
-        leaves: List[Tuple[Dict[int, int], np.ndarray]] = []
-        _collect_dimont_leaves(node, {}, leaves)
-
-        absolute_positions = list(range(position - span, position))
-        used_positions = set(context_positions[position])
-        context_axes = [axis for axis, abs_pos in enumerate(absolute_positions) if abs_pos in used_positions]
         context_log_probs = {}
 
-        for assignment, log_probs in leaves:
-            context_values = tuple(assignment[abs_pos] for abs_pos in absolute_positions if abs_pos in used_positions)
-            context_log_probs[context_values] = log_probs + uniform_log_odds_offset
+        for full_context in full_contexts:
+            current = node
+            while "scores" not in current:
+                parent_nt = _context_value(full_context, span, position, current["context_pos"])
+                current = current["children"][parent_nt]
+
+            context_log_probs[full_context] = current["scores"] + uniform_log_odds_offset - root_offsets[position]
 
         tensor[..., position] = _build_position_tensor(context_log_probs, context_axes, span)
 
