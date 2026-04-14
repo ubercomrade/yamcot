@@ -38,6 +38,8 @@ from mimosa.io import (
 from mimosa.ragged import RaggedData
 
 StrandMode = Literal["best", "+", "-"]
+_SEQ_DECODER = np.array(["A", "C", "G", "T", "N"], dtype="U1")
+_RC_TABLE = np.array([3, 2, 1, 0, 4], dtype=np.int8)
 
 
 @dataclass(eq=False)
@@ -208,6 +210,203 @@ def get_scores(model: GenericModel, sequences: RaggedData, strand: Optional[Stra
     return scan_model(model, sequences, strand)
 
 
+def _empty_hit_arrays() -> dict[str, np.ndarray]:
+    """Return a consistent empty hit-array payload."""
+    return {
+        "seq_index": np.empty(0, dtype=np.int64),
+        "start": np.empty(0, dtype=np.int64),
+        "strand_idx": np.empty(0, dtype=np.int8),
+        "score": np.empty(0, dtype=np.float32),
+    }
+
+
+def _scan_both_strands(model: GenericModel, sequences: RaggedData) -> tuple[RaggedData, RaggedData]:
+    """Scan sequences on both strands."""
+    return scan_model(model, sequences, strand="+"), scan_model(model, sequences, strand="-")
+
+
+def _collect_best_hits(
+    sequences: RaggedData,
+    s_fwd_ragged: RaggedData,
+    s_rev_ragged: RaggedData,
+) -> dict[str, np.ndarray]:
+    """Collect the single best hit per sequence as numeric arrays."""
+    seq_indices: list[int] = []
+    starts: list[int] = []
+    strand_indices: list[int] = []
+    scores: list[float] = []
+
+    for seq_idx in range(sequences.num_sequences):
+        s_fwd = s_fwd_ragged.get_slice(seq_idx)
+        s_rev = s_rev_ragged.get_slice(seq_idx)
+
+        f_max = s_fwd.max() if s_fwd.size > 0 else -np.inf
+        r_max = s_rev.max() if s_rev.size > 0 else -np.inf
+
+        if not np.isfinite(f_max) and not np.isfinite(r_max):
+            continue
+
+        seq_indices.append(seq_idx)
+        if f_max >= r_max:
+            starts.append(int(np.argmax(s_fwd)))
+            strand_indices.append(0)
+            scores.append(float(f_max))
+        else:
+            starts.append(int(np.argmax(s_rev)))
+            strand_indices.append(1)
+            scores.append(float(r_max))
+
+    if not seq_indices:
+        return _empty_hit_arrays()
+
+    return {
+        "seq_index": np.asarray(seq_indices, dtype=np.int64),
+        "start": np.asarray(starts, dtype=np.int64),
+        "strand_idx": np.asarray(strand_indices, dtype=np.int8),
+        "score": np.asarray(scores, dtype=np.float32),
+    }
+
+
+def _collect_threshold_hits(
+    sequences: RaggedData,
+    s_fwd_ragged: RaggedData,
+    s_rev_ragged: RaggedData,
+    score_threshold: float,
+) -> dict[str, np.ndarray]:
+    """Collect all hits above threshold as numeric arrays."""
+    del sequences
+    seq_indices_parts = []
+    start_parts = []
+    strand_parts = []
+    score_parts = []
+
+    for seq_idx in range(s_fwd_ragged.num_sequences):
+        s_fwd = s_fwd_ragged.get_slice(seq_idx)
+        s_rev = s_rev_ragged.get_slice(seq_idx)
+
+        f_pos = np.flatnonzero(s_fwd >= score_threshold)
+        if f_pos.size > 0:
+            seq_indices_parts.append(np.full(f_pos.size, seq_idx, dtype=np.int64))
+            start_parts.append(f_pos.astype(np.int64, copy=False))
+            strand_parts.append(np.zeros(f_pos.size, dtype=np.int8))
+            score_parts.append(s_fwd[f_pos].astype(np.float32, copy=False))
+
+        r_pos = np.flatnonzero(s_rev >= score_threshold)
+        if r_pos.size > 0:
+            seq_indices_parts.append(np.full(r_pos.size, seq_idx, dtype=np.int64))
+            start_parts.append(r_pos.astype(np.int64, copy=False))
+            strand_parts.append(np.ones(r_pos.size, dtype=np.int8))
+            score_parts.append(s_rev[r_pos].astype(np.float32, copy=False))
+
+    if not seq_indices_parts:
+        return _empty_hit_arrays()
+
+    return {
+        "seq_index": np.concatenate(seq_indices_parts),
+        "start": np.concatenate(start_parts),
+        "strand_idx": np.concatenate(strand_parts),
+        "score": np.concatenate(score_parts),
+    }
+
+
+def _collect_hits(
+    model: GenericModel,
+    sequences: RaggedData,
+    mode: str,
+    score_threshold: Optional[float],
+) -> dict[str, np.ndarray]:
+    """Collect motif hits as numeric arrays."""
+    s_fwd_ragged, s_rev_ragged = _scan_both_strands(model, sequences)
+    if mode == "best":
+        return _collect_best_hits(sequences, s_fwd_ragged, s_rev_ragged)
+    return _collect_threshold_hits(sequences, s_fwd_ragged, s_rev_ragged, float(score_threshold))
+
+
+def _scores_to_log_tail_array(model: GenericModel, scores: np.ndarray, strand: StrandMode = "best") -> np.ndarray:
+    """Convert a score array to background log-tail values."""
+    threshold_table = _resolve_threshold_table(model, strand)
+    if threshold_table is None:
+        return np.full(scores.shape, np.nan, dtype=np.float64)
+
+    if scores.size == 0:
+        return np.empty(0, dtype=np.float64)
+
+    scores_col = threshold_table[:, 0]
+    log_tail_col = threshold_table[:, 1]
+    idx = np.searchsorted(-scores_col, -scores.astype(np.float64, copy=False), side="left")
+    idx = np.clip(idx, 0, len(log_tail_col) - 1)
+    return log_tail_col[idx]
+
+
+def _extract_site_matrix(
+    sequences: RaggedData,
+    seq_indices: np.ndarray,
+    starts: np.ndarray,
+    motif_length: int,
+    strand_indices: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Extract numeric motif windows for a set of hits."""
+    n_hits = seq_indices.size
+    sites = np.empty((n_hits, motif_length), dtype=sequences.data.dtype)
+
+    for hit_idx in range(n_hits):
+        seq = sequences.get_slice(int(seq_indices[hit_idx]))
+        start = int(starts[hit_idx])
+        sites[hit_idx] = seq[start : start + motif_length]
+
+    if strand_indices is not None:
+        minus_mask = strand_indices == 1
+        if np.any(minus_mask):
+            sites[minus_mask] = _RC_TABLE[sites[minus_mask, ::-1]]
+
+    return sites
+
+
+def _site_matrix_to_strings(site_matrix: np.ndarray) -> np.ndarray:
+    """Convert numeric site windows into DNA strings."""
+    if site_matrix.size == 0:
+        return np.empty(0, dtype=object)
+
+    decoded = _SEQ_DECODER[np.clip(site_matrix, 0, 4)]
+    return np.fromiter(("".join(row) for row in decoded), dtype=object, count=decoded.shape[0])
+
+
+def _build_pcm_from_site_matrix(site_matrix: np.ndarray, motif_length: int) -> np.ndarray:
+    """Build a position count matrix from numeric sites."""
+    pcm = np.zeros((4, motif_length), dtype=np.float32)
+    if site_matrix.size == 0:
+        return pcm
+
+    valid_mask = site_matrix < 4
+    col_idx = np.broadcast_to(np.arange(motif_length, dtype=np.int64), site_matrix.shape)
+    np.add.at(pcm, (site_matrix[valid_mask], col_idx[valid_mask]), 1.0)
+    return pcm
+
+
+def _sort_hit_arrays(hit_arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Sort hits by sequence index ascending and score descending."""
+    if hit_arrays["score"].size == 0:
+        return hit_arrays
+
+    order = np.lexsort((-hit_arrays["score"], hit_arrays["seq_index"]))
+    return {key: values[order] for key, values in hit_arrays.items()}
+
+
+def _select_top_hit_arrays(hit_arrays: dict[str, np.ndarray], top_fraction: Optional[float]) -> dict[str, np.ndarray]:
+    """Keep only the top-scoring hits."""
+    if top_fraction is None or hit_arrays["score"].size == 0:
+        return hit_arrays
+
+    n_hits = hit_arrays["score"].size
+    n_keep = max(1, int(n_hits * top_fraction))
+    if n_keep >= n_hits:
+        return hit_arrays
+
+    keep_idx = np.argpartition(hit_arrays["score"], n_hits - n_keep)[-n_keep:]
+    keep_idx = keep_idx[np.argsort(hit_arrays["score"][keep_idx])[::-1]]
+    return {key: values[keep_idx] for key, values in hit_arrays.items()}
+
+
 def get_sites(
     model: GenericModel,
     sequences: RaggedData,
@@ -232,67 +431,40 @@ def get_sites(
         logger = logging.getLogger(__name__)
         logger.info(f"FPR threshold: {fpr_threshold} -> score threshold: {score_threshold:.4f}")
 
-    def add_site(seq_idx: int, seq: np.ndarray, pos: int, strand_idx: int, score: float):
-        """Add a site to results."""
-        if pos + model.length > len(seq):
-            return
+    hit_arrays = _collect_hits(model, sequences, mode, score_threshold)
+    hit_arrays = _sort_hit_arrays(hit_arrays)
 
-        site_seq = seq[pos : pos + model.length]
-        strand = "+" if strand_idx == 0 else "-"
-
-        if strand_idx == 1:
-            site_seq = _rc_sequence(site_seq)
-
-        results.append(
+    if hit_arrays["score"].size == 0:
+        df = pd.DataFrame(
             {
-                "seq_index": seq_idx,
-                "start": int(pos),
-                "end": int(pos + model.length),
-                "strand": strand,
-                "score": score,
-                "log_tail": _score_to_log_tail(model, score, strand="best"),
-                "site": _int_to_seq(site_seq),
+                "seq_index": np.empty(0, dtype=np.int64),
+                "start": np.empty(0, dtype=np.int64),
+                "end": np.empty(0, dtype=np.int64),
+                "strand": np.empty(0, dtype=object),
+                "score": np.empty(0, dtype=np.float32),
+                "log_tail": np.empty(0, dtype=np.float64),
+                "site": np.empty(0, dtype=object),
             }
         )
-
-    results = []
-
-    s_fwd_ragged = scan_model(model, sequences, strand="+")
-    s_rev_ragged = scan_model(model, sequences, strand="-")
-    n_seq = sequences.num_sequences
-
-    for seq_idx in range(n_seq):
-        seq = sequences.get_slice(seq_idx)
-        s_fwd = s_fwd_ragged.get_slice(seq_idx)
-        s_rev = s_rev_ragged.get_slice(seq_idx)
-
-        if mode == "best":
-            f_max = s_fwd.max() if s_fwd.size > 0 else -np.inf
-            r_max = s_rev.max() if s_rev.size > 0 else -np.inf
-
-            if not np.isfinite(f_max) and not np.isfinite(r_max):
-                continue
-            if f_max >= r_max:
-                best_pos = int(np.argmax(s_fwd))
-                best_score = float(f_max)
-                add_site(seq_idx, seq, best_pos, 0, best_score)
-            else:
-                best_pos = int(np.argmax(s_rev))
-                best_score = float(r_max)
-                add_site(seq_idx, seq, best_pos, 1, best_score)
-
-        else:
-            f_pos = np.where(s_fwd >= score_threshold)[0]
-            for pos in f_pos:
-                add_site(seq_idx, seq, int(pos), 0, float(s_fwd[pos]))
-
-            r_pos = np.where(s_rev >= score_threshold)[0]
-            for pos in r_pos:
-                add_site(seq_idx, seq, int(pos), 1, float(s_rev[pos]))
-
-    df = pd.DataFrame(results)
-    if len(df) > 0:
-        df = df.sort_values(["seq_index", "score"], ascending=[True, False]).reset_index(drop=True)
+    else:
+        site_matrix = _extract_site_matrix(
+            sequences,
+            hit_arrays["seq_index"],
+            hit_arrays["start"],
+            model.length,
+            hit_arrays["strand_idx"],
+        )
+        df = pd.DataFrame(
+            {
+                "seq_index": hit_arrays["seq_index"],
+                "start": hit_arrays["start"],
+                "end": hit_arrays["start"] + model.length,
+                "strand": np.where(hit_arrays["strand_idx"] == 0, "+", "-"),
+                "score": hit_arrays["score"],
+                "log_tail": _scores_to_log_tail_array(model, hit_arrays["score"], strand="best"),
+                "site": _site_matrix_to_strings(site_matrix),
+            }
+        )
 
     logger = logging.getLogger(__name__)
     logger.info(f"Found {len(df)} site(s) in {sequences.num_sequences} sequence(s)")
@@ -329,25 +501,36 @@ def get_pfm(
     logger = logging.getLogger(__name__)
     logger.info(f"Computing PFM for model: {model.name}")
 
-    sites_df = get_sites(model, sequences, mode=mode, fpr_threshold=fpr_threshold)
-    if len(sites_df) == 0:
+    threshold_table = _resolve_threshold_table(model, "best")
+    if mode not in ["best", "threshold"]:
+        raise ValueError(f"mode must be 'best' or 'threshold', got {mode}")
+    if mode == "threshold" and fpr_threshold is None:
+        raise ValueError("fpr_threshold is required for mode='threshold'")
+    if mode == "threshold" and threshold_table is None:
+        raise ValueError("Model has no threshold table")
+
+    score_threshold = (
+        _tail_probability_to_score(model, fpr_threshold, strand="best")
+        if mode == "threshold" and fpr_threshold is not None
+        else None
+    )
+
+    hit_arrays = _collect_hits(model, sequences, mode, score_threshold)
+    if hit_arrays["score"].size == 0:
         raise ValueError("No sites found")
 
-    sites_df = sites_df.sort_values(by=["score"], axis=0, ascending=False)
-
+    selected_hits = _select_top_hit_arrays(hit_arrays, top_fraction)
     if top_fraction is not None:
-        n_keep = max(1, int(len(sites_df) * top_fraction))
-        sites_df = sites_df.nlargest(n_keep, "score")
-        logger = logging.getLogger(__name__)
-        logger.info(f"Selected top {top_fraction * 100:.1f}%: {n_keep} sites")
+        logger.info(f"Selected top {top_fraction * 100:.1f}%: {selected_hits['score'].size} sites")
 
-    pcm = np.zeros((4, model.length), dtype=np.float32)
-    nuc_map = {"A": 0, "C": 1, "G": 2, "T": 3}
-
-    for site_str in sites_df["site"]:
-        for pos, nuc in enumerate(site_str):
-            if nuc in nuc_map:
-                pcm[nuc_map[nuc], pos] += 1.0
+    site_matrix = _extract_site_matrix(
+        sequences,
+        selected_hits["seq_index"],
+        selected_hits["start"],
+        model.length,
+        selected_hits["strand_idx"],
+    )
+    pcm = _build_pcm_from_site_matrix(site_matrix, model.length)
 
     pfm = pcm_to_pfm(pcm, pseudocount=pseudocount).astype(np.float32, copy=False)
 
@@ -377,15 +560,13 @@ def _tail_probability_to_score(model: GenericModel, tail_probability: float, str
 
 def _int_to_seq(seq_int: np.ndarray) -> str:
     """Convert integer-encoded sequence to ACGT string."""
-    decoder = np.array(["A", "C", "G", "T", "N"], dtype="U1")
     safe_seq = np.clip(seq_int, 0, 4)
-    return "".join(decoder[safe_seq])
+    return "".join(_SEQ_DECODER[safe_seq])
 
 
 def _rc_sequence(seq_int: np.ndarray) -> np.ndarray:
     """Return reverse complement of sequence."""
-    rc_table = np.array([3, 2, 1, 0, 4], dtype=np.int8)
-    return rc_table[seq_int[::-1]]
+    return _RC_TABLE[seq_int[::-1]]
 
 
 def _scan_with_batch_kernel(
