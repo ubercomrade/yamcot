@@ -15,10 +15,8 @@ import numpy as np
 import pandas as pd
 
 from mimosa.functions import (
-    apply_score_log_tail_table,
     batch_all_scores,
     build_score_log_tail_table,
-    lookup_log_tail,
     lookup_score_for_tail_probability,
     pcm_to_pfm,
     pfm_to_pwm,
@@ -33,6 +31,7 @@ from mimosa.io import (
     read_scores,
     read_sitega,
     read_slim,
+    write_pfm,
     write_sitega,
 )
 from mimosa.ragged import RaggedData
@@ -140,28 +139,6 @@ def calculate_threshold_table(model: GenericModel, sequences: RaggedData, strand
     """Calculate a score-to-log-tail lookup table on explicitly provided sequences."""
     ragged_scores = scan_model(model, sequences, strand=strand)
     return build_score_log_tail_table(ragged_scores.data).astype(np.float64, copy=False)
-
-
-def scores_to_background_log_tail(
-    model: GenericModel,
-    ragged_scores: RaggedData,
-    background_sequences: RaggedData,
-    strand: StrandMode = "best",
-) -> RaggedData:
-    """Convert scores to background-calibrated log-tail values using both strands."""
-    del strand
-    threshold_table = calculate_threshold_table(model, background_sequences, strand="best")
-    return apply_score_log_tail_table(ragged_scores, threshold_table)
-
-
-def scores_to_log_fpr(
-    model: GenericModel,
-    ragged_scores: RaggedData,
-    background_sequences: RaggedData,
-    strand: StrandMode = "best",
-) -> RaggedData:
-    """Backward-compatible alias for background-calibrated log-tail conversion."""
-    return scores_to_background_log_tail(model, ragged_scores, background_sequences, strand=strand)
 
 
 def get_frequencies(model: GenericModel, sequences: RaggedData, strand: Optional[StrandMode] = None) -> RaggedData:
@@ -502,25 +479,9 @@ def get_pfm(
     return pfm
 
 
-def _score_to_log_tail(score: float, threshold_table: np.ndarray) -> float:
-    """Convert score to a log-tail value using an explicit lookup table."""
-    return lookup_log_tail(threshold_table, score)
-
-
 def _tail_probability_to_score(tail_probability: float, threshold_table: np.ndarray) -> float:
     """Convert a tail-probability threshold to the corresponding score cutoff."""
     return lookup_score_for_tail_probability(threshold_table, tail_probability)
-
-
-def _int_to_seq(seq_int: np.ndarray) -> str:
-    """Convert integer-encoded sequence to ACGT string."""
-    safe_seq = np.clip(seq_int, 0, 4)
-    return "".join(_SEQ_DECODER[safe_seq])
-
-
-def _rc_sequence(seq_int: np.ndarray) -> np.ndarray:
-    """Return reverse complement of sequence."""
-    return _RC_TABLE[seq_int[::-1]]
 
 
 def _scan_with_batch_kernel(
@@ -559,10 +520,9 @@ class PwmStrategy:
     def write(model: GenericModel, path: str) -> None:
         """Write PWM model to file."""
         pfm = model.config.get("_source_pfm")
-        if pfm is not None:
-            with open(path, "w") as f:
-                f.write(f">{model.name}\n")
-                np.savetxt(f, pfm[:4, :].T, fmt="%.8f", delimiter="\t")
+        if pfm is None:
+            raise ValueError("PWM serialization requires the source PFM in model.config['_source_pfm'].")
+        write_pfm(np.asarray(pfm, dtype=np.float32), model.name, model.length, path)
 
     @staticmethod
     def score_bounds(model: GenericModel) -> tuple[float, float]:
@@ -575,7 +535,14 @@ class PwmStrategy:
         _, ext = os.path.splitext(path.lower())
 
         if ext == ".pkl":
-            return joblib.load(path)
+            model = joblib.load(path)
+            if not isinstance(model, GenericModel):
+                raise TypeError(f"Unsupported PWM pickle payload: expected GenericModel, got {type(model)!r}")
+            if model.config.get("_source_pfm") is None:
+                raise ValueError(
+                    "Unsupported PWM pickle format: source PFM is missing from model.config['_source_pfm']."
+                )
+            return model
         elif ext == ".meme":
             pfm, info, _ = read_meme(path, index=kwargs.get("index", 0))
             name, length = info
@@ -673,9 +640,9 @@ class BammStrategy:
             else:
                 raise FileNotFoundError(f"BaMM file not found: {path}")
 
-        target_order = kwargs.get("order")
-        target_order = 0 if target_order is None else int(target_order)
         _, max_order, _ = parse_file_content(path)
+        target_order = kwargs.get("order")
+        target_order = max_order if target_order is None else int(target_order)
         if target_order > max_order:
             target_order = max_order
 
@@ -687,7 +654,7 @@ class BammStrategy:
             name=name,
             length=representation.shape[-1],
             representation=np.asarray(representation, dtype=np.float32),
-            config={"kmer": representation.ndim - 1},
+            config={"kmer": representation.ndim - 1, "order": target_order},
         )
 
 

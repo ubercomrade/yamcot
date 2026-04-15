@@ -21,9 +21,7 @@ def run_motali(
     shift: int = 50,
     err: float = 0.002,
 ):
-    """
-    Run motali comparison using either the C++ extension or subprocess fallback.
-    """
+    """Run motali comparison through the native extension."""
     logger = logging.getLogger(__name__)
 
     if type_1 == "sitega":

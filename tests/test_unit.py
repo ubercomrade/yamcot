@@ -12,6 +12,7 @@ import xml.etree.ElementTree as ET
 from functools import lru_cache
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pytest
 
@@ -38,10 +39,10 @@ from mimosa.functions import (
     precision_recall_curve,
     roc_curve,
     score_seq,
-    scores_to_frequencies,
+    scores_to_empirical_log_tail,
     standardized_pauc,
 )
-from mimosa.io import read_scores
+from mimosa.io import parse_file_content, read_pfm, read_scores
 from mimosa.models import (
     GenericModel,
     calculate_threshold_table,
@@ -50,7 +51,7 @@ from mimosa.models import (
     get_sites,
     read_model,
     scan_model,
-    scores_to_log_fpr,
+    write_model,
 )
 from mimosa.models import registry as model_registry
 from mimosa.ragged import RaggedData, ragged_from_list
@@ -424,20 +425,20 @@ def test_standardized_pauc_basic():
     assert abs(standardized - expected) < 1e-6
 
 
-def test_scores_to_frequencies_basic():
-    """Test basic scores to frequencies conversion"""
+def test_scores_to_empirical_log_tail_basic():
+    """Empirical score normalization should preserve ragged layout."""
     # Create a simple RaggedData with some scores
     data = np.array([1.0, 2.0, 1.0, 3.0, 2.0], dtype=np.float32)
     offsets = np.array([0, 2, 4, 5], dtype=np.int64)  # Two sequences of lengths 2, 2, 1
     ragged_scores = RaggedData(data, offsets)
 
-    freq_result = scores_to_frequencies(ragged_scores)
+    transformed = scores_to_empirical_log_tail(ragged_scores)
 
     # Verify the output is a RaggedData
-    assert isinstance(freq_result, RaggedData)
+    assert isinstance(transformed, RaggedData)
     # Verify shape consistency
-    assert freq_result.data.shape == ragged_scores.data.shape
-    assert freq_result.offsets.shape == ragged_scores.offsets.shape
+    assert transformed.data.shape == ragged_scores.data.shape
+    assert transformed.offsets.shape == ragged_scores.offsets.shape
 
 
 def test_read_scores_basic(tmp_path):
@@ -582,20 +583,26 @@ def test_slim_fixture_site_scores_match_java_reference(path: Path):
         assert minus_score == pytest.approx(expected_minus, abs=1e-5)
 
 
-def test_read_model_bamm_defaults_to_zero_order_and_derives_kmer():
-    """BaMM loading should default to order 0 and derive k-mer size from the tensor shape."""
-    zero_order = read_model(str(EXAMPLES_ROOT / "myog.ihbcp"), "bamm")
-    second_order = read_model(str(EXAMPLES_ROOT / "myog.ihbcp"), "bamm", order=2)
+def test_read_model_bamm_defaults_to_max_order_and_derives_kmer():
+    """BaMM loading should preserve the highest-order tensor unless an explicit order is requested."""
+    myog_path = EXAMPLES_ROOT / "myog.ihbcp"
+    _, myog_max_order, _ = parse_file_content(str(myog_path))
+
+    default_order = read_model(str(myog_path), "bamm")
+    second_order = read_model(str(myog_path), "bamm", order=2)
     foxa1 = read_model(str(FIXTURES_ROOT / "bamm" / "PEAKS036274_FOXA1_P35582_MACS2_motif_1.ihbcp"), "bamm")
 
-    assert zero_order.config["kmer"] == 1
-    assert zero_order.representation.shape == (5, 14)
-
+    assert default_order.config["order"] == myog_max_order
+    assert default_order.config["kmer"] == myog_max_order + 1
+    assert default_order.representation.ndim == myog_max_order + 2
     assert second_order.config["kmer"] == 3
+    assert second_order.config["order"] == 2
     assert second_order.representation.shape == (5, 5, 5, 14)
+    assert default_order.representation.shape != second_order.representation.shape
 
-    assert foxa1.config["kmer"] == 1
-    assert foxa1.representation.shape[0] == 5
+    assert foxa1.config["kmer"] == foxa1.config["order"] + 1
+    assert foxa1.config["order"] > 0
+    assert foxa1.representation.ndim == foxa1.config["order"] + 2
 
 
 def test_read_model_bamm_ignores_missing_background_and_uses_uniform_log_odds(tmp_path):
@@ -727,40 +734,6 @@ def test_get_frequencies():
     assert frequencies.data.size > 0
 
 
-def test_scores_to_log_fpr_uses_threshold_table_scale():
-    """Background-calibrated conversion should use the best-strand threshold table."""
-    representation = np.array(
-        [
-            [1.0, 0.2],
-            [0.2, 1.0],
-            [0.1, 0.1],
-            [0.1, 0.1],
-            [0.1, 0.1],
-        ],
-        dtype=np.float32,
-    )
-    model = GenericModel(type_key="pwm", name="test_pwm", representation=representation, length=2, config={"kmer": 1})
-    promoters = ragged_from_list(
-        [
-            np.array([0, 1, 0, 1, 0, 1], dtype=np.int8),
-            np.array([1, 0, 1, 0, 1, 0], dtype=np.int8),
-        ],
-        dtype=np.int8,
-    )
-
-    scores = scan_model(model, promoters, "+")
-    threshold_table = calculate_threshold_table(model, promoters, strand="best")
-
-    transformed = scores_to_log_fpr(model, scores, promoters, strand="+")
-
-    idx = np.searchsorted(-threshold_table[:, 0], -scores.data, side="left")
-    idx = np.clip(idx, 0, len(threshold_table) - 1)
-    expected = threshold_table[:, 1][idx].astype(np.float32)
-
-    np.testing.assert_allclose(transformed.data, expected)
-    np.testing.assert_array_equal(transformed.offsets, scores.offsets)
-
-
 def test_calculate_threshold_table_does_not_mutate_model_config():
     """Threshold-table calculation should stay pure and avoid storing runtime lookup tables on the model."""
     representation = np.array(
@@ -824,6 +797,47 @@ def test_get_pfm_reconstructs_pwm_from_sites_with_single_pseudocount():
 
     np.testing.assert_allclose(pfm, expected)
     assert not np.allclose(pfm, source_pfm)
+
+
+def test_write_model_serializes_pwm_source_pfm(tmp_path):
+    """PWM serialization should write the stored source PFM via the shared PFM writer."""
+    source_pfm = np.array([[0.7, 0.1], [0.1, 0.7], [0.1, 0.1], [0.1, 0.1]], dtype=np.float32)
+    pwm = pfm_to_pwm(source_pfm)
+    representation = np.concatenate((pwm, np.min(pwm, axis=0, keepdims=True)), axis=0).astype(np.float32)
+    model = GenericModel(
+        type_key="pwm",
+        name="serialized_pwm",
+        representation=representation,
+        length=2,
+        config={"kmer": 1, "_source_pfm": source_pfm},
+    )
+
+    path = tmp_path / "serialized.pfm"
+    write_model(model, str(path))
+
+    assert path.exists()
+    written_pfm, length = read_pfm(str(path))
+    assert length == 2
+    np.testing.assert_allclose(written_pfm, source_pfm, atol=1e-6)
+
+
+def test_read_model_rejects_pwm_pickle_without_source_pfm(tmp_path):
+    """Legacy PWM pickles without a source PFM should no longer be accepted."""
+    source_pfm = np.full((4, 2), 0.25, dtype=np.float32)
+    pwm = pfm_to_pwm(source_pfm)
+    representation = np.concatenate((pwm, np.min(pwm, axis=0, keepdims=True)), axis=0).astype(np.float32)
+    legacy_model = GenericModel(
+        type_key="pwm",
+        name="legacy_pwm",
+        representation=representation,
+        length=2,
+        config={"kmer": 1, "_pfm": source_pfm},
+    )
+    path = tmp_path / "legacy_pwm.pkl"
+    joblib.dump(legacy_model, path)
+
+    with pytest.raises(ValueError, match="_source_pfm"):
+        read_model(str(path), "pwm")
 
 
 def test_get_sites_threshold_uses_current_sequences_by_default():

@@ -299,7 +299,7 @@ mimosa motali sitega_gata2.mat gata2.meme \
 
 MIMOSA exposes a functional API. The core building blocks are:
 
-- `GenericModel` (`mimosa.models`) as an immutable model container.
+- `GenericModel` (`mimosa.models`) as a model container with mutable runtime config.
 - `read_model(...)`, `scan_model(...)`, `get_sites(...)`, `get_pfm(...)` (`mimosa.models`) for model I/O and scanning.
 - `create_comparator_config(...)` and `compare(...)` (`mimosa.comparison`) for direct strategy execution.
 - `compare_motifs(...)`, `create_config(...)`, `run_comparison(...)` (`mimosa`) as high-level entry points.

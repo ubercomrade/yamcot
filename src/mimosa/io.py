@@ -175,22 +175,6 @@ def read_meme(path: str, index: int = 0) -> Tuple[np.ndarray, Tuple[str, int], i
     return target_motif, target_info, motif_count
 
 
-def write_meme(motifs: List[np.ndarray], info: List[Tuple[str, int]], path: str) -> None:
-    """Write a list of motifs to a MEME formatted file."""
-    with open(path, "w") as out:
-        out.write("MEME version 4\n\n")
-        out.write("ALPHABET= ACGT\n\n")
-        out.write("strands: + -\n\n")
-        out.write("Background letter frequencies\n")
-        out.write("A 0.25 C 0.25 G 0.25 T 0.25\n\n")
-        for motif, (name, length) in zip(motifs, info, strict=False):
-            out.write(f"MOTIF {name}\n")
-            out.write(f"letter-probability matrix: alength= 4 w= {length}\n")
-            for row in motif[:4].T:
-                out.write(" " + " ".join(f"{val:.6f}" for val in row) + "\n")
-            out.write("\n")
-
-
 def read_sitega(path: str) -> tuple[np.ndarray, str, int, float, float]:
     """Parse SiteGA output file and return the motif matrix with metadata."""
     converter = {"A": 0, "C": 1, "G": 2, "T": 3}
@@ -637,7 +621,7 @@ def write_pfm(pfm: np.ndarray, name: str, length: int, path: str) -> None:
 
 
 def read_pfm(path: str) -> tuple[np.ndarray, int]:
-    """Read a Position Frequency Matrix (PFM) from a file and convert to PWM."""
+    """Read a Position Frequency Matrix (PFM) from a file."""
     pfm = np.loadtxt(path, comments=">").T
     length = pfm.shape[1]
     return pfm, length

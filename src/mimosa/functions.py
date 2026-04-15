@@ -441,11 +441,6 @@ def scores_to_empirical_log_tail(ragged_scores: RaggedData) -> RaggedData:
     return apply_score_log_tail_table(ragged_scores, table)
 
 
-def scores_to_frequencies(ragged_scores: RaggedData) -> RaggedData:
-    """Backward-compatible alias for empirical score-to-log-tail conversion."""
-    return scores_to_empirical_log_tail(ragged_scores)
-
-
 @njit(_PROFILE_SUPPORT_SIGNATURE, cache=True)
 def _build_profile_support_numba(data, offsets, min_value):
     """Build sparse local-position support for one profile at the requested threshold."""
