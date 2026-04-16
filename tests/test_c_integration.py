@@ -6,7 +6,7 @@ import pytest
 
 from mimosa import compare_motifs
 from mimosa.io import read_fasta
-from mimosa.models import PwmStrategy
+from mimosa.models import read_model
 
 
 def test_c_module_import():
@@ -87,8 +87,8 @@ def test_motali_no_fd_leak_on_repeated_calls(tmp_path):
     root = Path(__file__).resolve().parent.parent
     examples_dir = root / "examples"
 
-    model1 = PwmStrategy.load(str(examples_dir / "pif4.meme"), {"index": 0})
-    model2 = PwmStrategy.load(str(examples_dir / "gata2.meme"), {"index": 0})
+    model1 = read_model(str(examples_dir / "pif4.meme"), "pwm", index=0)
+    model2 = read_model(str(examples_dir / "gata2.meme"), "pwm", index=0)
     sequences = read_fasta(examples_dir / "foreground.fa")
     promoters = read_fasta(examples_dir / "background.fa")
 

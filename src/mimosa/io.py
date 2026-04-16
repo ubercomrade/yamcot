@@ -6,42 +6,19 @@ import logging
 import os
 import re
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 
-from mimosa.ragged import RaggedData
+from mimosa.batches import make_score_batch, make_sequence_batch, row_values
 
 _JSTACS_NUMERIC_RE = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[Ee][-+]?\d+)?")
 _LOG_UNIFORM_BASE = float(np.log(4.0))
 _SITEGA_EPS = 1e-9
 
 
-@dataclass(frozen=True)
-class SlimParameters:
-    """Normalized SLIM parameters ready for tensor materialization."""
-
-    length: int
-    span: int
-    alphabet_size: int
-    component_log_probs: list[np.ndarray]
-    ancestor_log_probs: list[list[np.ndarray]]
-    dependency_log_probs: list[list[np.ndarray]]
-
-
-@dataclass(frozen=True)
-class DimontParameters:
-    """Parsed Dimont tree state ready for tensor materialization."""
-
-    length: int
-    span: int
-    nodes: list[dict]
-    root_offsets: np.ndarray
-
-
-def read_fasta(path: str | Path) -> RaggedData:
+def read_fasta(path: str | Path):
     """Read a FASTA file and return integer-encoded sequences."""
 
     trans_table = bytearray([4] * 256)
@@ -68,23 +45,11 @@ def read_fasta(path: str | Path) -> RaggedData:
             encoded = np.frombuffer(current_seq_bytes.translate(trans_table), dtype=np.int8).copy()
             sequences.append(encoded)
 
-    if not sequences:
-        return RaggedData(np.empty(0, dtype=np.int8), np.zeros(1, dtype=np.int64))
-
-    n = len(sequences)
-    offsets = np.zeros(n + 1, dtype=np.int64)
-    for i, seq in enumerate(sequences):
-        offsets[i + 1] = offsets[i] + len(seq)
-
-    total_data = np.empty(offsets[-1], dtype=np.int8)
-    for i, seq in enumerate(sequences):
-        total_data[offsets[i] : offsets[i + 1]] = seq
-
-    return RaggedData(total_data, offsets)
+    return make_sequence_batch(sequences)
 
 
-def read_scores(path: str | Path) -> RaggedData:
-    """Read FASTA-like numerical score profiles into RaggedData."""
+def read_scores(path: str | Path):
+    """Read FASTA-like numerical score profiles into a dense masked batch."""
 
     profiles: List[np.ndarray] = []
     current_values: List[float] = []
@@ -109,30 +74,18 @@ def read_scores(path: str | Path) -> RaggedData:
     if current_values:
         profiles.append(np.asarray(current_values, dtype=np.float32))
 
-    if not profiles:
-        return RaggedData(np.empty(0, dtype=np.float32), np.zeros(1, dtype=np.int64))
-
-    n = len(profiles)
-    offsets = np.zeros(n + 1, dtype=np.int64)
-    for i, profile in enumerate(profiles):
-        offsets[i + 1] = offsets[i] + len(profile)
-
-    total_data = np.empty(offsets[-1], dtype=np.float32)
-    for i, profile in enumerate(profiles):
-        total_data[offsets[i] : offsets[i + 1]] = profile
-
-    return RaggedData(total_data, offsets)
+    return make_score_batch(profiles)
 
 
-def write_fasta(sequences: Union[RaggedData, Iterable[np.ndarray]], path: str) -> None:
+def write_fasta(sequences: Union[dict, Iterable[np.ndarray]], path: str) -> None:
     """Write integer-encoded sequences to a FASTA file."""
 
     decoder = np.array(["A", "C", "G", "T", "N"], dtype="U1")
 
     with open(path, "w") as out:
-        if isinstance(sequences, RaggedData):
-            for i in range(sequences.num_sequences):
-                seq_int = sequences.get_slice(i)
+        if isinstance(sequences, dict) and {"values", "mask", "lengths"} <= set(sequences.keys()):
+            for i in range(len(sequences["lengths"])):
+                seq_int = row_values(sequences, i)
                 safe_seq = np.clip(seq_int, 0, 4)
                 chars = decoder[safe_seq]
                 seq_str = "".join(chars)
@@ -430,21 +383,21 @@ def _slim_span(length: int, component_params: list, ancestor_params: list, path:
     return span
 
 
-def _normalize_slim_parameters(path: str) -> SlimParameters:
+def _normalize_slim_parameters(path: str) -> dict:
     """Normalize raw SLIM parameters to log-probability tables."""
     length, component_params, ancestor_params, dependency_params = _parse_slim_model(path)
-    return SlimParameters(
-        length=length,
-        span=_slim_span(length, component_params, ancestor_params, path),
-        alphabet_size=len(dependency_params[0][0][0]),
-        component_log_probs=[
+    return {
+        "length": length,
+        "span": _slim_span(length, component_params, ancestor_params, path),
+        "alphabet_size": len(dependency_params[0][0][0]),
+        "component_log_probs": [
             _log_normalize(np.asarray(component_params[position], dtype=np.float64)) for position in range(length)
         ],
-        ancestor_log_probs=[
+        "ancestor_log_probs": [
             [_log_normalize(np.asarray(component, dtype=np.float64)) for component in ancestor_params[position]]
             for position in range(length)
         ],
-        dependency_log_probs=[
+        "dependency_log_probs": [
             [
                 np.vstack(
                     [
@@ -456,53 +409,54 @@ def _normalize_slim_parameters(path: str) -> SlimParameters:
             ]
             for position in range(length)
         ],
-    )
+    }
 
 
 def _slim_symbol_log_probs(
     position: int,
     symbol: int,
     full_context: Tuple[int, ...],
-    params: SlimParameters,
+    params: dict,
 ) -> float:
     """Evaluate one SLIM position for a concrete symbol and context."""
-    local_scores = np.empty(len(params.component_log_probs[position]), dtype=np.float64)
-    local_scores[0] = params.component_log_probs[position][0] + params.dependency_log_probs[position][0][0, symbol]
+    component_log_probs = params["component_log_probs"]
+    dependency_log_probs = params["dependency_log_probs"]
+    ancestor_log_probs = params["ancestor_log_probs"]
+    alphabet_size = int(params["alphabet_size"])
 
-    for component_index in range(1, len(params.component_log_probs[position])):
-        ancestor_count = len(params.ancestor_log_probs[position][component_index])
+    local_scores = np.empty(len(component_log_probs[position]), dtype=np.float64)
+    local_scores[0] = component_log_probs[position][0] + dependency_log_probs[position][0][0, symbol]
+
+    for component_index in range(1, len(component_log_probs[position])):
+        ancestor_count = len(ancestor_log_probs[position][component_index])
         context_index = 0
 
         for current_order in range(1, component_index):
             parent_position = position - current_order
-            context_index = context_index * params.alphabet_size + _context_value(
-                full_context, params.span, position, parent_position
+            context_index = context_index * alphabet_size + _context_value(
+                full_context, int(params["span"]), position, parent_position
             )
 
         ancestor_scores = np.empty(ancestor_count, dtype=np.float64)
-        dependency = params.dependency_log_probs[position][component_index]
+        dependency = dependency_log_probs[position][component_index]
         total_contexts = dependency.shape[0]
         width = dependency.shape[1]
 
         for ancestor_index in range(ancestor_count):
             parent_position = position - component_index - ancestor_index
             context_index = (
-                context_index * width + _context_value(full_context, params.span, position, parent_position)
+                context_index * width + _context_value(full_context, int(params["span"]), position, parent_position)
             ) % total_contexts
             ancestor_scores[ancestor_index] = (
-                params.ancestor_log_probs[position][component_index][ancestor_index] + dependency[context_index, symbol]
+                ancestor_log_probs[position][component_index][ancestor_index] + dependency[context_index, symbol]
             )
 
-        local_scores[component_index] = params.component_log_probs[position][component_index] + _logsumexp(
-            ancestor_scores
-        )
+        local_scores[component_index] = component_log_probs[position][component_index] + _logsumexp(ancestor_scores)
 
     return _logsumexp(local_scores) + _LOG_UNIFORM_BASE
 
 
-def _build_slim_position_tensor(
-    position: int, params: SlimParameters, full_contexts: list[Tuple[int, ...]]
-) -> np.ndarray:
+def _build_slim_position_tensor(position: int, params: dict, full_contexts: list[Tuple[int, ...]]) -> np.ndarray:
     """Materialize one SLIM position into a dense tensor."""
     context_log_probs = {}
     for full_context in full_contexts:
@@ -510,17 +464,20 @@ def _build_slim_position_tensor(
         for symbol in range(4):
             symbol_log_probs[symbol] = _slim_symbol_log_probs(position, symbol, full_context, params)
         context_log_probs[full_context] = symbol_log_probs
-    return _build_position_tensor(context_log_probs, list(range(params.span)), params.span)
+    span = int(params["span"])
+    return _build_position_tensor(context_log_probs, list(range(span)), span)
 
 
 def read_slim(path: str) -> tuple[np.ndarray, int, int]:
     """Read a Jstacs Slim XML model into a dense log-odds tensor."""
     params = _normalize_slim_parameters(path)
-    tensor = np.empty((5,) * (params.span + 1) + (params.length,), dtype=np.float32)
-    full_contexts = list(_iter_full_contexts(params.span))
-    for position in range(params.length):
+    span = int(params["span"])
+    length = int(params["length"])
+    tensor = np.empty((5,) * (span + 1) + (length,), dtype=np.float32)
+    full_contexts = list(_iter_full_contexts(span))
+    for position in range(length):
         tensor[..., position] = _build_slim_position_tensor(position, params, full_contexts)
-    return tensor, params.length, params.span
+    return tensor, length, span
 
 
 def _parse_dimont_treeelement(elem: ET.Element) -> dict:
@@ -597,15 +554,15 @@ def _dimont_root_offsets(path: str, nodes: list[dict], context_positions: list[l
     return root_offsets
 
 
-def _normalize_dimont_parameters(path: str) -> DimontParameters:
+def _normalize_dimont_parameters(path: str) -> dict:
     """Normalize Dimont XML state to a tensor-materialization plan."""
     context_positions, nodes = _parse_dimont_model(path)
-    return DimontParameters(
-        length=len(nodes),
-        span=_dimont_span(context_positions),
-        nodes=nodes,
-        root_offsets=_dimont_root_offsets(path, nodes, context_positions),
-    )
+    return {
+        "length": len(nodes),
+        "span": _dimont_span(context_positions),
+        "nodes": nodes,
+        "root_offsets": _dimont_root_offsets(path, nodes, context_positions),
+    }
 
 
 def _build_dimont_position_tensor(
@@ -629,17 +586,19 @@ def _build_dimont_position_tensor(
 def read_dimont(path: str) -> tuple[np.ndarray, int, int]:
     """Read a Jstacs Dimont XML model into a dense log-odds tensor."""
     params = _normalize_dimont_parameters(path)
-    tensor = np.empty((5,) * (params.span + 1) + (params.length,), dtype=np.float32)
-    full_contexts = list(_iter_full_contexts(params.span))
-    for position, node in enumerate(params.nodes):
+    span = int(params["span"])
+    length = int(params["length"])
+    tensor = np.empty((5,) * (span + 1) + (length,), dtype=np.float32)
+    full_contexts = list(_iter_full_contexts(span))
+    for position, node in enumerate(params["nodes"]):
         tensor[..., position] = _build_dimont_position_tensor(
             position,
             node,
-            float(params.root_offsets[position]),
-            params.span,
+            float(params["root_offsets"][position]),
+            span,
             full_contexts,
         )
-    return tensor, params.length, params.span
+    return tensor, length, span
 
 
 def write_sitega(model, path: str) -> None:

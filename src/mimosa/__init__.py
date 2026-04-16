@@ -1,9 +1,21 @@
 """Public package API."""
 
-from mimosa.api import ComparisonConfig, compare_motifs, create_config, run_comparison
+from mimosa.api import compare_motifs, create_config, run_comparison
 from mimosa.cache import clear_cache
-from mimosa.comparison import ComparatorConfig, compare, create_comparator_config
-from mimosa.models import GenericModel, get_frequencies, get_pfm, get_scores, get_sites, read_model, scan_model
+from mimosa.comparison import compare, create_comparator_config
+from mimosa.models import (
+    GenericModel,
+    get_frequencies,
+    get_pfm,
+    get_scores,
+    get_sites,
+    read_model,
+    register_model_handler,
+    scan_model,
+)
+
+ComparisonConfig = dict
+ComparatorConfig = dict
 
 __all__ = [
     "ComparatorConfig",
@@ -19,6 +31,7 @@ __all__ = [
     "get_scores",
     "get_sites",
     "read_model",
+    "register_model_handler",
     "run_comparison",
     "scan_model",
 ]

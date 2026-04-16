@@ -20,10 +20,10 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=2.0,<2.4",
-    "numba>=0.62.0",
     "scipy>=1.14.1",
     "pandas>=2.2.3",
     "joblib>=1.5.3",
+    "jax>=0.6.2",
 ]
 
 [project.urls]

@@ -1,19 +1,17 @@
-"""
-Model utilities and registry-backed motif strategies.
-"""
+"""Model utilities and registry-backed motif handlers."""
 
 from __future__ import annotations
 
 import logging
 import os
 from dataclasses import dataclass
-from dataclasses import field as dc_field
 from typing import Any, Dict, Literal, Optional
 
 import joblib
 import numpy as np
 import pandas as pd
 
+from mimosa.batches import SCORE_PADDING, pack_batch, row_values
 from mimosa.functions import (
     batch_all_scores,
     build_score_log_tail_table,
@@ -34,7 +32,6 @@ from mimosa.io import (
     write_pfm,
     write_sitega,
 )
-from mimosa.ragged import RaggedData
 from mimosa.validation import validate_site_mode
 
 StrandMode = Literal["best", "+", "-"]
@@ -45,132 +42,87 @@ _NUCLEOTIDE_CARDINALITY = 4
 
 @dataclass(eq=False)
 class GenericModel:
-    """Motif model container with mutable runtime caches in ``config``."""
+    """Motif model container."""
 
     type_key: str
     name: str
-    representation: Any = dc_field(hash=False)
+    representation: Any
     length: int
-    config: dict = dc_field(default_factory=dict, hash=False)
+    config: dict
 
 
-@dataclass(frozen=True)
-class HitSelectionConfig:
-    """Inputs that define one hit-extraction request."""
-
-    mode: str = "best"
-    fpr_threshold: Optional[float] = None
-    background_sequences: Optional[RaggedData] = None
-    threshold_table: Optional[np.ndarray] = dc_field(default=None, repr=False)
+registry: Dict[str, dict] = {}
 
 
-@dataclass(frozen=True)
-class ResolvedHits:
-    """Resolved hit arrays plus the threshold metadata used to produce them."""
-
-    hit_arrays: dict[str, np.ndarray]
-    threshold_table: Optional[np.ndarray]
-    score_threshold: Optional[float]
-
-
-class ModelRegistry:
-    """Registry for model strategies using decorator pattern."""
-
-    def __init__(self):
-        """Initialize registry state."""
-        self._strategies: Dict[str, type] = {}
-
-    def register(self, key: str):
-        """Decorator to register a model strategy class."""
-
-        def decorator(strategy_cls):
-            """Store a callable in the registry."""
-            self._strategies[key] = strategy_cls
-            logging.info(f"Registered model strategy: {key} -> {strategy_cls.__name__}")
-            return strategy_cls
-
-        return decorator
-
-    def get(self, key: str) -> type:
-        """Get strategy class by key."""
-        if key not in self._strategies:
-            available = list(self._strategies.keys())
-            raise ValueError(f"Model strategy '{key}' not found. Available: {available}")
-        return self._strategies[key]
+def _register_model_handler(key: str, *, scan, load, write, score_bounds) -> None:
+    """Register one model handler bundle."""
+    registry[key] = {
+        "scan": scan,
+        "load": load,
+        "write": write,
+        "score_bounds": score_bounds,
+    }
 
 
-registry = ModelRegistry()
+def register_model_handler(key: str, *, scan, load, write, score_bounds) -> None:
+    """Register one public model handler bundle."""
+    _register_model_handler(key, scan=scan, load=load, write=write, score_bounds=score_bounds)
 
 
-def scan_model(model: GenericModel, sequences: Optional[RaggedData], strand: Optional[StrandMode] = None) -> RaggedData:
-    """Universal scanning function that dispatches to the appropriate strategy."""
-    strategy_cls = registry.get(model.type_key)
+def _get_model_handler(key: str) -> dict:
+    """Return one registered handler bundle."""
+    try:
+        return registry[key]
+    except KeyError as exc:
+        available = ", ".join(sorted(registry))
+        raise ValueError(f"Model strategy '{key}' not found. Available: {available}") from exc
+
+
+def scan_model(model: GenericModel, sequences=None, strand: Optional[StrandMode] = None):
+    """Universal scanning function that dispatches to the appropriate handler."""
+    handler = _get_model_handler(model.type_key)
     strand_mode = strand or model.config.get("strand_mode", "best")
-    return strategy_cls.scan(model, sequences, strand_mode)
+    return handler["scan"](model, sequences, strand_mode)
 
 
 def write_model(model: GenericModel, path: str) -> None:
-    """Universal write function that dispatches to the appropriate strategy."""
-    strategy_cls = registry.get(model.type_key)
+    """Universal write function that dispatches to the appropriate handler."""
+    handler = _get_model_handler(model.type_key)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    strategy_cls.write(model, path)
+    handler["write"](model, path)
 
 
 def read_model(path: str, model_type: str, **kwargs) -> GenericModel:
     """Factory function for creating models from files."""
-    strategy_cls = registry.get(model_type)
-    return strategy_cls.load(path, kwargs)
+    handler = _get_model_handler(model_type)
+    return handler["load"](path, kwargs)
 
 
 def get_score_bounds(model: GenericModel) -> tuple[float, float]:
     """Return theoretical minimum and maximum scores for a model."""
-    strategy_cls = registry.get(model.type_key)
-    if not hasattr(strategy_cls, "score_bounds"):
-        raise NotImplementedError(f"Model strategy '{model.type_key}' does not implement score_bounds")
-    return strategy_cls.score_bounds(model)
+    return _get_model_handler(model.type_key)["score_bounds"](model)
 
 
 def _score_bounds_from_representation(representation: np.ndarray) -> tuple[float, float]:
-    """
-    Compute theoretical score bounds from model tensor representation.
-    """
-
+    """Compute theoretical score bounds from one model tensor."""
     minimum = representation.min(axis=tuple(range(representation.ndim - 1))).sum()
     maximum = representation.max(axis=tuple(range(representation.ndim - 1))).sum()
     return minimum, maximum
 
 
-def _get_float32_representation(model: GenericModel) -> np.ndarray:
-    """Return a cached float32 representation for repeated scans."""
-    representation = np.asarray(model.representation)
-    meta = (id(representation), representation.shape, representation.dtype.str)
-
-    cached_meta = model.config.get("_representation_float32_meta")
-    cached = model.config.get("_representation_float32")
-    if cached_meta == meta and cached is not None:
-        return cached
-
-    converted = np.asarray(representation, dtype=np.float32)
-    model.config["_representation_float32_meta"] = meta
-    model.config["_representation_float32"] = converted
-    return converted
-
-
-def calculate_threshold_table(model: GenericModel, sequences: RaggedData, strand: StrandMode = "best") -> np.ndarray:
+def calculate_threshold_table(model: GenericModel, sequences, strand: StrandMode = "best") -> np.ndarray:
     """Calculate a score-to-log-tail lookup table on explicitly provided sequences."""
-    ragged_scores = scan_model(model, sequences, strand=strand)
-    return build_score_log_tail_table(ragged_scores.data).astype(np.float64, copy=False)
+    scores = scan_model(model, sequences, strand=strand)
+    return build_score_log_tail_table(scores["values"][scores["mask"]]).astype(np.float64, copy=False)
 
 
-def get_frequencies(model: GenericModel, sequences: RaggedData, strand: Optional[StrandMode] = None) -> RaggedData:
+def get_frequencies(model: GenericModel, sequences, strand: Optional[StrandMode] = None):
     """Calculate per-position empirical log-tail values."""
-    scores = scan_model(model, sequences, strand)
-
-    return scores_to_empirical_log_tail(scores)
+    return scores_to_empirical_log_tail(scan_model(model, sequences, strand))
 
 
-def get_scores(model: GenericModel, sequences: RaggedData, strand: Optional[StrandMode] = None) -> RaggedData:
-    """Calculate motif scores for each position using pure functions."""
+def get_scores(model: GenericModel, sequences, strand: Optional[StrandMode] = None):
+    """Calculate motif scores for each position."""
     return scan_model(model, sequences, strand)
 
 
@@ -184,26 +136,21 @@ def _empty_hit_arrays() -> dict[str, np.ndarray]:
     }
 
 
-def _scan_both_strands(model: GenericModel, sequences: RaggedData) -> tuple[RaggedData, RaggedData]:
+def _scan_both_strands(model: GenericModel, sequences):
     """Scan sequences on both strands."""
     return scan_model(model, sequences, strand="+"), scan_model(model, sequences, strand="-")
 
 
-def _collect_best_hits(
-    sequences: RaggedData,
-    s_fwd_ragged: RaggedData,
-    s_rev_ragged: RaggedData,
-) -> dict[str, np.ndarray]:
+def _collect_best_hits(sequences, s_fwd_batch, s_rev_batch) -> dict[str, np.ndarray]:
     """Collect the single best hit per sequence as numeric arrays."""
     seq_indices: list[int] = []
     starts: list[int] = []
     strand_indices: list[int] = []
     scores: list[float] = []
 
-    for seq_idx in range(sequences.num_sequences):
-        s_fwd = s_fwd_ragged.get_slice(seq_idx)
-        s_rev = s_rev_ragged.get_slice(seq_idx)
-
+    for seq_idx in range(len(sequences["lengths"])):
+        s_fwd = row_values(s_fwd_batch, seq_idx)
+        s_rev = row_values(s_rev_batch, seq_idx)
         f_max = s_fwd.max() if s_fwd.size > 0 else -np.inf
         r_max = s_rev.max() if s_rev.size > 0 else -np.inf
 
@@ -231,22 +178,16 @@ def _collect_best_hits(
     }
 
 
-def _collect_threshold_hits(
-    sequences: RaggedData,
-    s_fwd_ragged: RaggedData,
-    s_rev_ragged: RaggedData,
-    score_threshold: float,
-) -> dict[str, np.ndarray]:
+def _collect_threshold_hits(s_fwd_batch, s_rev_batch, score_threshold: float) -> dict[str, np.ndarray]:
     """Collect all hits above threshold as numeric arrays."""
-    del sequences
     seq_indices_parts = []
     start_parts = []
     strand_parts = []
     score_parts = []
 
-    for seq_idx in range(s_fwd_ragged.num_sequences):
-        s_fwd = s_fwd_ragged.get_slice(seq_idx)
-        s_rev = s_rev_ragged.get_slice(seq_idx)
+    for seq_idx in range(len(s_fwd_batch["lengths"])):
+        s_fwd = row_values(s_fwd_batch, seq_idx)
+        s_rev = row_values(s_rev_batch, seq_idx)
 
         f_pos = np.flatnonzero(s_fwd >= score_threshold)
         if f_pos.size > 0:
@@ -273,21 +214,16 @@ def _collect_threshold_hits(
     }
 
 
-def _collect_hits(
-    model: GenericModel,
-    sequences: RaggedData,
-    mode: str,
-    score_threshold: Optional[float],
-) -> dict[str, np.ndarray]:
+def _collect_hits(model: GenericModel, sequences, mode: str, score_threshold: Optional[float]) -> dict[str, np.ndarray]:
     """Collect motif hits as numeric arrays."""
-    s_fwd_ragged, s_rev_ragged = _scan_both_strands(model, sequences)
+    s_fwd_batch, s_rev_batch = _scan_both_strands(model, sequences)
     if mode == "best":
-        return _collect_best_hits(sequences, s_fwd_ragged, s_rev_ragged)
-    return _collect_threshold_hits(sequences, s_fwd_ragged, s_rev_ragged, float(score_threshold))
+        return _collect_best_hits(sequences, s_fwd_batch, s_rev_batch)
+    return _collect_threshold_hits(s_fwd_batch, s_rev_batch, float(score_threshold))
 
 
 def _scores_to_log_tail_array(scores: np.ndarray, threshold_table: np.ndarray) -> np.ndarray:
-    """Convert a score array to log-tail values using an explicit lookup table."""
+    """Convert one score array to log-tail values using an explicit lookup table."""
     if scores.size == 0:
         return np.empty(0, dtype=np.float64)
 
@@ -298,12 +234,7 @@ def _scores_to_log_tail_array(scores: np.ndarray, threshold_table: np.ndarray) -
     return log_tail_col[idx]
 
 
-def _resolve_hit_threshold_table(
-    model: GenericModel,
-    sequences: RaggedData,
-    background_sequences: Optional[RaggedData],
-    threshold_table: Optional[np.ndarray],
-) -> np.ndarray:
+def _resolve_hit_threshold_table(model: GenericModel, sequences, background_sequences, threshold_table) -> np.ndarray:
     """Resolve the explicit log-tail table used for hit extraction and annotation."""
     if threshold_table is not None:
         return np.asarray(threshold_table, dtype=np.float64)
@@ -312,15 +243,9 @@ def _resolve_hit_threshold_table(
     return calculate_threshold_table(model, calibration_sequences, strand="best")
 
 
-def _resolve_hits(
-    model: GenericModel,
-    sequences: RaggedData,
-    selection: HitSelectionConfig,
-    *,
-    include_threshold_table: bool,
-) -> ResolvedHits:
+def _resolve_hits(model: GenericModel, sequences, selection: dict, *, include_threshold_table: bool) -> dict:
     """Resolve hit arrays and optional threshold metadata for one request."""
-    mode = validate_site_mode(selection.mode, selection.fpr_threshold)
+    mode = validate_site_mode(selection.get("mode", "best"), selection.get("fpr_threshold"))
     threshold_table = None
     score_threshold = None
 
@@ -328,32 +253,33 @@ def _resolve_hits(
         threshold_table = _resolve_hit_threshold_table(
             model,
             sequences,
-            selection.background_sequences,
-            selection.threshold_table,
+            selection.get("background_sequences"),
+            selection.get("threshold_table"),
         )
 
     if mode == "threshold":
-        score_threshold = _tail_probability_to_score(float(selection.fpr_threshold), threshold_table)
-        logger = logging.getLogger(__name__)
-        logger.info("FPR threshold: %s -> score threshold: %.4f", selection.fpr_threshold, score_threshold)
+        score_threshold = lookup_score_for_tail_probability(threshold_table, float(selection["fpr_threshold"]))
+        logging.getLogger(__name__).info(
+            "FPR threshold: %s -> score threshold: %.4f", selection["fpr_threshold"], score_threshold
+        )
 
     hit_arrays = _sort_hit_arrays(_collect_hits(model, sequences, mode, score_threshold))
-    return ResolvedHits(hit_arrays=hit_arrays, threshold_table=threshold_table, score_threshold=score_threshold)
+    return {
+        "hit_arrays": hit_arrays,
+        "threshold_table": threshold_table,
+        "score_threshold": score_threshold,
+    }
 
 
 def _extract_site_matrix(
-    sequences: RaggedData,
-    seq_indices: np.ndarray,
-    starts: np.ndarray,
-    motif_length: int,
-    strand_indices: Optional[np.ndarray] = None,
-) -> np.ndarray:
+    sequences, seq_indices: np.ndarray, starts: np.ndarray, motif_length: int, strand_indices=None
+):
     """Extract numeric motif windows for a set of hits."""
     n_hits = seq_indices.size
-    sites = np.empty((n_hits, motif_length), dtype=sequences.data.dtype)
+    sites = np.empty((n_hits, motif_length), dtype=sequences["values"].dtype)
 
     for hit_idx in range(n_hits):
-        seq = sequences.get_slice(int(seq_indices[hit_idx]))
+        seq = row_values(sequences, int(seq_indices[hit_idx]))
         start = int(starts[hit_idx])
         sites[hit_idx] = seq[start : start + motif_length]
 
@@ -390,7 +316,6 @@ def _sort_hit_arrays(hit_arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]
     """Sort hits by sequence index ascending and score descending."""
     if hit_arrays["score"].size == 0:
         return hit_arrays
-
     order = np.lexsort((-hit_arrays["score"], hit_arrays["seq_index"]))
     return {key: values[order] for key, values in hit_arrays.items()}
 
@@ -426,10 +351,7 @@ def _empty_sites_frame() -> pd.DataFrame:
 
 
 def _build_sites_frame(
-    model: GenericModel,
-    sequences: RaggedData,
-    hit_arrays: dict[str, np.ndarray],
-    threshold_table: np.ndarray,
+    model: GenericModel, sequences, hit_arrays: dict[str, np.ndarray], threshold_table: np.ndarray
 ) -> pd.DataFrame:
     """Build the public site table from resolved hits."""
     if hit_arrays["score"].size == 0:
@@ -455,12 +377,7 @@ def _build_sites_frame(
     )
 
 
-def _hits_to_pfm(
-    model: GenericModel,
-    sequences: RaggedData,
-    hit_arrays: dict[str, np.ndarray],
-    pseudocount: float,
-) -> np.ndarray:
+def _hits_to_pfm(model: GenericModel, sequences, hit_arrays: dict[str, np.ndarray], pseudocount: float) -> np.ndarray:
     """Convert a selected hit set to a PFM."""
     if hit_arrays["score"].size == 0:
         raise ValueError("No sites found")
@@ -478,43 +395,41 @@ def _hits_to_pfm(
 
 def get_sites(
     model: GenericModel,
-    sequences: RaggedData,
+    sequences,
     mode: str = "best",
     fpr_threshold: Optional[float] = None,
-    background_sequences: Optional[RaggedData] = None,
+    background_sequences=None,
     threshold_table: Optional[np.ndarray] = None,
 ) -> pd.DataFrame:
     """Find motif binding sites in sequences."""
     resolved = _resolve_hits(
         model,
         sequences,
-        HitSelectionConfig(
-            mode=mode,
-            fpr_threshold=fpr_threshold,
-            background_sequences=background_sequences,
-            threshold_table=threshold_table,
-        ),
+        {
+            "mode": mode,
+            "fpr_threshold": fpr_threshold,
+            "background_sequences": background_sequences,
+            "threshold_table": threshold_table,
+        },
         include_threshold_table=True,
     )
-    df = _build_sites_frame(model, sequences, resolved.hit_arrays, resolved.threshold_table)
-
-    logger = logging.getLogger(__name__)
-    logger.info("Found %s site(s) in %s sequence(s)", len(df), sequences.num_sequences)
+    df = _build_sites_frame(model, sequences, resolved["hit_arrays"], resolved["threshold_table"])
+    logging.getLogger(__name__).info("Found %s site(s) in %s sequence(s)", len(df), len(sequences["lengths"]))
     return df
 
 
 def get_pfm(
     model: GenericModel,
-    sequences: RaggedData,
+    sequences,
     mode: str = "best",
     fpr_threshold: Optional[float] = None,
-    background_sequences: Optional[RaggedData] = None,
+    background_sequences=None,
     threshold_table: Optional[np.ndarray] = None,
     top_fraction: Optional[float] = None,
     pseudocount: float = 0.25,
     force_recompute: bool = False,
 ) -> np.ndarray:
-    """Construct Position Frequency Matrix (PFM) from binding sites."""
+    """Construct a Position Frequency Matrix from binding sites."""
     del force_recompute
 
     logger = logging.getLogger(__name__)
@@ -522,35 +437,24 @@ def get_pfm(
     resolved = _resolve_hits(
         model,
         sequences,
-        HitSelectionConfig(
-            mode=mode,
-            fpr_threshold=fpr_threshold,
-            background_sequences=background_sequences,
-            threshold_table=threshold_table,
-        ),
+        {
+            "mode": mode,
+            "fpr_threshold": fpr_threshold,
+            "background_sequences": background_sequences,
+            "threshold_table": threshold_table,
+        },
         include_threshold_table=mode == "threshold",
     )
-    selected_hits = _select_top_hit_arrays(resolved.hit_arrays, top_fraction)
+    selected_hits = _select_top_hit_arrays(resolved["hit_arrays"], top_fraction)
     if top_fraction is not None:
         logger.info("Selected top %.1f%%: %s sites", top_fraction * 100.0, selected_hits["score"].size)
     return _hits_to_pfm(model, sequences, selected_hits, pseudocount)
 
 
-def _tail_probability_to_score(tail_probability: float, threshold_table: np.ndarray) -> float:
-    """Convert a tail-probability threshold to the corresponding score cutoff."""
-    return lookup_score_for_tail_probability(threshold_table, tail_probability)
-
-
-def _scan_with_batch_kernel(
-    model: GenericModel,
-    sequences: RaggedData,
-    strand: StrandMode,
-    *,
-    with_context: bool = False,
-) -> RaggedData:
-    """Scan a tensor-based motif model with the shared batch scoring kernel."""
-    representation = _get_float32_representation(model)
-    kmer = model.config.get("kmer", 1)
+def _scan_with_batch_kernel(model: GenericModel, sequences, strand: StrandMode, *, with_context: bool = False):
+    """Scan a tensor-based motif model with the shared JAX batch kernel."""
+    representation = np.asarray(model.representation, dtype=np.float32)
+    kmer = int(model.config.get("kmer", 1))
 
     if strand == "+":
         return batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=False, with_context=with_context)
@@ -559,274 +463,184 @@ def _scan_with_batch_kernel(
     if strand == "best":
         sf = batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=False, with_context=with_context)
         sr = batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=True, with_context=with_context)
-        return RaggedData(np.maximum(sf.data, sr.data), sf.offsets)
+        values = np.full(sf["values"].shape, SCORE_PADDING, dtype=np.float32)
+        values[sf["mask"]] = np.maximum(sf["values"][sf["mask"]], sr["values"][sr["mask"]])
+        return pack_batch(values, sf["mask"], sf["lengths"], SCORE_PADDING)
     raise ValueError(f"Invalid strand mode: {strand}")
 
 
-@registry.register("pwm")
-class PwmStrategy:
-    """PWM (Position Weight Matrix) strategy implementation."""
-
-    @staticmethod
-    def scan(model: GenericModel, sequences: RaggedData, strand: StrandMode) -> RaggedData:
-        """Scan sequences with PWM model."""
-        return _scan_with_batch_kernel(model, sequences, strand, with_context=False)
-
-    @staticmethod
-    def write(model: GenericModel, path: str) -> None:
-        """Write PWM model to file."""
-        pfm = model.config.get("_source_pfm")
-        if pfm is None:
-            raise ValueError("PWM serialization requires the source PFM in model.config['_source_pfm'].")
-        write_pfm(np.asarray(pfm, dtype=np.float32), model.name, model.length, path)
-
-    @staticmethod
-    def score_bounds(model: GenericModel) -> tuple[float, float]:
-        """Return theoretical min/max score for PWM model."""
-        return _score_bounds_from_representation(model.representation)
-
-    @staticmethod
-    def load(path: str, kwargs: dict) -> GenericModel:
-        """Load PWM model from file."""
-        _, ext = os.path.splitext(path.lower())
-
-        if ext == ".pkl":
-            model = joblib.load(path)
-            if not isinstance(model, GenericModel):
-                raise TypeError(f"Unsupported PWM pickle payload: expected GenericModel, got {type(model)!r}")
-            if model.config.get("_source_pfm") is None:
-                raise ValueError(
-                    "Unsupported PWM pickle format: source PFM is missing from model.config['_source_pfm']."
-                )
-            return model
-        if ext == ".meme":
-            pfm, info, _ = read_meme(path, index=kwargs.get("index", 0))
-            name, length = info
-        elif ext == ".pfm":
-            pfm, length = read_pfm(path)
-            name = os.path.splitext(os.path.basename(path))[0]
-        else:
-            raise ValueError(f"Unsupported PWM format: {path}")
-
-        pwm = pfm_to_pwm(pfm)
-
-        pwm_ext = np.concatenate((pwm, np.min(pwm, axis=0, keepdims=True)), axis=0).astype(np.float32, copy=False)
-
-        return GenericModel(
-            type_key="pwm",
-            name=name,
-            length=int(length),
-            representation=pwm_ext,
-            config={"kmer": 1, "_source_pfm": pfm},
-        )
+def _score_bounds_from_model(model: GenericModel) -> tuple[float, float]:
+    """Return theoretical min/max score for tensor-based motif models."""
+    return _score_bounds_from_representation(np.asarray(model.representation))
 
 
-@registry.register("sitega")
-class SitegaStrategy:
-    """SiteGA strategy implementation."""
-
-    @staticmethod
-    def scan(model: GenericModel, sequences: RaggedData, strand: StrandMode) -> RaggedData:
-        """Scan sequences with PWM model."""
-        return _scan_with_batch_kernel(model, sequences, strand, with_context=False)
-
-    @staticmethod
-    def write(model: GenericModel, path: str) -> None:
-        """Write SiteGA model to file."""
-        write_sitega(model, path)
-
-    @staticmethod
-    def score_bounds(model: GenericModel) -> tuple[float, float]:
-        """Return theoretical min/max score for SiteGA model."""
-        minimum = model.config.get("minimum")
-        maximum = model.config.get("maximum")
-        if minimum is not None and maximum is not None:
-            return minimum, maximum
-        return _score_bounds_from_representation(model.representation)
-
-    @staticmethod
-    def load(path: str, _kwargs: dict) -> GenericModel:
-        """Load SiteGA model from file."""
-        _, ext = os.path.splitext(path.lower())
-
-        if ext == ".pkl":
-            return joblib.load(path)
-        if ext == ".mat":
-            representation, name, length, minimum, maximum = read_sitega(path)
-        else:
-            raise ValueError(f"Unsupported SiteGA format: {path}")
-
-        return GenericModel(
-            type_key="sitega",
-            name=name,
-            length=int(length),
-            representation=np.asarray(representation, dtype=np.float32),
-            config={"kmer": 2, "minimum": float(minimum), "maximum": float(maximum)},
-        )
+def _scan_pwm(model: GenericModel, sequences, strand: StrandMode):
+    return _scan_with_batch_kernel(model, sequences, strand, with_context=False)
 
 
-@registry.register("bamm")
-class BammStrategy:
-    """BaMM (Bayesian Markov Model) strategy implementation."""
+def _write_pwm(model: GenericModel, path: str) -> None:
+    pfm = model.config.get("_source_pfm")
+    if pfm is None:
+        raise ValueError("PWM serialization requires the source PFM in model.config['_source_pfm'].")
+    write_pfm(np.asarray(pfm, dtype=np.float32), model.name, model.length, path)
 
-    @staticmethod
-    def scan(model: GenericModel, sequences: RaggedData, strand: StrandMode) -> RaggedData:
-        """Scan sequences with BaMM model."""
-        return _scan_with_batch_kernel(model, sequences, strand, with_context=True)
 
-    @staticmethod
-    def write(model: GenericModel, path: str) -> None:
-        """Write BaMM model to file."""
-        joblib.dump(model, path)
+def _load_pwm(path: str, kwargs: dict) -> GenericModel:
+    _, ext = os.path.splitext(path.lower())
 
-    @staticmethod
-    def score_bounds(model: GenericModel) -> tuple[float, float]:
-        """Return theoretical min/max score for BaMM model."""
-        return _score_bounds_from_representation(model.representation)
+    if ext == ".pkl":
+        model = joblib.load(path)
+        if not isinstance(model, GenericModel):
+            raise TypeError(f"Unsupported PWM pickle payload: expected GenericModel, got {type(model)!r}")
+        if model.config.get("_source_pfm") is None:
+            raise ValueError("Unsupported PWM pickle format: source PFM is missing from model.config['_source_pfm'].")
+        return model
 
-    @staticmethod
-    def load(path: str, kwargs: dict) -> GenericModel:
-        """Load BaMM model from file."""
-
-        if not path.endswith(".ihbcp") and not os.path.exists(path):
-            ihbcp_path = f"{path}.ihbcp"
-            if os.path.exists(ihbcp_path):
-                path = ihbcp_path
-            else:
-                raise FileNotFoundError(f"BaMM file not found: {path}")
-
-        _, max_order, _ = parse_file_content(path)
-        target_order = kwargs.get("order")
-        target_order = max_order if target_order is None else int(target_order)
-        target_order = min(target_order, max_order)
-
-        representation = read_bamm(path, target_order)
+    if ext == ".meme":
+        pfm, info, _ = read_meme(path, index=kwargs.get("index", 0))
+        name, length = info
+    elif ext == ".pfm":
+        pfm, length = read_pfm(path)
         name = os.path.splitext(os.path.basename(path))[0]
+    else:
+        raise ValueError(f"Unsupported PWM format: {path}")
 
-        return GenericModel(
-            type_key="bamm",
-            name=name,
-            length=representation.shape[-1],
-            representation=np.asarray(representation, dtype=np.float32),
-            config={"kmer": representation.ndim - 1, "order": target_order},
-        )
+    pwm = pfm_to_pwm(pfm)
+    pwm_ext = np.concatenate((pwm, np.min(pwm, axis=0, keepdims=True)), axis=0).astype(np.float32, copy=False)
+    return GenericModel("pwm", name, pwm_ext, int(length), {"kmer": 1, "_source_pfm": pfm})
 
 
-@registry.register("dimont")
-class DimontStrategy:
-    """Dimont motif model strategy implementation."""
+def _scan_sitega(model: GenericModel, sequences, strand: StrandMode):
+    return _scan_with_batch_kernel(model, sequences, strand, with_context=False)
 
-    @staticmethod
-    def scan(model: GenericModel, sequences: RaggedData, strand: StrandMode) -> RaggedData:
-        """Scan sequences with a Dimont motif model."""
-        return _scan_with_batch_kernel(model, sequences, strand, with_context=model.config.get("kmer", 1) > 1)
 
-    @staticmethod
-    def write(model: GenericModel, path: str) -> None:
-        """Persist Dimont models via pickle serialization."""
-        joblib.dump(model, path)
+def _write_sitega(model: GenericModel, path: str) -> None:
+    write_sitega(model, path)
 
-    @staticmethod
-    def score_bounds(model: GenericModel) -> tuple[float, float]:
-        """Return theoretical min/max score for a Dimont model."""
-        return _score_bounds_from_representation(model.representation)
 
-    @staticmethod
-    def load(path: str, _kwargs: dict) -> GenericModel:
-        """Load a Dimont XML model."""
-        _, ext = os.path.splitext(path.lower())
+def _load_sitega(path: str, _kwargs: dict) -> GenericModel:
+    _, ext = os.path.splitext(path.lower())
+    if ext == ".pkl":
+        return joblib.load(path)
+    if ext != ".mat":
+        raise ValueError(f"Unsupported SiteGA format: {path}")
 
-        if ext == ".pkl":
-            return joblib.load(path)
-        if ext == ".xml":
-            representation, length, span = read_dimont(path)
+    representation, name, length, minimum, maximum = read_sitega(path)
+    return GenericModel(
+        "sitega",
+        name,
+        np.asarray(representation, dtype=np.float32),
+        int(length),
+        {"kmer": 2, "minimum": float(minimum), "maximum": float(maximum)},
+    )
+
+
+def _sitega_score_bounds(model: GenericModel) -> tuple[float, float]:
+    minimum = model.config.get("minimum")
+    maximum = model.config.get("maximum")
+    if minimum is not None and maximum is not None:
+        return float(minimum), float(maximum)
+    return _score_bounds_from_model(model)
+
+
+def _scan_bamm(model: GenericModel, sequences, strand: StrandMode):
+    return _scan_with_batch_kernel(model, sequences, strand, with_context=True)
+
+
+def _load_bamm(path: str, kwargs: dict) -> GenericModel:
+    if not path.endswith(".ihbcp") and not os.path.exists(path):
+        ihbcp_path = f"{path}.ihbcp"
+        if os.path.exists(ihbcp_path):
+            path = ihbcp_path
         else:
-            raise ValueError(f"Unsupported Dimont format: {path}")
+            raise FileNotFoundError(f"BaMM file not found: {path}")
 
-        name = os.path.splitext(os.path.basename(path))[0]
-        return GenericModel(
-            type_key="dimont",
-            name=name,
-            length=length,
-            representation=np.asarray(representation, dtype=np.float32),
-            config={"kmer": span + 1},
-        )
-
-
-@registry.register("slim")
-class SlimStrategy:
-    """Slim motif model strategy implementation."""
-
-    @staticmethod
-    def scan(model: GenericModel, sequences: RaggedData, strand: StrandMode) -> RaggedData:
-        """Scan sequences with a Slim motif model."""
-        return _scan_with_batch_kernel(model, sequences, strand, with_context=model.config.get("kmer", 1) > 1)
-
-    @staticmethod
-    def write(model: GenericModel, path: str) -> None:
-        """Persist Slim models via pickle serialization."""
-        joblib.dump(model, path)
-
-    @staticmethod
-    def score_bounds(model: GenericModel) -> tuple[float, float]:
-        """Return theoretical min/max score for a Slim model."""
-        return _score_bounds_from_representation(model.representation)
-
-    @staticmethod
-    def load(path: str, _kwargs: dict) -> GenericModel:
-        """Load a Slim XML model."""
-        _, ext = os.path.splitext(path.lower())
-
-        if ext == ".pkl":
-            return joblib.load(path)
-        if ext == ".xml":
-            representation, length, span = read_slim(path)
-        else:
-            raise ValueError(f"Unsupported Slim format: {path}")
-
-        name = os.path.splitext(os.path.basename(path))[0]
-        return GenericModel(
-            type_key="slim",
-            name=name,
-            length=length,
-            representation=np.asarray(representation, dtype=np.float32),
-            config={"kmer": span + 1},
-        )
+    _, max_order, _ = parse_file_content(path)
+    target_order = kwargs.get("order")
+    target_order = max_order if target_order is None else min(int(target_order), max_order)
+    representation = read_bamm(path, target_order)
+    name = os.path.splitext(os.path.basename(path))[0]
+    return GenericModel(
+        "bamm",
+        name,
+        np.asarray(representation, dtype=np.float32),
+        representation.shape[-1],
+        {"kmer": representation.ndim - 1, "order": target_order},
+    )
 
 
-@registry.register("scores")
-class ScoresStrategy:
-    """Numerical score-profile strategy implementation."""
+def _dump_model(model: GenericModel, path: str) -> None:
+    joblib.dump(model, path)
 
-    @staticmethod
-    def scan(model: GenericModel, _sequences: Optional[RaggedData] = None, _strand: StrandMode = "best") -> RaggedData:
-        """Return stored score profiles directly."""
-        return model.config["scores_data"]
 
-    @staticmethod
-    def write(model: GenericModel, path: str) -> None:
-        """Score profiles are not writable through model serialization."""
-        raise NotImplementedError("Score profiles cannot be written to files")
+def _scan_dimont(model: GenericModel, sequences, strand: StrandMode):
+    return _scan_with_batch_kernel(model, sequences, strand, with_context=int(model.config.get("kmer", 1)) > 1)
 
-    @staticmethod
-    def score_bounds(model: GenericModel) -> tuple[float, float]:
-        """Return score bounds for numerical score profiles."""
-        scores_data = model.config["scores_data"]
-        if scores_data.data.size == 0:
-            return 0.0, 0.0
-        return float(np.min(scores_data.data)), float(np.max(scores_data.data))
 
-    @staticmethod
-    def load(path: str, _kwargs: dict) -> GenericModel:
-        """Load numerical score profiles from a FASTA-like text file."""
+def _load_dimont(path: str, _kwargs: dict) -> GenericModel:
+    _, ext = os.path.splitext(path.lower())
+    if ext == ".pkl":
+        return joblib.load(path)
+    if ext != ".xml":
+        raise ValueError(f"Unsupported Dimont format: {path}")
 
-        scores_data = read_scores(path)
-        name = os.path.splitext(os.path.basename(path))[0]
+    representation, length, span = read_dimont(path)
+    name = os.path.splitext(os.path.basename(path))[0]
+    return GenericModel("dimont", name, np.asarray(representation, dtype=np.float32), length, {"kmer": span + 1})
 
-        return GenericModel(
-            type_key="scores",
-            name=name,
-            length=0,
-            representation=None,
-            config={"scores_data": scores_data},
-        )
+
+def _scan_slim(model: GenericModel, sequences, strand: StrandMode):
+    return _scan_with_batch_kernel(model, sequences, strand, with_context=int(model.config.get("kmer", 1)) > 1)
+
+
+def _load_slim(path: str, _kwargs: dict) -> GenericModel:
+    _, ext = os.path.splitext(path.lower())
+    if ext == ".pkl":
+        return joblib.load(path)
+    if ext != ".xml":
+        raise ValueError(f"Unsupported Slim format: {path}")
+
+    representation, length, span = read_slim(path)
+    name = os.path.splitext(os.path.basename(path))[0]
+    return GenericModel("slim", name, np.asarray(representation, dtype=np.float32), length, {"kmer": span + 1})
+
+
+def _scan_scores(model: GenericModel, _sequences=None, _strand: StrandMode = "best"):
+    return model.config["scores_data"]
+
+
+def _write_scores(_model: GenericModel, _path: str) -> None:
+    raise NotImplementedError("Score profiles cannot be written to files")
+
+
+def _scores_score_bounds(model: GenericModel) -> tuple[float, float]:
+    values = model.config["scores_data"]["values"]
+    mask = model.config["scores_data"]["mask"]
+    if not np.any(mask):
+        return 0.0, 0.0
+    valid = values[mask]
+    return float(np.min(valid)), float(np.max(valid))
+
+
+def _load_scores(path: str, _kwargs: dict) -> GenericModel:
+    scores_data = read_scores(path)
+    name = os.path.splitext(os.path.basename(path))[0]
+    return GenericModel("scores", name, None, 0, {"scores_data": scores_data})
+
+
+_register_model_handler("pwm", scan=_scan_pwm, load=_load_pwm, write=_write_pwm, score_bounds=_score_bounds_from_model)
+_register_model_handler(
+    "sitega", scan=_scan_sitega, load=_load_sitega, write=_write_sitega, score_bounds=_sitega_score_bounds
+)
+_register_model_handler(
+    "bamm", scan=_scan_bamm, load=_load_bamm, write=_dump_model, score_bounds=_score_bounds_from_model
+)
+_register_model_handler(
+    "dimont", scan=_scan_dimont, load=_load_dimont, write=_dump_model, score_bounds=_score_bounds_from_model
+)
+_register_model_handler(
+    "slim", scan=_scan_slim, load=_load_slim, write=_dump_model, score_bounds=_score_bounds_from_model
+)
+_register_model_handler(
+    "scores", scan=_scan_scores, load=_load_scores, write=_write_scores, score_bounds=_scores_score_bounds
+)

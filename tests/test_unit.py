@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from mimosa.api import compare_motifs, create_config, run_comparison
+from mimosa.batches import flatten_valid, make_score_batch, make_sequence_batch, row_values
 from mimosa.cache import clear_cache
 from mimosa.comparison import (
     create_comparator_config,
@@ -26,10 +27,9 @@ from mimosa.comparison import (
 )
 from mimosa.comparison import registry as comparison_registry
 from mimosa.functions import (
-    ProfileScoreOptions,
     apply_score_log_tail_table,
     batch_all_scores,
-    build_profile_support,
+    build_profile_score_options,
     build_score_log_tail_table,
     cut_prc,
     cut_roc,
@@ -55,7 +55,6 @@ from mimosa.models import (
     write_model,
 )
 from mimosa.models import registry as model_registry
-from mimosa.ragged import RaggedData, ragged_from_list
 
 FIXTURES_ROOT = Path(__file__).resolve().parent / "fixtures" / "models"
 EXAMPLES_ROOT = Path(__file__).resolve().parents[1] / "examples"
@@ -73,6 +72,12 @@ def _encode_sequence(sequence: str) -> np.ndarray:
 def _reverse_complement_encoded(sequence: np.ndarray) -> np.ndarray:
     """Return the reverse complement in the project's integer alphabet."""
     return _RC_TABLE[sequence[::-1]]
+
+
+def _score_batch_from_flat(data: np.ndarray, offsets: np.ndarray):
+    """Build one score batch from flattened values and ragged offsets."""
+    rows = [np.asarray(data[offsets[index] : offsets[index + 1]]) for index in range(len(offsets) - 1)]
+    return make_score_batch(rows)
 
 
 def _xml_numeric_value_reference(elem: ET.Element | None) -> float | None:
@@ -427,19 +432,16 @@ def test_standardized_pauc_basic():
 
 
 def test_scores_to_empirical_log_tail_basic():
-    """Empirical score normalization should preserve ragged layout."""
-    # Create a simple RaggedData with some scores
+    """Empirical score normalization should preserve dense masked layout."""
     data = np.array([1.0, 2.0, 1.0, 3.0, 2.0], dtype=np.float32)
-    offsets = np.array([0, 2, 4, 5], dtype=np.int64)  # Two sequences of lengths 2, 2, 1
-    ragged_scores = RaggedData(data, offsets)
+    offsets = np.array([0, 2, 4, 5], dtype=np.int64)
+    score_batch = _score_batch_from_flat(data, offsets)
 
-    transformed = scores_to_empirical_log_tail(ragged_scores)
+    transformed = scores_to_empirical_log_tail(score_batch)
 
-    # Verify the output is a RaggedData
-    assert isinstance(transformed, RaggedData)
-    # Verify shape consistency
-    assert transformed.data.shape == ragged_scores.data.shape
-    assert transformed.offsets.shape == ragged_scores.offsets.shape
+    assert transformed["values"].shape == score_batch["values"].shape
+    assert transformed["mask"].shape == score_batch["mask"].shape
+    np.testing.assert_array_equal(transformed["lengths"], score_batch["lengths"])
 
 
 def test_read_scores_basic(tmp_path):
@@ -449,9 +451,9 @@ def test_read_scores_basic(tmp_path):
 
     result = read_scores(path)
 
-    assert result.num_sequences == 2
-    np.testing.assert_allclose(result.get_slice(0), np.array([0.1, 0.2, 0.3], dtype=np.float32))
-    np.testing.assert_allclose(result.get_slice(1), np.array([1.0, 2.0], dtype=np.float32))
+    assert len(result["lengths"]) == 2
+    np.testing.assert_allclose(row_values(result, 0), np.array([0.1, 0.2, 0.3], dtype=np.float32))
+    np.testing.assert_allclose(row_values(result, 1), np.array([1.0, 2.0], dtype=np.float32))
 
 
 def test_format_params_basic():
@@ -495,8 +497,8 @@ def test_model_registry():
 def test_read_model_supports_dimont_xml_and_matches_example_score():
     """Dimont XML models should load and reproduce exact uniform-background log-odds site scores."""
     model = read_model(str(FIXTURES_ROOT / "dimont" / "exampleD-model-1.xml"), "dimont")
-    plus_sequence = ragged_from_list([_encode_sequence("TTCCAGGGAACCC")], dtype=np.int8)
-    minus_sequence = ragged_from_list([_encode_sequence("GGGTTCCCTGGAA")], dtype=np.int8)
+    plus_sequence = make_sequence_batch([_encode_sequence("TTCCAGGGAACCC")])
+    minus_sequence = make_sequence_batch([_encode_sequence("GGGTTCCCTGGAA")])
 
     plus_scores = scan_model(model, plus_sequence, "+")
     minus_scores = scan_model(model, minus_sequence, "-")
@@ -505,16 +507,16 @@ def test_read_model_supports_dimont_xml_and_matches_example_score():
     assert model.length == 13
     assert model.config["kmer"] == 1
     assert model.representation.shape == (5, 13)
-    assert plus_scores.get_slice(0)[0] == pytest.approx(6.65103275172514)
-    assert minus_scores.get_slice(0)[0] == pytest.approx(6.65103275172514)
+    assert row_values(plus_scores, 0)[0] == pytest.approx(6.65103275172514)
+    assert row_values(minus_scores, 0)[0] == pytest.approx(6.65103275172514)
 
 
 def test_read_model_supports_higher_order_dimont_xml():
     """Higher-order Dimont XML models should scan via the shared context kernel in log-odds space."""
     path = FIXTURES_ROOT / "dimont" / "stat_dimont-model-1.xml"
     model = read_model(str(path), "dimont")
-    plus_sequence = ragged_from_list([_encode_sequence("AACCC")], dtype=np.int8)
-    minus_sequence = ragged_from_list([_encode_sequence("GGGTT")], dtype=np.int8)
+    plus_sequence = make_sequence_batch([_encode_sequence("AACCC")])
+    minus_sequence = make_sequence_batch([_encode_sequence("GGGTT")])
 
     plus_scores = scan_model(model, plus_sequence, "+")
     minus_scores = scan_model(model, minus_sequence, "-")
@@ -523,15 +525,17 @@ def test_read_model_supports_higher_order_dimont_xml():
     assert model.length == 5
     assert model.config["kmer"] == 4
     assert model.representation.shape == (5, 5, 5, 5, 5)
-    assert plus_scores.get_slice(0)[0] == pytest.approx(_reference_dimont_site_score(path, _encode_sequence("AACCC")))
-    assert minus_scores.get_slice(0)[0] == pytest.approx(_reference_dimont_site_score(path, _encode_sequence("AACCC")))
+    assert row_values(plus_scores, 0)[0] == pytest.approx(_reference_dimont_site_score(path, _encode_sequence("AACCC")))
+    assert row_values(minus_scores, 0)[0] == pytest.approx(
+        _reference_dimont_site_score(path, _encode_sequence("AACCC"))
+    )
 
 
 def test_read_model_supports_slim_xml_and_matches_example_score():
     """Slim XML models should reproduce the exact uniform-background log-odds site scores."""
     model = read_model(str(FIXTURES_ROOT / "slim" / "example-model-1.xml"), "slim")
-    plus_sequence = ragged_from_list([_encode_sequence("TTCCTCGGAACTGAG")], dtype=np.int8)
-    minus_sequence = ragged_from_list([_encode_sequence("CTCAGTTCCGAGGAA")], dtype=np.int8)
+    plus_sequence = make_sequence_batch([_encode_sequence("TTCCTCGGAACTGAG")])
+    minus_sequence = make_sequence_batch([_encode_sequence("CTCAGTTCCGAGGAA")])
 
     plus_scores = scan_model(model, plus_sequence, "+")
     minus_scores = scan_model(model, minus_sequence, "-")
@@ -540,8 +544,8 @@ def test_read_model_supports_slim_xml_and_matches_example_score():
     assert model.length == 15
     assert model.config["kmer"] == 6
     assert model.representation.shape == (5, 5, 5, 5, 5, 5, 15)
-    assert plus_scores.get_slice(0)[0] == pytest.approx(6.243921739188615, abs=2e-5)
-    assert minus_scores.get_slice(0)[0] == pytest.approx(6.243921739188615, abs=2e-5)
+    assert row_values(plus_scores, 0)[0] == pytest.approx(6.243921739188615, abs=2e-5)
+    assert row_values(minus_scores, 0)[0] == pytest.approx(6.243921739188615, abs=2e-5)
 
 
 @pytest.mark.parametrize("path", sorted((FIXTURES_ROOT / "dimont").glob("*.xml")), ids=lambda path: path.name)
@@ -552,10 +556,10 @@ def test_dimont_fixture_site_scores_match_java_reference(path: Path):
 
     for _ in range(20):
         sequence = rng.integers(0, 4, size=model.length, dtype=np.int8)
-        site = ragged_from_list([sequence], dtype=np.int8)
+        site = make_sequence_batch([sequence])
 
-        plus_score = float(scan_model(model, site, "+").get_slice(0)[0])
-        minus_score = float(scan_model(model, site, "-").get_slice(0)[0])
+        plus_score = float(row_values(scan_model(model, site, "+"), 0)[0])
+        minus_score = float(row_values(scan_model(model, site, "-"), 0)[0])
 
         expected_plus = _reference_dimont_site_score(path, sequence)
         expected_minus = _reference_dimont_site_score(path, _reverse_complement_encoded(sequence))
@@ -572,10 +576,10 @@ def test_slim_fixture_site_scores_match_java_reference(path: Path):
 
     for _ in range(20):
         sequence = rng.integers(0, 4, size=model.length, dtype=np.int8)
-        site = ragged_from_list([sequence], dtype=np.int8)
+        site = make_sequence_batch([sequence])
 
-        plus_score = float(scan_model(model, site, "+").get_slice(0)[0])
-        minus_score = float(scan_model(model, site, "-").get_slice(0)[0])
+        plus_score = float(row_values(scan_model(model, site, "+"), 0)[0])
+        minus_score = float(row_values(scan_model(model, site, "-"), 0)[0])
 
         expected_plus = _reference_slim_site_score(path, sequence)
         expected_minus = _reference_slim_site_score(path, _reverse_complement_encoded(sequence))
@@ -621,18 +625,18 @@ def test_create_comparator_config():
     """Test ComparatorConfig creation and factory function"""
     # Test factory function with defaults
     config = create_comparator_config()
-    assert config.metric == "pcc"
-    assert config.n_permutations == 0
-    assert config.seed is None
-    assert config.pfm_top_fraction == pytest.approx(0.05)
-    assert config.profile_normalization == "empirical_log_tail"
+    assert config["metric"] == "pcc"
+    assert config["n_permutations"] == 0
+    assert config["seed"] is None
+    assert config["pfm_top_fraction"] == pytest.approx(0.05)
+    assert config["profile_normalization"] == "empirical_log_tail"
 
     # Test factory function with custom parameters
     config = create_comparator_config(metric="co", n_permutations=100, seed=42, pfm_top_fraction=0.2)
-    assert config.metric == "co"
-    assert config.n_permutations == 100
-    assert config.seed == 42
-    assert config.pfm_top_fraction == pytest.approx(0.2)
+    assert config["metric"] == "co"
+    assert config["n_permutations"] == 100
+    assert config["seed"] == 42
+    assert config["pfm_top_fraction"] == pytest.approx(0.2)
 
 
 def test_create_comparator_config_validates_kernel_range():
@@ -644,8 +648,8 @@ def test_create_comparator_config_validates_kernel_range():
         create_comparator_config(min_kernel_size=4, max_kernel_size=4)
 
     config = create_comparator_config(min_kernel_size=4, max_kernel_size=6)
-    assert config.min_kernel_size == 4
-    assert config.max_kernel_size == 6
+    assert config["min_kernel_size"] == 4
+    assert config["max_kernel_size"] == 6
 
 
 def test_create_comparator_config_validates_min_logfpr():
@@ -667,7 +671,7 @@ def test_create_comparator_config_validates_cache_mode():
         create_comparator_config(cache_mode="targets")
 
     config = create_comparator_config(cache_mode="on")
-    assert config.cache_mode == "on"
+    assert config["cache_mode"] == "on"
 
 
 def test_create_comparator_config_validates_profile_normalization():
@@ -676,7 +680,7 @@ def test_create_comparator_config_validates_profile_normalization():
         create_comparator_config(profile_normalization="zscore")
 
     config = create_comparator_config(profile_normalization="empirical_log_tail")
-    assert config.profile_normalization == "empirical_log_tail"
+    assert config["profile_normalization"] == "empirical_log_tail"
 
 
 def test_comparison_registry():
@@ -712,18 +716,16 @@ def test_scan_model_with_pwm():
     model = GenericModel(type_key="pwm", name="test_pwm", representation=representation, length=3, config={"kmer": 1})
 
     # Create test sequences
-    sequences = ragged_from_list(
+    sequences = make_sequence_batch(
         [
             np.array([0, 1, 2, 3, 2, 1, 0], dtype=np.int8),  # A,C,G,T,C,G,A
             np.array([1, 2, 3, 0], dtype=np.int8),  # C,G,T,A
-        ],
-        dtype=np.int8,
+        ]
     )
 
     # Test scanning
     scores = scan_model(model, sequences, "+")
-    assert isinstance(scores, RaggedData)
-    assert scores.data.size > 0
+    assert flatten_valid(scores).size > 0
 
 
 def test_get_frequencies():
@@ -732,17 +734,15 @@ def test_get_frequencies():
 
     model = GenericModel("pwm", "test", representation, 2, {"kmer": 1})
 
-    sequences = ragged_from_list(
+    sequences = make_sequence_batch(
         [
             np.array([0, 1, 2, 3], dtype=np.int8),
             np.array([1, 2, 3, 0], dtype=np.int8),
-        ],
-        dtype=np.int8,
+        ]
     )
 
     frequencies = get_frequencies(model, sequences, "+")
-    assert isinstance(frequencies, RaggedData)
-    assert frequencies.data.size > 0
+    assert flatten_valid(frequencies).size > 0
 
 
 def test_calculate_threshold_table_does_not_mutate_model_config():
@@ -758,12 +758,11 @@ def test_calculate_threshold_table_does_not_mutate_model_config():
         dtype=np.float32,
     )
     model = GenericModel(type_key="pwm", name="test_pwm", representation=representation, length=2, config={"kmer": 1})
-    sequences = ragged_from_list(
+    sequences = make_sequence_batch(
         [
             np.array([0, 1, 0, 1, 0, 1], dtype=np.int8),
             np.array([1, 0, 1, 0, 1, 0], dtype=np.int8),
-        ],
-        dtype=np.int8,
+        ]
     )
 
     table = calculate_threshold_table(model, sequences, strand="best")
@@ -793,13 +792,12 @@ def test_get_pfm_reconstructs_pwm_from_sites_with_single_pseudocount():
         length=2,
         config={"kmer": 1, "_source_pfm": source_pfm},
     )
-    sequences = ragged_from_list(
+    sequences = make_sequence_batch(
         [
             _encode_sequence("AC"),
             _encode_sequence("AC"),
             _encode_sequence("AT"),
-        ],
-        dtype=np.int8,
+        ]
     )
 
     pfm = get_pfm(model, sequences, pseudocount=0.25)
@@ -870,13 +868,11 @@ def test_get_sites_threshold_uses_current_sequences_by_default():
         length=2,
         config={"kmer": 1},
     )
-    sequences = ragged_from_list(
-        [_encode_sequence("AC"), _encode_sequence("AC"), _encode_sequence("AT"), _encode_sequence("TG")],
-        dtype=np.int8,
+    sequences = make_sequence_batch(
+        [_encode_sequence("AC"), _encode_sequence("AC"), _encode_sequence("AT"), _encode_sequence("TG")]
     )
-    background = ragged_from_list(
-        [_encode_sequence("AC"), _encode_sequence("AT"), _encode_sequence("TG"), _encode_sequence("TG")],
-        dtype=np.int8,
+    background = make_sequence_batch(
+        [_encode_sequence("AC"), _encode_sequence("AT"), _encode_sequence("TG"), _encode_sequence("TG")]
     )
 
     default_sites = get_sites(model, sequences, mode="threshold", fpr_threshold=0.5)
@@ -905,13 +901,11 @@ def test_get_pfm_threshold_accepts_external_background_sequences():
         length=2,
         config={"kmer": 1},
     )
-    sequences = ragged_from_list(
-        [_encode_sequence("AC"), _encode_sequence("AC"), _encode_sequence("AT"), _encode_sequence("TG")],
-        dtype=np.int8,
+    sequences = make_sequence_batch(
+        [_encode_sequence("AC"), _encode_sequence("AC"), _encode_sequence("AT"), _encode_sequence("TG")]
     )
-    background = ragged_from_list(
-        [_encode_sequence("AC"), _encode_sequence("AT"), _encode_sequence("TG"), _encode_sequence("TG")],
-        dtype=np.int8,
+    background = make_sequence_batch(
+        [_encode_sequence("AC"), _encode_sequence("AT"), _encode_sequence("TG"), _encode_sequence("TG")]
     )
 
     default_pfm = get_pfm(model, sequences, mode="threshold", fpr_threshold=0.5, pseudocount=0.25)
@@ -944,7 +938,7 @@ def test_get_sites_best_skips_sequences_shorter_than_motif():
         dtype=np.float32,
     )
     model = GenericModel(type_key="pwm", name="short_test", representation=representation, length=4, config={"kmer": 1})
-    sequences = ragged_from_list([_encode_sequence("ACG")], dtype=np.int8)
+    sequences = make_sequence_batch([_encode_sequence("ACG")])
 
     result = get_sites(model, sequences, mode="best")
 
@@ -952,15 +946,23 @@ def test_get_sites_best_skips_sequences_shorter_than_motif():
 
 
 def test_batch_all_scores_with_simple_data():
-    """Test batch_all_scores with simple RaggedData"""
-    # Create proper RaggedData for testing
+    """Test batch_all_scores with a simple dense masked batch."""
     data = np.array([0, 1, 2, 3, 0, 1], dtype=np.int8)
-    offsets = np.array([0, 3, 6], dtype=np.int64)
-    sequences = RaggedData(data, offsets)
-    representation = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    sequences = make_sequence_batch([data[:3], data[3:]])
+    representation = np.array(
+        [
+            [1.0, 2.0],
+            [3.0, 4.0],
+            [5.0, 6.0],
+            [7.0, 8.0],
+            [0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
 
     result = batch_all_scores(sequences, representation, kmer=1, is_revcomp=False)
-    assert hasattr(result, "data") and hasattr(result, "offsets")
+    assert result["values"].shape == (2, 2)
+    np.testing.assert_array_equal(result["lengths"], np.array([2, 2], dtype=np.int64))
 
 
 def _manual_reverse_scores(seq: np.ndarray, matrix: np.ndarray, kmer: int, with_context: bool) -> np.ndarray:
@@ -989,7 +991,7 @@ def _manual_reverse_scores(seq: np.ndarray, matrix: np.ndarray, kmer: int, with_
 def test_batch_all_scores_reverse_complement_preserves_positions():
     """Reverse-complement PWM scan should remain aligned to forward coordinates."""
     seq = np.array([0, 1, 2, 3, 0, 1], dtype=np.int8)
-    sequences = ragged_from_list([seq], dtype=np.int8)
+    sequences = make_sequence_batch([seq])
     representation = np.array(
         [
             [1.0, 0.1, 0.3],
@@ -1004,19 +1006,19 @@ def test_batch_all_scores_reverse_complement_preserves_positions():
     result = batch_all_scores(sequences, representation, kmer=1, is_revcomp=True)
     expected = _manual_reverse_scores(seq, representation, kmer=1, with_context=False)
 
-    np.testing.assert_allclose(result.get_slice(0), expected)
+    np.testing.assert_allclose(row_values(result, 0), expected)
 
 
 def test_batch_all_scores_reverse_complement_with_context_preserves_positions():
     """Reverse-complement BaMM scan should keep the same coordinate convention."""
     seq = np.array([0, 1, 2, 3, 0, 1], dtype=np.int8)
-    sequences = ragged_from_list([seq], dtype=np.int8)
+    sequences = make_sequence_batch([seq])
     representation = np.arange(25 * 3, dtype=np.float32).reshape(25, 3) / 10.0
 
     result = batch_all_scores(sequences, representation, kmer=2, is_revcomp=True, with_context=True)
     expected = _manual_reverse_scores(seq, representation, kmer=2, with_context=True)
 
-    np.testing.assert_allclose(result.get_slice(0), expected)
+    np.testing.assert_allclose(row_values(result, 0), expected)
 
 
 @pytest.mark.parametrize(
@@ -1033,9 +1035,9 @@ def test_profile_pairwise_threshold_mask_keeps_real_values(metric, expected):
     offsets = np.array([0, 1], dtype=np.int64)
 
     score, offset = fast_profile_score(
-        (data1, offsets),
-        (data2, offsets),
-        ProfileScoreOptions(search_range=0, min_value=1.0, metric=metric),
+        _score_batch_from_flat(data1, offsets),
+        _score_batch_from_flat(data2, offsets),
+        build_profile_score_options(search_range=0, min_value=1.0, metric=metric),
     )
 
     assert score == pytest.approx(expected)
@@ -1048,13 +1050,17 @@ def test_fast_profile_score_rejects_unknown_metric():
     offsets = np.array([0, 1], dtype=np.int64)
 
     with pytest.raises(ValueError, match="'co', 'dice'"):
-        fast_profile_score((data, offsets), (data, offsets), ProfileScoreOptions(search_range=0, metric="corr"))
+        fast_profile_score(
+            _score_batch_from_flat(data, offsets),
+            _score_batch_from_flat(data, offsets),
+            build_profile_score_options(search_range=0, metric="corr"),
+        )
 
 
 @pytest.mark.parametrize("metric", ["co", "dice"])
 @pytest.mark.parametrize("min_value", [0.0, 1.0])
 def test_fast_profile_score_matches_reference_for_ragged_inputs(metric, min_value):
-    """Optimized profile scorer should match the dense reference on ragged inputs."""
+    """Optimized profile scorer should match the dense reference on masked batches."""
     rng = np.random.default_rng(42)
     lengths = np.array([2, 5, 7, 4], dtype=np.int64)
     offsets = np.zeros(lengths.size + 1, dtype=np.int64)
@@ -1063,9 +1069,9 @@ def test_fast_profile_score_matches_reference_for_ragged_inputs(metric, min_valu
     data2 = rng.gamma(shape=1.7, scale=0.9, size=int(offsets[-1])).astype(np.float32)
 
     score, offset = fast_profile_score(
-        (data1, offsets),
-        (data2, offsets),
-        ProfileScoreOptions(search_range=3, min_value=min_value, metric=metric),
+        _score_batch_from_flat(data1, offsets),
+        _score_batch_from_flat(data2, offsets),
+        build_profile_score_options(search_range=3, min_value=min_value, metric=metric),
     )
     expected_score, expected_offset = _reference_fast_profile_score(
         data1, offsets, data2, offsets, 3, min_value=min_value, metric=metric
@@ -1085,9 +1091,9 @@ def test_fast_profile_score_normalizes_non_contiguous_inputs(metric):
     offsets = np.array([0, 2, 4], dtype=np.int32)
 
     score, offset = fast_profile_score(
-        (data1, offsets),
-        (data2, offsets),
-        ProfileScoreOptions(search_range=1, min_value=0.5, metric=metric),
+        _score_batch_from_flat(data1, offsets),
+        _score_batch_from_flat(data2, offsets),
+        build_profile_score_options(search_range=1, min_value=0.5, metric=metric),
     )
     expected_score, expected_offset = _reference_fast_profile_score(
         np.ascontiguousarray(data1, dtype=np.float32),
@@ -1104,19 +1110,16 @@ def test_fast_profile_score_normalizes_non_contiguous_inputs(metric):
 
 
 @pytest.mark.parametrize("metric", ["co", "dice"])
-def test_fast_profile_score_accepts_precomputed_sparse_support(metric):
-    """Profile scorer should accept externally prepared sparse support."""
+def test_fast_profile_score_thresholded_mask_matches_reference(metric):
+    """Profile scorer should match the reference under explicit threshold masking."""
     data1 = np.array([0.2, 1.3, 0.4, 1.1, 0.1, 0.9], dtype=np.float32)
     data2 = np.array([0.3, 0.7, 1.4, 0.2, 1.2, 0.1], dtype=np.float32)
     offsets = np.array([0, 3, 6], dtype=np.int64)
-    support1 = build_profile_support(data1, offsets, 1.0)
-    support2 = build_profile_support(data2, offsets, 1.0)
 
     score, offset = fast_profile_score(
-        (data1, offsets),
-        (data2, offsets),
-        ProfileScoreOptions(search_range=1, min_value=1.0, metric=metric),
-        supports=(support1, support2),
+        _score_batch_from_flat(data1, offsets),
+        _score_batch_from_flat(data2, offsets),
+        build_profile_score_options(search_range=1, min_value=1.0, metric=metric),
     )
     expected_score, expected_offset = _reference_fast_profile_score(
         data1, offsets, data2, offsets, 1, min_value=1.0, metric=metric
@@ -1136,11 +1139,11 @@ def test_strategy_functions_exist():
 
 def test_strategy_profile_uses_target_relative_offset_convention():
     """Profile strategy should report target-relative offsets with the same sign in both directions."""
-    scores_1 = RaggedData(
+    scores_1 = _score_batch_from_flat(
         np.array([0.0, 1.0, 4.0, 2.0, 0.0, 0.0, 0.0], dtype=np.float32),
         np.array([0, 7], dtype=np.int64),
     )
-    scores_2 = RaggedData(
+    scores_2 = _score_batch_from_flat(
         np.array([0.0, 0.0, 0.0, 1.0, 4.0, 2.0, 0.0], dtype=np.float32),
         np.array([0, 7], dtype=np.int64),
     )
@@ -1169,13 +1172,15 @@ def test_strategy_profile_empirical_uses_combined_strand_table():
         seq[30 : 30 + encoded_site.size] = encoded_site
         sequences.append(seq)
 
-    ragged_sequences = ragged_from_list(sequences, dtype=np.int8)
+    ragged_sequences = make_sequence_batch(sequences)
     dimont = read_model(str(FIXTURES_ROOT / "dimont" / "PEAKS036274_FOXA1_P35582_MACS2-model-1.xml"), "dimont")
     cfg = create_comparator_config(metric="co", n_permutations=0)
 
     plus_scores = scan_model(dimont, ragged_sequences, "+")
     minus_scores = scan_model(dimont, ragged_sequences, "-")
-    combined_table = build_score_log_tail_table(np.concatenate((plus_scores.data, minus_scores.data)))
+    combined_table = build_score_log_tail_table(
+        np.concatenate((flatten_valid(plus_scores), flatten_valid(minus_scores)))
+    )
 
     expected_plus = apply_score_log_tail_table(plus_scores, combined_table)
     expected_minus = apply_score_log_tail_table(minus_scores, combined_table)
@@ -1184,11 +1189,11 @@ def test_strategy_profile_empirical_uses_combined_strand_table():
     resolved_plus = resolve_profile_signal(dimont, ragged_sequences, ragged_sequences, cfg, "+")
     resolved_minus = resolve_profile_signal(dimont, ragged_sequences, ragged_sequences, cfg, "-")
 
-    np.testing.assert_allclose(resolved_plus.data, expected_plus.data, atol=1e-6)
-    np.testing.assert_allclose(resolved_minus.data, expected_minus.data, atol=1e-6)
+    np.testing.assert_allclose(flatten_valid(resolved_plus), flatten_valid(expected_plus), atol=1e-6)
+    np.testing.assert_allclose(flatten_valid(resolved_minus), flatten_valid(expected_minus), atol=1e-6)
 
-    plus_slice = resolved_plus.get_slice(0)
-    minus_slice = resolved_minus.get_slice(0)
+    plus_slice = row_values(resolved_plus, 0)
+    minus_slice = row_values(resolved_minus, 0)
     assert plus_slice[30] > minus_slice[29]
 
 
@@ -1205,20 +1210,20 @@ def test_strategy_profile_uses_promoters_for_empirical_calibration():
         dtype=np.float32,
     )
     model = GenericModel(type_key="pwm", name="m1", representation=representation, length=2, config={"kmer": 1})
-    sequences = ragged_from_list([_encode_sequence("ACACAC"), _encode_sequence("CAAAAA")], dtype=np.int8)
-    promoters = ragged_from_list([_encode_sequence("AAAAAA"), _encode_sequence("CCCCCC")], dtype=np.int8)
+    sequences = make_sequence_batch([_encode_sequence("ACACAC"), _encode_sequence("CAAAAA")])
+    promoters = make_sequence_batch([_encode_sequence("AAAAAA"), _encode_sequence("CCCCCC")])
     cfg = create_comparator_config(metric="co", promoters=promoters, n_permutations=0)
 
     plus_scores = scan_model(model, sequences, "+")
     promoter_plus = scan_model(model, promoters, "+")
     promoter_minus = scan_model(model, promoters, "-")
-    table = build_score_log_tail_table(np.concatenate((promoter_plus.data, promoter_minus.data)))
+    table = build_score_log_tail_table(np.concatenate((flatten_valid(promoter_plus), flatten_valid(promoter_minus))))
     expected_plus = apply_score_log_tail_table(plus_scores, table)
 
     resolve_profile_signal = strategy_profile.__globals__["_resolve_profile_signal"]
     resolved_plus = resolve_profile_signal(model, sequences, promoters, cfg, "+")
 
-    np.testing.assert_allclose(resolved_plus.data, expected_plus.data, atol=1e-6)
+    np.testing.assert_allclose(flatten_valid(resolved_plus), flatten_valid(expected_plus), atol=1e-6)
 
 
 def test_strategy_motif_handles_reverse_complement_for_higher_order_tensors():
@@ -1244,10 +1249,7 @@ def test_strategy_motif_handles_reverse_complement_for_higher_order_tensors():
 def test_foxa1_cross_type_motif_comparison_recovers_dimont_and_slim_similarity():
     """FOXA1 higher-order models should stay aligned with PWM/BaMM after PFM reconstruction."""
     rng = np.random.default_rng(1)
-    sequences = ragged_from_list(
-        [rng.integers(0, 4, size=40, dtype=np.int8) for _ in range(2000)],
-        dtype=np.int8,
-    )
+    sequences = make_sequence_batch([rng.integers(0, 4, size=40, dtype=np.int8) for _ in range(2000)])
 
     pwm = read_model(str(FIXTURES_ROOT / "pwm" / "PEAKS036274_FOXA1_P35582_MACS2.meme"), "pwm")
     bamm = read_model(str(FIXTURES_ROOT / "bamm" / "PEAKS036274_FOXA1_P35582_MACS2_motif_1.ihbcp"), "bamm", order=2)
@@ -1290,7 +1292,7 @@ def test_strategy_profile_co_uses_sparse_signal_on_foxa1_dimont_pwm_sites():
         seq[30 : 30 + encoded_site.size] = encoded_site
         sequences.append(seq)
 
-    ragged_sequences = ragged_from_list(sequences, dtype=np.int8)
+    ragged_sequences = make_sequence_batch(sequences)
     pwm = read_model(str(FIXTURES_ROOT / "pwm" / "PEAKS036274_FOXA1_P35582_MACS2.meme"), "pwm")
     dimont = read_model(str(FIXTURES_ROOT / "dimont" / "PEAKS036274_FOXA1_P35582_MACS2-model-1.xml"), "dimont")
 
@@ -1314,7 +1316,7 @@ def test_strategy_profile_is_symmetric_when_models_peak_on_different_strands():
         seq[30 : 30 + encoded_site.size] = encoded_site
         sequences.append(seq)
 
-    ragged_sequences = ragged_from_list(sequences, dtype=np.int8)
+    ragged_sequences = make_sequence_batch(sequences)
     pwm = read_model(str(FIXTURES_ROOT / "pwm" / "PEAKS036274_FOXA1_P35582_MACS2.meme"), "pwm")
     dimont = read_model(str(FIXTURES_ROOT / "dimont" / "PEAKS036274_FOXA1_P35582_MACS2-model-1.xml"), "dimont")
     cfg = create_comparator_config(metric="co", n_permutations=0)
@@ -1344,12 +1346,11 @@ def test_strategy_profile_uses_disk_cache_for_target_and_query(tmp_path, monkeyp
         )
         return GenericModel(type_key="pwm", name=name, representation=representation, length=3, config={"kmer": 1})
 
-    sequences = ragged_from_list(
+    sequences = make_sequence_batch(
         [
             np.array([0, 1, 2, 3, 0, 1, 2], dtype=np.int8),
             np.array([1, 2, 3, 0, 1, 2, 3], dtype=np.int8),
-        ],
-        dtype=np.int8,
+        ]
     )
     query = make_model("query")
     target = make_model("target")
@@ -1390,7 +1391,7 @@ def test_clear_cache_removes_cached_profiles(tmp_path):
         ],
         dtype=np.float32,
     )
-    sequences = ragged_from_list([np.array([0, 1, 2, 3, 0, 1, 2], dtype=np.int8)], dtype=np.int8)
+    sequences = make_sequence_batch([np.array([0, 1, 2, 3, 0, 1, 2], dtype=np.int8)])
     query = GenericModel(type_key="pwm", name="query", representation=representation, length=3, config={"kmer": 1})
     target = GenericModel(type_key="pwm", name="target", representation=representation, length=3, config={"kmer": 1})
     cfg = create_comparator_config(metric="co", cache_mode="on", cache_dir=str(tmp_path), n_permutations=0)
@@ -1416,10 +1417,10 @@ def test_create_config_builds_unified_config():
         seed=99,
     )
 
-    assert config.strategy == "profile"
-    assert config.comparator.metric == "co"
-    assert config.comparator.n_permutations == 10
-    assert config.seed == 99
+    assert config["strategy"] == "profile"
+    assert config["comparator"]["metric"] == "co"
+    assert config["comparator"]["n_permutations"] == 10
+    assert config["seed"] == 99
 
 
 def test_run_comparison_with_unified_config_and_models():
@@ -1436,12 +1437,11 @@ def test_run_comparison_with_unified_config_and_models():
     )
     model1 = GenericModel(type_key="pwm", name="m1", representation=representation, length=3, config={"kmer": 1})
     model2 = GenericModel(type_key="pwm", name="m2", representation=representation, length=3, config={"kmer": 1})
-    sequences = ragged_from_list(
+    sequences = make_sequence_batch(
         [
             np.array([0, 1, 2, 3, 2, 1, 0], dtype=np.int8),
             np.array([1, 2, 3, 0, 1, 2], dtype=np.int8),
-        ],
-        dtype=np.int8,
+        ]
     )
 
     config = create_config(
@@ -1475,7 +1475,7 @@ def test_run_comparison_rejects_removed_profile_metrics(metric):
     )
     model1 = GenericModel(type_key="pwm", name="m1", representation=representation, length=3, config={"kmer": 1})
     model2 = GenericModel(type_key="pwm", name="m2", representation=representation, length=3, config={"kmer": 1})
-    sequences = ragged_from_list([np.array([0, 1, 2, 3, 2, 1, 0], dtype=np.int8)], dtype=np.int8)
+    sequences = make_sequence_batch([np.array([0, 1, 2, 3, 2, 1, 0], dtype=np.int8)])
 
     config = create_config(
         model1=model1,
@@ -1493,9 +1493,9 @@ def test_run_comparison_rejects_removed_profile_metrics(metric):
 
 def test_strategy_profile_accepts_promoters_configuration():
     """Profile strategy should accept external promoter calibration sequences."""
-    scores_1 = RaggedData(np.array([0.1, 0.2, 0.3], dtype=np.float32), np.array([0, 3], dtype=np.int64))
-    scores_2 = RaggedData(np.array([0.2, 0.3, 0.4], dtype=np.float32), np.array([0, 3], dtype=np.int64))
-    promoters = ragged_from_list([np.array([0, 1, 2, 3, 0, 1], dtype=np.int8)], dtype=np.int8)
+    scores_1 = _score_batch_from_flat(np.array([0.1, 0.2, 0.3], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    scores_2 = _score_batch_from_flat(np.array([0.2, 0.3, 0.4], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    promoters = make_sequence_batch([np.array([0, 1, 2, 3, 0, 1], dtype=np.int8)])
     model1 = GenericModel(type_key="scores", name="s1", representation=None, length=0, config={"scores_data": scores_1})
     model2 = GenericModel(type_key="scores", name="s2", representation=None, length=0, config={"scores_data": scores_2})
     cfg = create_comparator_config(metric="co", promoters=promoters)
@@ -1508,8 +1508,8 @@ def test_strategy_profile_accepts_promoters_configuration():
 
 def test_strategy_profile_co_has_no_default_floor():
     """CO should not apply an implicit logFPR floor when min_logfpr is omitted."""
-    scores_1 = RaggedData(np.array([0.2, 0.2, 0.1], dtype=np.float32), np.array([0, 3], dtype=np.int64))
-    scores_2 = RaggedData(np.array([0.2, 0.2, 0.1], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    scores_1 = _score_batch_from_flat(np.array([0.2, 0.2, 0.1], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    scores_2 = _score_batch_from_flat(np.array([0.2, 0.2, 0.1], dtype=np.float32), np.array([0, 3], dtype=np.int64))
     model1 = GenericModel(type_key="scores", name="s1", representation=None, length=0, config={"scores_data": scores_1})
     model2 = GenericModel(type_key="scores", name="s2", representation=None, length=0, config={"scores_data": scores_2})
 
@@ -1521,8 +1521,8 @@ def test_strategy_profile_co_has_no_default_floor():
 @pytest.mark.parametrize("metric", ["co", "dice"])
 def test_strategy_profile_handles_all_positions_masked_by_threshold(metric):
     """Pairwise threshold masking should not crash when every aligned pair is filtered out."""
-    scores_1 = RaggedData(np.array([0.1, 0.2, 0.3], dtype=np.float32), np.array([0, 3], dtype=np.int64))
-    scores_2 = RaggedData(np.array([0.1, 0.2, 0.4], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    scores_1 = _score_batch_from_flat(np.array([0.1, 0.2, 0.3], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    scores_2 = _score_batch_from_flat(np.array([0.1, 0.2, 0.4], dtype=np.float32), np.array([0, 3], dtype=np.int64))
     model1 = GenericModel(type_key="scores", name="s1", representation=None, length=0, config={"scores_data": scores_1})
     model2 = GenericModel(type_key="scores", name="s2", representation=None, length=0, config={"scores_data": scores_2})
     cfg = create_comparator_config(metric=metric, min_logfpr=10.0, n_permutations=0)
@@ -1536,8 +1536,8 @@ def test_strategy_profile_handles_all_positions_masked_by_threshold(metric):
 
 def test_run_comparison_supports_dice_for_profile():
     """Unified API should expose the Dice profile metric."""
-    scores_1 = RaggedData(np.array([0.1, 0.5, 1.0], dtype=np.float32), np.array([0, 3], dtype=np.int64))
-    scores_2 = RaggedData(np.array([0.1, 0.5, 0.9], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    scores_1 = _score_batch_from_flat(np.array([0.1, 0.5, 1.0], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    scores_2 = _score_batch_from_flat(np.array([0.1, 0.5, 0.9], dtype=np.float32), np.array([0, 3], dtype=np.int64))
     model1 = GenericModel(type_key="scores", name="s1", representation=None, length=0, config={"scores_data": scores_1})
     model2 = GenericModel(type_key="scores", name="s2", representation=None, length=0, config={"scores_data": scores_2})
 
@@ -1562,7 +1562,7 @@ def test_compare_motifs_shortcut_works_with_single_import_api():
     )
     model1 = GenericModel(type_key="pwm", name="m1", representation=representation, length=3, config={"kmer": 1})
     model2 = GenericModel(type_key="pwm", name="m2", representation=representation, length=3, config={"kmer": 1})
-    sequences = ragged_from_list([np.array([0, 1, 2, 3, 2, 1, 0], dtype=np.int8)], dtype=np.int8)
+    sequences = make_sequence_batch([np.array([0, 1, 2, 3, 2, 1, 0], dtype=np.int8)])
 
     result = compare_motifs(
         model1=model1,

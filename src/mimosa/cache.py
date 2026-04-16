@@ -6,32 +6,18 @@ import hashlib
 import os
 import shutil
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
+from mimosa.batches import SCORE_PADDING, pack_batch
 from mimosa.models import GenericModel
-from mimosa.ragged import RaggedData
 
-CACHE_VERSION = "v2"
-
-
-@dataclass(frozen=True)
-class ProfileCacheSpec:
-    """Address of one cached profile artifact."""
-
-    model: GenericModel
-    sequences: Optional[RaggedData]
-    promoters: Optional[RaggedData]
-    strand: str
-    profile_kind: str
-    cache_dir: str
+CACHE_VERSION = "v3"
 
 
 def _hash_array(array: np.ndarray) -> bytes:
-    """Hash array shape, dtype, and raw bytes deterministically."""
+    """Hash one array shape, dtype, and raw bytes deterministically."""
     contiguous = np.ascontiguousarray(array)
     shape = np.asarray(contiguous.shape, dtype=np.int64)
 
@@ -42,98 +28,49 @@ def _hash_array(array: np.ndarray) -> bytes:
     return hasher.digest()
 
 
-def fingerprint_ragged(ragged: Optional[RaggedData]) -> Optional[str]:
-    """Return a stable content fingerprint for a RaggedData object."""
-    if ragged is None:
+def fingerprint_batch(batch) -> str | None:
+    """Return a stable content fingerprint for one dense masked batch."""
+    if batch is None:
         return None
 
-    meta = (
-        id(ragged.data),
-        id(ragged.offsets),
-        ragged.data.shape,
-        ragged.offsets.shape,
-        ragged.data.dtype.str,
-        ragged.offsets.dtype.str,
-    )
-    cached_meta = getattr(ragged, "_cache_fingerprint_meta", None)
-    cached_value = getattr(ragged, "_cache_fingerprint", None)
-    if cached_meta == meta and cached_value is not None:
-        return cached_value
-
     hasher = hashlib.blake2b(digest_size=16)
-    hasher.update(_hash_array(ragged.data))
-    hasher.update(_hash_array(ragged.offsets))
-    fingerprint = hasher.hexdigest()
-
-    ragged._cache_fingerprint_meta = meta
-    ragged._cache_fingerprint = fingerprint
-    return fingerprint
+    hasher.update(_hash_array(np.asarray(batch["values"])))
+    hasher.update(_hash_array(np.asarray(batch["mask"], dtype=np.uint8)))
+    hasher.update(_hash_array(np.asarray(batch["lengths"], dtype=np.int64)))
+    return hasher.hexdigest()
 
 
 def fingerprint_model(model: GenericModel) -> str:
     """Return a stable fingerprint for the effective model representation."""
-    if model.type_key == "scores":
-        scores_data = model.config["scores_data"]
-        meta = ("scores", id(scores_data.data), id(scores_data.offsets), model.name, model.length)
-        cached_meta = model.config.get("_cache_model_fingerprint_meta")
-        cached_value = model.config.get("_cache_model_fingerprint")
-        if cached_meta == meta and cached_value is not None:
-            return cached_value
-
-        hasher = hashlib.blake2b(digest_size=16)
-        hasher.update(model.type_key.encode("ascii"))
-        hasher.update(model.name.encode("utf-8"))
-        hasher.update(str(model.length).encode("ascii"))
-        ragged_fp = fingerprint_ragged(scores_data)
-        if ragged_fp is not None:
-            hasher.update(ragged_fp.encode("ascii"))
-        fingerprint = hasher.hexdigest()
-
-        model.config["_cache_model_fingerprint_meta"] = meta
-        model.config["_cache_model_fingerprint"] = fingerprint
-        return fingerprint
-
-    representation = np.asarray(model.representation)
-    meta = (
-        id(representation),
-        representation.shape,
-        representation.dtype.str,
-        model.type_key,
-        model.name,
-        model.length,
-        model.config.get("kmer"),
-    )
-    cached_meta = model.config.get("_cache_model_fingerprint_meta")
-    cached_value = model.config.get("_cache_model_fingerprint")
-    if cached_meta == meta and cached_value is not None:
-        return cached_value
-
     hasher = hashlib.blake2b(digest_size=16)
     hasher.update(model.type_key.encode("ascii"))
     hasher.update(model.name.encode("utf-8"))
     hasher.update(str(model.length).encode("ascii"))
     hasher.update(str(model.config.get("kmer")).encode("ascii"))
-    hasher.update(_hash_array(representation))
-    fingerprint = hasher.hexdigest()
 
-    model.config["_cache_model_fingerprint_meta"] = meta
-    model.config["_cache_model_fingerprint"] = fingerprint
-    return fingerprint
+    if model.type_key == "scores":
+        batch_fp = fingerprint_batch(model.config["scores_data"])
+        if batch_fp is not None:
+            hasher.update(batch_fp.encode("ascii"))
+        return hasher.hexdigest()
 
-
-def _profile_cache_path(spec: ProfileCacheSpec) -> Path:
-    """Build the file path for a cached profile artifact."""
-    model_fp = fingerprint_model(spec.model)
-    seq_fp = fingerprint_ragged(spec.sequences) or "no-sequences"
-    base = Path(spec.cache_dir) / CACHE_VERSION / "profiles" / spec.profile_kind / seq_fp
-    prom_fp = fingerprint_ragged(spec.promoters)
-    if prom_fp is not None:
-        base = base / prom_fp
-    return base / f"{model_fp}.{spec.strand}.npz"
+    hasher.update(_hash_array(np.asarray(model.representation)))
+    return hasher.hexdigest()
 
 
-def load_profile_cache(spec: ProfileCacheSpec) -> Optional[RaggedData]:
-    """Load a cached profile if it is present and readable."""
+def _profile_cache_path(spec: dict) -> Path:
+    """Build the file path for one cached profile artifact."""
+    model_fp = fingerprint_model(spec["model"])
+    sequence_fp = fingerprint_batch(spec.get("sequences")) or "no-sequences"
+    base = Path(spec["cache_dir"]) / CACHE_VERSION / "profiles" / spec["profile_kind"] / sequence_fp
+    promoter_fp = fingerprint_batch(spec.get("promoters"))
+    if promoter_fp is not None:
+        base = base / promoter_fp
+    return base / f"{model_fp}.{spec['strand']}.npz"
+
+
+def load_profile_cache(spec: dict):
+    """Load one cached profile if it is present and readable."""
     path = _profile_cache_path(spec)
     if not path.exists():
         return None
@@ -143,17 +80,18 @@ def load_profile_cache(spec: ProfileCacheSpec) -> Optional[RaggedData]:
             version = str(payload["version"])
             if version != CACHE_VERSION:
                 return None
-            data = payload["data"].astype(np.float32, copy=False)
-            offsets = payload["offsets"].astype(np.int64, copy=False)
+            values = payload["values"].astype(np.float32, copy=False)
+            mask = payload["mask"].astype(bool, copy=False)
+            lengths = payload["lengths"].astype(np.int64, copy=False)
     except (OSError, ValueError, KeyError):
         path.unlink(missing_ok=True)
         return None
 
-    return RaggedData(data=data, offsets=offsets)
+    return pack_batch(values, mask, lengths, SCORE_PADDING)
 
 
-def store_profile_cache(spec: ProfileCacheSpec, profile: RaggedData) -> Path:
-    """Store a derived profile atomically on disk."""
+def store_profile_cache(spec: dict, profile) -> Path:
+    """Store one derived profile atomically on disk."""
     path = _profile_cache_path(spec)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -164,8 +102,9 @@ def store_profile_cache(spec: ProfileCacheSpec, profile: RaggedData) -> Path:
             np.savez(
                 handle,
                 version=np.array(CACHE_VERSION),
-                data=profile.data.astype(np.float32, copy=False),
-                offsets=profile.offsets.astype(np.int64, copy=False),
+                values=np.asarray(profile["values"], dtype=np.float32),
+                mask=np.asarray(profile["mask"], dtype=bool),
+                lengths=np.asarray(profile["lengths"], dtype=np.int64),
             )
         os.replace(tmp_path, path)
     finally:

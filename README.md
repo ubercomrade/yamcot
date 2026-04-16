@@ -165,10 +165,10 @@ uv pip install -e . --no-build-isolation
 When installing via `pip`, the following dependencies are resolved automatically:
 
 * `numpy` (>= 2.0, < 2.4)
-* `numba` (>= 0.62.0)
 * `scipy` (>= 1.14.1)
 * `pandas` (>= 2.2.3)
 * `joblib` (>= 1.5.3)
+* `jax` (>= 0.6.2)
 
 ### Build Requirements (Source only)
 
@@ -331,36 +331,33 @@ MIMOSA exposes a functional API. The core building blocks are:
 
 ### Implementing a Custom Model Type
 
-Custom models are added through the model strategy registry (`mimosa.models.registry`), not by subclassing a base model class.
+Custom models are added through a functional handler registry.
 
 ```python
 import os
 import joblib
 import numpy as np
 
-from mimosa.models import GenericModel
-from mimosa.models import registry as model_registry
-from mimosa.ragged import RaggedData, ragged_from_list
+from mimosa.batches import SCORE_PADDING, make_score_batch, row_values
+from mimosa.models import GenericModel, register_model_handler
 
 
-def scan_dinuc_scores(sequences: RaggedData, matrix: np.ndarray, strand: str) -> RaggedData:
-    """Scan sequences with a dinucleotide matrix of shape (16, motif_length-1)."""
+def scan_dinuc_scores(sequences, matrix: np.ndarray, strand: str):
     motif_len = matrix.shape[1] + 1
     rc_table = np.array([3, 2, 1, 0, 4], dtype=np.int8)
-    result = []
+    rows = []
 
-    for i in range(sequences.num_sequences):
-        seq = sequences.get_slice(i)
+    for row_index in range(len(sequences["lengths"])):
+        seq = row_values(sequences, row_index)
         if strand == "-":
             seq = rc_table[seq[::-1]]
 
         if len(seq) < motif_len:
-            result.append(np.array([], dtype=np.float32))
+            rows.append(np.array([], dtype=np.float32))
             continue
 
         n_pos = len(seq) - motif_len + 1
-        scores = np.zeros(n_pos, dtype=np.float32)
-
+        scores = np.full(n_pos, SCORE_PADDING, dtype=np.float32)
         for pos in range(n_pos):
             window = seq[pos : pos + motif_len]
             score = 0.0
@@ -368,94 +365,67 @@ def scan_dinuc_scores(sequences: RaggedData, matrix: np.ndarray, strand: str) ->
                 a = int(window[k])
                 b = int(window[k + 1])
                 if a < 4 and b < 4:
-                    dinuc_idx = a * 4 + b
-                    score += matrix[dinuc_idx, k]
+                    score += matrix[a * 4 + b, k]
             scores[pos] = score
+        rows.append(scores)
 
-        result.append(scores)
-
-    return ragged_from_list(result, dtype=np.float32)
+    return make_score_batch(rows)
 
 
-@model_registry.register("dinuc")
-class DinucStrategy:
-    """Example custom strategy for a dinucleotide model."""
+def scan_dinuc(model: GenericModel, sequences, strand: str):
+    representation = model.representation.astype(np.float32)
+    if strand == "+":
+        return scan_dinuc_scores(sequences, representation, "+")
+    if strand == "-":
+        return scan_dinuc_scores(sequences, representation, "-")
+    if strand == "best":
+        plus = scan_dinuc_scores(sequences, representation, "+")
+        minus = scan_dinuc_scores(sequences, representation, "-")
+        values = np.full(plus["values"].shape, SCORE_PADDING, dtype=np.float32)
+        values[plus["mask"]] = np.maximum(plus["values"][plus["mask"]], minus["values"][minus["mask"]])
+        return {
+            "values": values,
+            "mask": plus["mask"],
+            "lengths": plus["lengths"],
+            "padding_value": SCORE_PADDING,
+        }
+    raise ValueError(f"Invalid strand mode: {strand}")
 
-    @staticmethod
-    def scan(model: GenericModel, sequences: RaggedData, strand: str) -> RaggedData:
-        representation = model.representation.astype(np.float32)
-        if strand == "+":
-            return scan_dinuc_scores(sequences, representation, "+")
-        if strand == "-":
-            return scan_dinuc_scores(sequences, representation, "-")
-        if strand == "best":
-            sf = scan_dinuc_scores(sequences, representation, "+")
-            sr = scan_dinuc_scores(sequences, representation, "-")
-            return RaggedData(np.maximum(sf.data, sr.data), sf.offsets)
-        raise ValueError(f"Invalid strand mode: {strand}")
 
-    @staticmethod
-    def write(model: GenericModel, path: str) -> None:
-        joblib.dump(model, path)
+def load_dinuc(path: str, kwargs: dict) -> GenericModel:
+    if path.endswith(".pkl"):
+        return joblib.load(path)
+    matrix = np.load(path)
+    name = kwargs.get("name", os.path.splitext(os.path.basename(path))[0])
+    length = int(matrix.shape[-1] + 1)
+    return GenericModel("dinuc", name, matrix.astype(np.float32), length, {"kmer": 2})
 
-    @staticmethod
-    def score_bounds(model: GenericModel) -> tuple[float, float]:
-        # Approximation: valid for many practical cases, but not a strict bound
-        # for all dependency-aware models.
-        rep = model.representation
-        min_score = rep.min(axis=0).sum()
-        max_score = rep.max(axis=0).sum()
-        return float(min_score), float(max_score)
 
-    @staticmethod
-    def load(path: str, kwargs: dict) -> GenericModel:
-        if path.endswith(".pkl"):
-            return joblib.load(path)
-        matrix = np.load(path)  # expected shape: (16, motif_length-1)
-        name = kwargs.get("name", os.path.splitext(os.path.basename(path))[0])
-        length = int(matrix.shape[-1] + 1)
-        return GenericModel(
-            type_key="dinuc",
-            name=name,
-            length=length,
-            representation=matrix.astype(np.float32),
-            config={"kmer": 2},
-        )
-```
+def write_dinuc(model: GenericModel, path: str) -> None:
+    joblib.dump(model, path)
 
-Important: this module must be imported before calling `read_model(..., "dinuc")`
-or any comparison that relies on this model type. Registration happens at import time.
 
-```python
-from mimosa import compare_motifs
-from mimosa.io import read_fasta
-from mimosa.models import read_model
+def bounds_dinuc(model: GenericModel) -> tuple[float, float]:
+    rep = model.representation
+    return float(rep.min(axis=0).sum()), float(rep.max(axis=0).sum())
 
-# Ensure DinucStrategy registration code above has already run in this process.
-model1 = read_model("my_custom.npy", "dinuc")
-model2 = read_model("examples/pif4.meme", "pwm")
-sequences = read_fasta("examples/foreground.fa")
 
-result = compare_motifs(
-    model1=model1,
-    model2=model2,
-    strategy="profile",
-    sequences=sequences,
-    profile_normalization="empirical_log_tail",
-    metric="co",
-    n_permutations=100,
-    seed=42,
+register_model_handler(
+    "dinuc",
+    scan=scan_dinuc,
+    load=load_dinuc,
+    write=write_dinuc,
+    score_bounds=bounds_dinuc,
 )
-print(result)
 ```
 
 ### Strategy Contract
 
-A model strategy registered in `mimosa.models.registry` must provide:
+A model handler registered through `register_model_handler(...)` must provide:
 
-| Method | Description |
+| Function | Description |
 | :--- | :--- |
-| `scan(model, sequences, strand)` | Required. Returns `RaggedData` with positional scores. |
+| `scan(model, sequences, strand)` | Required. Returns a dense masked score batch. |
 | `write(model, path)` | Required. Serializes model data. |
 | `score_bounds(model)` | Required for threshold table generation. |
 | `load(path, kwargs)` | Required. Builds and returns a `GenericModel`. |

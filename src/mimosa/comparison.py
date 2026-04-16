@@ -1,50 +1,28 @@
-"""
-Functional Comparison Module
-============================
-
-This module provides a functional programming approach to motif comparison,
-replacing class hierarchies with pure functions and registry-based polymorphism.
-
-Key Features:
-- Immutable configuration using frozen dataclasses
-- Registry-based strategy pattern using decorators
-- Pure functions for all comparison operations
-- Elimination of code duplication between different comparator types
-"""
+"""Functional motif comparison workflows."""
 
 from __future__ import annotations
 
 import logging
 import os
 import tempfile
-from dataclasses import dataclass, replace
-from dataclasses import field as dc_field
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Callable
 
 import numpy as np
 from joblib import Parallel, delayed
 from scipy.ndimage import convolve1d
 
-from mimosa.cache import ProfileCacheSpec, fingerprint_ragged, load_profile_cache, store_profile_cache
+from mimosa.batches import SCORE_PADDING, batch_with_values, flatten_valid
+from mimosa.cache import fingerprint_batch, load_profile_cache, store_profile_cache
 from mimosa.execute import run_motali
 from mimosa.functions import (
-    ProfileScoreOptions,
     apply_score_log_tail_table,
-    build_profile_support,
+    build_profile_score_options,
     build_score_log_tail_table,
     fast_profile_score,
     scores_to_empirical_log_tail,
 )
 from mimosa.io import write_dist, write_fasta
-from mimosa.models import (
-    GenericModel,
-    calculate_threshold_table,
-    get_pfm,
-    get_score_bounds,
-    scan_model,
-    write_model,
-)
-from mimosa.ragged import RaggedData
+from mimosa.models import GenericModel, calculate_threshold_table, get_pfm, get_score_bounds, scan_model, write_model
 from mimosa.validation import (
     validate_cache_mode,
     validate_kernel_size_range,
@@ -62,96 +40,29 @@ SIMILARITY_EPS = 1e-9
 SURROGATE_SMOOTH_FILTER = np.array([0.25, 0.5, 0.25], dtype=np.float32)
 SURROGATE_SIGN_FLIP_PROBABILITY = 0.5
 
-
-@dataclass(frozen=True)
-class ProfileNormalizationStrategy:
-    """One profile-normalization strategy.
-
-    The strategy owns three pieces of behavior:
-    - fitting normalization parameters from a calibration score sample
-    - applying those fitted parameters to raw scores
-    - re-normalizing surrogate profiles used in Monte Carlo nulls
-    """
-
-    fit: Callable[[np.ndarray], Any]
-    apply: Callable[[RaggedData, Any], RaggedData]
-    normalize_surrogate: Callable[[RaggedData], RaggedData]
-
-
 PROFILE_NORMALIZATION_REGISTRY = {
-    "empirical_log_tail": ProfileNormalizationStrategy(
-        fit=build_score_log_tail_table,
-        apply=apply_score_log_tail_table,
-        normalize_surrogate=scores_to_empirical_log_tail,
-    ),
+    "empirical_log_tail": {
+        "fit": build_score_log_tail_table,
+        "apply": apply_score_log_tail_table,
+        "normalize_surrogate": scores_to_empirical_log_tail,
+    },
 }
 
-
-@dataclass(frozen=True)
-class ComparatorConfig:
-    """Immutable configuration for comparison strategies.
-
-    This dataclass enforces dependency injection by requiring all
-    parameters to be explicitly passed. The frozen=True makes it
-    hashable and thread-safe.
-    """
-
-    metric: str
-    n_permutations: int = 0
-    seed: Optional[int] = None
-    n_jobs: int = -1
-
-    permute_rows: bool = False
-    pfm_mode: bool = False
-    pfm_top_fraction: Optional[float] = 0.05
-
-    distortion_level: float = 0.4
-    search_range: int = 10
-    min_kernel_size: int = 3
-    max_kernel_size: int = 11
-    min_logfpr: Optional[float] = None
-    profile_normalization: str = "empirical_log_tail"
-
-    motali_err: float = 0.002
-    motali_shift: int = 50
-    tmp_directory: str = "."
-    fasta_path: Optional[str] = None
-    cache_mode: str = "off"
-    cache_dir: str = ".mimosa-cache"
-    promoters: Optional[RaggedData] = dc_field(default=None, compare=False, hash=False, repr=False)
+registry: dict[str, Callable] = {}
 
 
-@dataclass(frozen=True)
-class ProfileResolutionSpec:
-    """Inputs required to resolve one normalized profile signal."""
+def _register_comparison_strategy(name: str):
+    """Register one comparison strategy."""
 
-    model: GenericModel
-    sequences: Optional[RaggedData]
-    calibration_sequences: Optional[RaggedData]
-    strand: str
+    def decorator(fn):
+        registry[name] = fn
+        return fn
 
-
-@dataclass(frozen=True)
-class StrandProfileBundle:
-    """Resolved profile signals and optional sparse supports for both strands."""
-
-    plus: RaggedData
-    minus: RaggedData
-    plus_support: Optional[tuple[np.ndarray, np.ndarray]]
-    minus_support: Optional[tuple[np.ndarray, np.ndarray]]
+    return decorator
 
 
-@dataclass(frozen=True)
-class PreparedMotif:
-    """Forward and reverse-complement views of one comparison matrix."""
-
-    forward: np.ndarray
-    reverse: np.ndarray
-
-
-def create_comparator_config(**kwargs) -> ComparatorConfig:
-    """Factory function for creating ComparatorConfig."""
-
+def create_comparator_config(**kwargs) -> dict:
+    """Build one validated comparison options dictionary."""
     defaults = {
         "metric": "pcc",
         "n_permutations": 0,
@@ -169,51 +80,38 @@ def create_comparator_config(**kwargs) -> ComparatorConfig:
         "motali_err": 0.002,
         "motali_shift": 50,
         "tmp_directory": ".",
+        "fasta_path": None,
         "cache_mode": "off",
         "cache_dir": ".mimosa-cache",
+        "promoters": None,
     }
-
-    config_params = {**defaults, **kwargs}
-
-    min_kernel_size, max_kernel_size = validate_kernel_size_range(
-        config_params["min_kernel_size"],
-        config_params["max_kernel_size"],
-    )
-    config_params["min_kernel_size"] = min_kernel_size
-    config_params["max_kernel_size"] = max_kernel_size
-    config_params["min_logfpr"] = validate_non_negative("min_logfpr", config_params.get("min_logfpr"))
-    config_params["profile_normalization"] = validate_profile_normalization(
-        config_params.get("profile_normalization", "empirical_log_tail"),
+    config = {**defaults, **kwargs}
+    min_kernel_size, max_kernel_size = validate_kernel_size_range(config["min_kernel_size"], config["max_kernel_size"])
+    config["min_kernel_size"] = min_kernel_size
+    config["max_kernel_size"] = max_kernel_size
+    config["min_logfpr"] = validate_non_negative("min_logfpr", config.get("min_logfpr"))
+    config["profile_normalization"] = validate_profile_normalization(
+        config.get("profile_normalization", "empirical_log_tail"),
         PROFILE_NORMALIZATION_REGISTRY,
     )
-    config_params["pfm_top_fraction"] = validate_pfm_top_fraction(config_params.get("pfm_top_fraction"))
-    config_params["cache_mode"] = validate_cache_mode(config_params.get("cache_mode", "off"))
-
-    return ComparatorConfig(**config_params)
+    config["pfm_top_fraction"] = validate_pfm_top_fraction(config.get("pfm_top_fraction"))
+    config["cache_mode"] = validate_cache_mode(config.get("cache_mode", "off"))
+    return config
 
 
 def _select_best_orientation(candidates):
-    """Choose the highest-scoring orientation with deterministic tie-breaking.
-
-    The returned offset is always interpreted in the coordinate system of the
-    oriented query/target pair encoded by the orientation label.
-    """
-
+    """Choose the highest-scoring orientation with deterministic tie-breaking."""
     return max(
-        candidates,
-        key=lambda candidate: (float(candidate["score"]), -ORIENTATION_TIEBREAK[candidate["orientation"]]),
+        candidates, key=lambda candidate: (float(candidate["score"]), -ORIENTATION_TIEBREAK[candidate["orientation"]])
     )
 
 
-def _get_profile_calibration_sequences(
-    sequences: Optional[RaggedData],
-    cfg: ComparatorConfig,
-) -> Optional[RaggedData]:
+def _get_profile_calibration_sequences(sequences, cfg: dict):
     """Return the sequence collection used to fit profile normalization."""
-    return cfg.promoters if cfg.promoters is not None else sequences
+    return cfg.get("promoters") if cfg.get("promoters") is not None else sequences
 
 
-def _get_profile_normalization_strategy(name: str) -> ProfileNormalizationStrategy:
+def _get_profile_normalization_strategy(name: str) -> dict:
     """Resolve one registered profile-normalization strategy."""
     try:
         return PROFILE_NORMALIZATION_REGISTRY[name]
@@ -222,20 +120,13 @@ def _get_profile_normalization_strategy(name: str) -> ProfileNormalizationStrate
         raise ValueError(f"Unsupported profile normalization: {name}. Available: {available}") from exc
 
 
-def _resolve_raw_profile_scores(
-    model: GenericModel,
-    sequences: Optional[RaggedData],
-    strand: str,
-    runtime_cache: Optional[dict] = None,
-) -> RaggedData:
+def _resolve_raw_profile_scores(model: GenericModel, sequences, strand: str, runtime_cache: dict | None = None):
     """Resolve one raw score profile before normalization."""
-    sequence_fp = fingerprint_ragged(sequences) or "no-sequences"
-    runtime_key = ("raw_scores", strand, sequence_fp)
     runtime_cache = {} if runtime_cache is None else runtime_cache
-
-    cached = runtime_cache.get(runtime_key)
-    if cached is not None:
-        return cached
+    sequence_fp = fingerprint_batch(sequences) or "no-sequences"
+    runtime_key = ("raw_scores", model.name, strand, sequence_fp)
+    if runtime_key in runtime_cache:
+        return runtime_cache[runtime_key]
 
     if model.type_key == "scores":
         scores = scan_model(model, None, strand)
@@ -248,145 +139,85 @@ def _resolve_raw_profile_scores(
     return scores
 
 
-def _fit_profile_normalizer(
-    model: GenericModel,
-    calibration_sequences: Optional[RaggedData],
-    cfg: ComparatorConfig,
-    runtime_cache: Optional[dict] = None,
-):
+def _fit_profile_normalizer(model: GenericModel, calibration_sequences, cfg: dict, runtime_cache: dict | None = None):
     """Fit normalization parameters from the calibration score sample."""
     runtime_cache = {} if runtime_cache is None else runtime_cache
-    calibration_fp = fingerprint_ragged(calibration_sequences) or "no-calibration"
-    runtime_key = ("profile_normalizer", cfg.profile_normalization, calibration_fp)
-
-    cached = runtime_cache.get(runtime_key)
-    if cached is not None:
-        return cached
+    calibration_fp = fingerprint_batch(calibration_sequences) or "no-calibration"
+    runtime_key = ("profile_normalizer", model.name, cfg["profile_normalization"], calibration_fp)
+    if runtime_key in runtime_cache:
+        return runtime_cache[runtime_key]
 
     calibration_plus = _resolve_raw_profile_scores(model, calibration_sequences, "+", runtime_cache)
     calibration_minus = _resolve_raw_profile_scores(model, calibration_sequences, "-", runtime_cache)
-    calibration_sample = np.concatenate((calibration_plus.data, calibration_minus.data))
-    strategy = _get_profile_normalization_strategy(cfg.profile_normalization)
-    normalizer = (cfg.profile_normalization, strategy.fit(calibration_sample))
-
+    calibration_sample = np.concatenate((flatten_valid(calibration_plus), flatten_valid(calibration_minus)))
+    strategy = _get_profile_normalization_strategy(cfg["profile_normalization"])
+    normalizer = (cfg["profile_normalization"], strategy["fit"](calibration_sample))
     runtime_cache[runtime_key] = normalizer
     return normalizer
 
 
-def _apply_profile_normalizer(scores: RaggedData, normalizer) -> RaggedData:
+def _apply_profile_normalizer(scores, normalizer):
     """Apply fitted normalization parameters to one score profile."""
     strategy_name, params = normalizer
     strategy = _get_profile_normalization_strategy(strategy_name)
-    return strategy.apply(scores, params)
+    return strategy["apply"](scores, params)
 
 
 def _resolve_profile_signal(
-    spec_or_model,
-    sequences_or_cfg,
-    calibration_sequences: Optional[RaggedData] = None,
-    cfg: Optional[ComparatorConfig] = None,
-    strand: Optional[str] = None,
-    runtime_cache: Optional[dict] = None,
-) -> RaggedData:
-    """Resolve a model to the profile signal used in profile comparisons."""
-    if isinstance(spec_or_model, ProfileResolutionSpec):
-        spec = spec_or_model
-        if not isinstance(sequences_or_cfg, ComparatorConfig):
-            raise TypeError("ComparatorConfig is required when resolving a ProfileResolutionSpec.")
-        cfg = sequences_or_cfg
-    else:
-        if cfg is None or strand is None:
-            raise TypeError("cfg and strand are required when resolving a profile from raw arguments.")
-        spec = ProfileResolutionSpec(spec_or_model, sequences_or_cfg, calibration_sequences, strand)
-
-    profile_kind = cfg.profile_normalization
-    sequence_fp = fingerprint_ragged(spec.sequences) or "no-sequences"
-    calibration_fp = fingerprint_ragged(spec.calibration_sequences) or "no-calibration"
-    runtime_key = (profile_kind, spec.strand, sequence_fp, calibration_fp)
+    model: GenericModel, sequences, calibration_sequences, cfg: dict, strand: str, runtime_cache=None
+):
+    """Resolve a model to the normalized profile signal used in profile comparisons."""
     runtime_cache = {} if runtime_cache is None else runtime_cache
+    profile_kind = cfg["profile_normalization"]
+    sequence_fp = fingerprint_batch(sequences) or "no-sequences"
+    calibration_fp = fingerprint_batch(calibration_sequences) or "no-calibration"
+    runtime_key = (model.name, profile_kind, strand, sequence_fp, calibration_fp)
 
     cached = runtime_cache.get(runtime_key)
     if cached is not None:
         return cached
 
-    use_disk_cache = cfg.cache_mode == "on"
-    if use_disk_cache:
-        cache_spec = ProfileCacheSpec(
-            model=spec.model,
-            sequences=spec.sequences,
-            promoters=spec.calibration_sequences,
-            strand=spec.strand,
-            profile_kind=profile_kind,
-            cache_dir=cfg.cache_dir,
-        )
+    cache_spec = None
+    if cfg["cache_mode"] == "on":
+        cache_spec = {
+            "model": model,
+            "sequences": sequences,
+            "promoters": calibration_sequences,
+            "strand": strand,
+            "profile_kind": profile_kind,
+            "cache_dir": cfg["cache_dir"],
+        }
         cached = load_profile_cache(cache_spec)
         if cached is not None:
             runtime_cache[runtime_key] = cached
-            logger.debug("Profile cache hit for model '%s' (%s strand).", spec.model.name, spec.strand)
+            logger.debug("Profile cache hit for model '%s' (%s strand).", model.name, strand)
             return cached
 
-    scores = _resolve_raw_profile_scores(spec.model, spec.sequences, spec.strand, runtime_cache)
-    normalizer = _fit_profile_normalizer(spec.model, spec.calibration_sequences, cfg, runtime_cache)
+    scores = _resolve_raw_profile_scores(model, sequences, strand, runtime_cache)
+    normalizer = _fit_profile_normalizer(model, calibration_sequences, cfg, runtime_cache)
     profile = _apply_profile_normalizer(scores, normalizer)
     runtime_cache[runtime_key] = profile
 
-    if use_disk_cache:
+    if cache_spec is not None:
         store_profile_cache(cache_spec, profile)
-        logger.debug("Stored profile cache for model '%s' (%s strand).", spec.model.name, spec.strand)
+        logger.debug("Stored profile cache for model '%s' (%s strand).", model.name, strand)
 
     return profile
 
 
-def _resolve_profile_support(
-    profile: RaggedData,
-    cfg: ComparatorConfig,
-    strand: str,
-    runtime_cache: Optional[dict] = None,
-):
-    """Resolve cached sparse support for thresholded profile comparisons."""
-    if cfg.min_logfpr is None:
-        return None
-
-    min_value = float(cfg.min_logfpr)
-    if min_value <= 0.0:
-        return None
-
-    runtime_key = ("support", np.float32(min_value), strand)
-    runtime_cache = {} if runtime_cache is None else runtime_cache
-
-    cached = runtime_cache.get(runtime_key)
-    if cached is not None:
-        return cached
-
-    support = build_profile_support(profile.data, profile.offsets, min_value)
-    runtime_cache[runtime_key] = support
-    return support
-
-
-def _resolve_profile_bundle(
-    model: GenericModel,
-    sequences: Optional[RaggedData],
-    calibration_sequences: Optional[RaggedData],
-    cfg: ComparatorConfig,
-) -> StrandProfileBundle:
-    """Resolve normalized profile signals and sparse support for both strands."""
+def _resolve_profile_bundle(model: GenericModel, sequences, calibration_sequences, cfg: dict) -> dict:
+    """Resolve normalized profile signals for both strands."""
     runtime_cache: dict = {}
-    plus_spec = ProfileResolutionSpec(model, sequences, calibration_sequences, "+")
-    minus_spec = ProfileResolutionSpec(model, sequences, calibration_sequences, "-")
-    plus = _resolve_profile_signal(plus_spec, cfg, runtime_cache)
-    minus = _resolve_profile_signal(minus_spec, cfg, runtime_cache)
-    plus_support = _resolve_profile_support(plus, cfg, "+", runtime_cache)
-    minus_support = _resolve_profile_support(minus, cfg, "-", runtime_cache)
-    return StrandProfileBundle(plus=plus, minus=minus, plus_support=plus_support, minus_support=minus_support)
+    return {
+        "plus": _resolve_profile_signal(model, sequences, calibration_sequences, cfg, "+", runtime_cache),
+        "minus": _resolve_profile_signal(model, sequences, calibration_sequences, cfg, "-", runtime_cache),
+    }
 
 
-def _create_surrogate_ragged(frequencies: RaggedData, rng: np.random.Generator, cfg: ComparatorConfig) -> RaggedData:
-    """Surrogate generation: random kernel + delta-spike at a random offset, then smoothing + normalization."""
-    data = frequencies.data
-    offsets = frequencies.offsets
-
-    min_kernel_size = int(cfg.min_kernel_size)
-    max_kernel_size = int(cfg.max_kernel_size)
+def _create_surrogate_batch(profile, rng: np.random.Generator, cfg: dict):
+    """Generate one surrogate profile batch by row-wise convolution and renormalization."""
+    min_kernel_size = int(cfg["min_kernel_size"])
+    max_kernel_size = int(cfg["max_kernel_size"])
     first_odd = min_kernel_size if min_kernel_size % 2 == 1 else min_kernel_size + 1
     n_odd = ((max_kernel_size - first_odd) // 2) + 1
     kernel_size = int(first_odd + 2 * int(rng.integers(0, n_odd)))
@@ -394,7 +225,7 @@ def _create_surrogate_ragged(frequencies: RaggedData, rng: np.random.Generator, 
 
     identity_kernel = np.zeros(kernel_size, dtype=np.float32)
     identity_kernel[center] = 1.0
-    alpha = float(np.clip(cfg.distortion_level, 0.0, 1.0))
+    alpha = float(np.clip(cfg["distortion_level"], 0.0, 1.0))
     kernel = rng.normal(0.0, 1.0, size=kernel_size).astype(np.float32)
     if kernel_size >= len(SURROGATE_SMOOTH_FILTER):
         kernel = np.convolve(kernel, SURROGATE_SMOOTH_FILTER, mode="same").astype(np.float32)
@@ -404,53 +235,41 @@ def _create_surrogate_ragged(frequencies: RaggedData, rng: np.random.Generator, 
         final_kernel = -final_kernel
     final_kernel /= np.linalg.norm(final_kernel) + 1e-8
 
-    convolved = np.empty_like(data, dtype=np.float32)
-    for i in range(len(offsets) - 1):
-        start = int(offsets[i])
-        end = int(offsets[i + 1])
-        segment = data[start:end]
-        if segment.size == 0:
+    convolved = np.full(profile["values"].shape, SCORE_PADDING, dtype=np.float32)
+    for row_index, length in enumerate(profile["lengths"]):
+        current_length = int(length)
+        if current_length == 0:
             continue
-        convolved[start:end] = convolve1d(segment, final_kernel, axis=0, mode="constant", cval=0.0).astype(np.float32)
+        segment = profile["values"][row_index, :current_length]
+        convolved[row_index, :current_length] = convolve1d(segment, final_kernel, axis=0, mode="constant", cval=0.0)
 
-    convolved_ragged = RaggedData(data=convolved, offsets=offsets)
-    strategy = _get_profile_normalization_strategy(cfg.profile_normalization)
-    return strategy.normalize_surrogate(convolved_ragged)
+    surrogate = batch_with_values(profile, convolved, padding_value=SCORE_PADDING)
+    strategy = _get_profile_normalization_strategy(cfg["profile_normalization"])
+    return strategy["normalize_surrogate"](surrogate)
 
 
 def run_montecarlo(
-    obs_score_func: Callable,
-    surrogate_generator_func: Callable,
-    n_permutations: int,
-    n_jobs: int,
-    seed: Optional[int],
-    *args,
-) -> Tuple[np.ndarray, float, float]:
-    """Generic function to run Monte Carlo permutations in parallel."""
+    obs_score_func: Callable, surrogate_generator_func: Callable, n_permutations: int, n_jobs: int, seed, *args
+):
+    """Run a Monte Carlo workflow in parallel."""
     if n_permutations <= 0:
         return np.array([]), 0.0, 0.0
 
     base_rng = np.random.default_rng(seed)
     seeds = base_rng.integers(0, 2**31, size=n_permutations)
 
-    def worker(seed_val):
-        """Compute one score for a permutation seed."""
-        rng = np.random.default_rng(int(seed_val))
+    def worker(seed_value):
+        rng = np.random.default_rng(int(seed_value))
         surrogate = surrogate_generator_func(rng, *args)
         return obs_score_func(surrogate)
 
-    results = Parallel(n_jobs=n_jobs, backend="loky")(delayed(worker)(s) for s in seeds)
-
-    null_scores = np.array([r for r in results if r is not None], dtype=np.float32)
-
-    return (null_scores, float(np.mean(null_scores)), float(np.std(null_scores)))
+    results = Parallel(n_jobs=n_jobs, backend="loky")(delayed(worker)(seed_value) for seed_value in seeds)
+    null_scores = np.array([result for result in results if result is not None], dtype=np.float32)
+    return null_scores, float(np.mean(null_scores)), float(np.std(null_scores))
 
 
 def _update_result_with_null_statistics(
-    result: dict,
-    obs_score: float,
-    stats: tuple[np.ndarray, float, float],
-    n_permutations: int,
+    result: dict, obs_score: float, stats: tuple[np.ndarray, float, float], n_permutations: int
 ) -> None:
     """Attach Monte Carlo summary statistics to one result payload."""
     null_scores, null_mean, null_std = stats
@@ -469,31 +288,6 @@ def _update_result_with_null_statistics(
     )
 
 
-class ComparatorRegistry:
-    """Registry for comparison strategies using decorator pattern."""
-
-    def __init__(self):
-        """Initialize registry state."""
-        self._strategies: Dict[str, Callable] = {}
-
-    def register(self, name: str):
-        """Register a callable under the given name."""
-
-        def decorator(fn):
-            """Store a callable in the registry."""
-            self._strategies[name] = fn
-            return fn
-
-        return decorator
-
-    def get(self, name: str):
-        """Return a registered callable by name."""
-        return self._strategies.get(name)
-
-
-registry = ComparatorRegistry()
-
-
 def _is_power_of_four(value: int) -> bool:
     """Return True when the provided value is a positive power of four."""
     if value < 1:
@@ -504,7 +298,7 @@ def _is_power_of_four(value: int) -> bool:
 
 
 def _looks_like_alphabet_axis(size: int) -> bool:
-    """Return True when an axis likely encodes nucleotide states."""
+    """Return True when one axis likely encodes nucleotide states."""
     return size in (NUCLEOTIDE_CARDINALITY, AMBIGUOUS_STATE_CARDINALITY) or _is_power_of_four(size)
 
 
@@ -541,14 +335,14 @@ def _reverse_complement_motif_tensor(matrix: np.ndarray) -> np.ndarray:
     return np.flip(reverse, axis=-1)
 
 
-def _prepare_motif(matrix: np.ndarray) -> PreparedMotif:
+def _prepare_motif(matrix: np.ndarray) -> dict:
     """Build flattened forward and reverse-complement views for alignment."""
     normalized = _normalize_motif_tensor(matrix)
     reverse = _reverse_complement_motif_tensor(normalized)
-    return PreparedMotif(
-        forward=normalized.reshape(-1, normalized.shape[-1]),
-        reverse=reverse.reshape(-1, reverse.shape[-1]),
-    )
+    return {
+        "forward": normalized.reshape(-1, normalized.shape[-1]),
+        "reverse": reverse.reshape(-1, reverse.shape[-1]),
+    }
 
 
 def _vectorized_pcc(x1: np.ndarray, x2: np.ndarray) -> np.ndarray:
@@ -612,42 +406,37 @@ def _align_motif_matrices(query_matrix: np.ndarray, target_matrix: np.ndarray, m
     return best_score, best_offset
 
 
-def _score_motif_candidates(
-    query: PreparedMotif, target: PreparedMotif, metric: str
-) -> list[dict[str, float | int | str]]:
+def _score_motif_candidates(query: dict, target: dict, metric: str) -> list[dict]:
     """Score all orientation pairs for one prepared motif pair."""
     candidates = []
     for orientation, query_matrix, target_matrix in (
-        ("++", query.forward, target.forward),
-        ("+-", query.forward, target.reverse),
-        ("-+", query.reverse, target.forward),
-        ("--", query.reverse, target.reverse),
+        ("++", query["forward"], target["forward"]),
+        ("+-", query["forward"], target["reverse"]),
+        ("-+", query["reverse"], target["forward"]),
+        ("--", query["reverse"], target["reverse"]),
     ):
         score, offset = _align_motif_matrices(query_matrix, target_matrix, metric)
         candidates.append({"orientation": orientation, "score": score, "offset": offset})
     return candidates
 
 
-def _best_motif_score(query: PreparedMotif, target: PreparedMotif, metric: str) -> float:
+def _best_motif_score(query: dict, target: dict, metric: str) -> float:
     """Return the best orientation score for one motif pair."""
     return float(_select_best_orientation(_score_motif_candidates(query, target, metric))["score"])
 
 
 def _resolve_motif_matrices(
-    model1: GenericModel,
-    model2: GenericModel,
-    sequences: Optional[RaggedData],
-    cfg: ComparatorConfig,
+    model1: GenericModel, model2: GenericModel, sequences, cfg: dict
 ) -> tuple[np.ndarray, np.ndarray]:
     """Resolve the motif representations used for direct alignment."""
-    use_pfm_mode = cfg.pfm_mode or (model1.type_key != model2.type_key)
+    use_pfm_mode = cfg["pfm_mode"] or (model1.type_key != model2.type_key)
     if not use_pfm_mode:
         return model1.representation, model2.representation
     if sequences is None:
         raise ValueError("sequences are required for pfm_mode")
     return (
-        get_pfm(model1, sequences, top_fraction=cfg.pfm_top_fraction),
-        get_pfm(model2, sequences, top_fraction=cfg.pfm_top_fraction),
+        get_pfm(model1, sequences, top_fraction=cfg["pfm_top_fraction"]),
+        get_pfm(model2, sequences, top_fraction=cfg["pfm_top_fraction"]),
     )
 
 
@@ -666,18 +455,13 @@ def _permute_motif_matrix(matrix: np.ndarray, rng: np.random.Generator, permute_
     return permuted
 
 
-@registry.register("motif")
-def strategy_motif(
-    model1: GenericModel,
-    model2: GenericModel,
-    sequences: Optional[RaggedData],
-    cfg: ComparatorConfig,
-) -> dict:
+@_register_comparison_strategy("motif")
+def strategy_motif(model1: GenericModel, model2: GenericModel, sequences, cfg: dict) -> dict:
     """Matrix-based comparison strategy (PCC/ED/Cosine)."""
     matrix1, matrix2 = _resolve_motif_matrices(model1, model2, sequences, cfg)
     prepared1 = _prepare_motif(matrix1)
     prepared2 = _prepare_motif(matrix2)
-    best = _select_best_orientation(_score_motif_candidates(prepared1, prepared2, cfg.metric))
+    best = _select_best_orientation(_score_motif_candidates(prepared1, prepared2, cfg["metric"]))
     obs_score = float(best["score"])
 
     result = {
@@ -686,123 +470,99 @@ def strategy_motif(
         "score": obs_score,
         "offset": int(best["offset"]),
         "orientation": best["orientation"],
-        "metric": cfg.metric,
+        "metric": cfg["metric"],
     }
 
-    if cfg.n_permutations > 0:
+    if cfg["n_permutations"] > 0:
 
         def gen_surrogate(rng):
-            """Generate one surrogate score."""
-            surrogate = _permute_motif_matrix(matrix2, rng, cfg.permute_rows)
-            return _best_motif_score(prepared1, _prepare_motif(surrogate), cfg.metric)
+            surrogate = _permute_motif_matrix(matrix2, rng, cfg["permute_rows"])
+            return _best_motif_score(prepared1, _prepare_motif(surrogate), cfg["metric"])
 
         nulls, null_mean, null_std = run_montecarlo(
             lambda value: value,
             gen_surrogate,
-            cfg.n_permutations,
-            cfg.n_jobs,
-            cfg.seed,
+            cfg["n_permutations"],
+            cfg["n_jobs"],
+            cfg["seed"],
         )
-        _update_result_with_null_statistics(result, obs_score, (nulls, null_mean, null_std), cfg.n_permutations)
+        _update_result_with_null_statistics(result, obs_score, (nulls, null_mean, null_std), cfg["n_permutations"])
 
     return result
 
 
-@registry.register("profile")
-def strategy_profile(
-    model1: GenericModel,
-    model2: GenericModel,
-    sequences: Optional[RaggedData],
-    cfg: ComparatorConfig,
-) -> dict:
-    """RaggedData-based comparison strategy (CO/Dice similarity)."""
+@_register_comparison_strategy("profile")
+def strategy_profile(model1: GenericModel, model2: GenericModel, sequences, cfg: dict) -> dict:
+    """Dense masked profile comparison strategy (CO/Dice similarity)."""
     calibration_sequences = _get_profile_calibration_sequences(sequences, cfg)
     bundle1 = _resolve_profile_bundle(model1, sequences, calibration_sequences, cfg)
     bundle2 = _resolve_profile_bundle(model2, sequences, calibration_sequences, cfg)
-    score_options = ProfileScoreOptions(
-        search_range=cfg.search_range,
-        min_value=0.0 if cfg.min_logfpr is None else float(cfg.min_logfpr),
-        metric=cfg.metric,
+    score_options = build_profile_score_options(
+        search_range=cfg["search_range"],
+        min_value=0.0 if cfg["min_logfpr"] is None else float(cfg["min_logfpr"]),
+        metric=cfg["metric"],
     )
 
-    def get_score(S1: RaggedData, S2: RaggedData, support1=None, support2=None) -> Tuple[float, int]:
-        """Compute score and offset for two profiles."""
-        sc, off = fast_profile_score(S1, S2, score_options, supports=(support1, support2))
-        return sc, off
-
     candidates = []
-    for orient, query_profile, target_profile, query_support, target_support in (
-        ("++", bundle1.plus, bundle2.plus, bundle1.plus_support, bundle2.plus_support),
-        ("--", bundle1.minus, bundle2.minus, bundle1.minus_support, bundle2.minus_support),
-        ("+-", bundle1.plus, bundle2.minus, bundle1.plus_support, bundle2.minus_support),
-        ("-+", bundle1.minus, bundle2.plus, bundle1.minus_support, bundle2.plus_support),
+    for orientation, query_profile, target_profile in (
+        ("++", bundle1["plus"], bundle2["plus"]),
+        ("--", bundle1["minus"], bundle2["minus"]),
+        ("+-", bundle1["plus"], bundle2["minus"]),
+        ("-+", bundle1["minus"], bundle2["plus"]),
     ):
-        score, off = get_score(query_profile, target_profile, query_support, target_support)
+        score, offset = fast_profile_score(query_profile, target_profile, score_options)
         candidates.append(
             {
-                "orientation": orient,
+                "orientation": orientation,
                 "score": score,
-                "offset": off,
+                "offset": offset,
                 "query_profile": query_profile,
-                "query_support": query_support,
                 "target_profile": target_profile,
             }
         )
 
     best = _select_best_orientation(candidates)
-    obs_score = best["score"]
-    off = best["offset"]
-    orient = best["orientation"]
-    f_final = best["target_profile"]
-
-    # fast_profile_score uses the opposite shift sign convention; flip it so the
-    # reported offset remains "target start relative to query start" for the
-    # oriented pair encoded in `orientation`.
-    motif_offset = -off
+    obs_score = float(best["score"])
+    motif_offset = -int(best["offset"])
 
     result = {
         "query": model1.name,
         "target": model2.name,
-        "score": float(obs_score),
-        "offset": int(motif_offset),
-        "orientation": orient,
-        "metric": cfg.metric,
+        "score": obs_score,
+        "offset": motif_offset,
+        "orientation": best["orientation"],
+        "metric": cfg["metric"],
     }
 
-    if cfg.n_permutations > 0:
+    if cfg["n_permutations"] > 0:
+        best_target_profile = best["target_profile"]
 
         def surrogate_gen(rng):
-            """Generate one surrogate score."""
-            surr = _create_surrogate_ragged(f_final, rng, cfg)
-            sc_plus, _ = get_score(bundle1.plus, surr, bundle1.plus_support, None)
-            sc_minus, _ = get_score(bundle1.minus, surr, bundle1.minus_support, None)
-            return max(sc_plus, sc_minus)
+            surrogate = _create_surrogate_batch(best_target_profile, rng, cfg)
+            score_plus, _ = fast_profile_score(bundle1["plus"], surrogate, score_options)
+            score_minus, _ = fast_profile_score(bundle1["minus"], surrogate, score_options)
+            return max(score_plus, score_minus)
 
         nulls, null_mean, null_std = run_montecarlo(
             lambda value: value,
             surrogate_gen,
-            cfg.n_permutations,
-            cfg.n_jobs,
-            cfg.seed,
+            cfg["n_permutations"],
+            cfg["n_jobs"],
+            cfg["seed"],
         )
-        _update_result_with_null_statistics(result, obs_score, (nulls, null_mean, null_std), cfg.n_permutations)
+        _update_result_with_null_statistics(result, obs_score, (nulls, null_mean, null_std), cfg["n_permutations"])
 
     return result
 
 
-@registry.register("motali")
-def strategy_motali(
-    model1: GenericModel,
-    model2: GenericModel,
-    sequences: Optional[RaggedData],
-    cfg: ComparatorConfig,
-) -> dict:
+@_register_comparison_strategy("motali")
+def strategy_motali(model1: GenericModel, model2: GenericModel, sequences, cfg: dict) -> dict:
     """External Motali tool wrapper."""
-    threshold_sequences = cfg.promoters if cfg.promoters is not None else sequences
+    threshold_sequences = cfg.get("promoters") if cfg.get("promoters") is not None else sequences
     if threshold_sequences is None:
         raise ValueError("Motali strategy requires 'promoters' or 'sequences' for threshold table calculation.")
 
-    with tempfile.TemporaryDirectory(dir=cfg.tmp_directory, ignore_cleanup_errors=True) as tmp:
+    with tempfile.TemporaryDirectory(dir=cfg["tmp_directory"], ignore_cleanup_errors=True) as tmp:
         ext_1 = ".pfm" if model1.type_key == "pwm" else ".mat"
         ext_2 = ".pfm" if model2.type_key == "pwm" else ".mat"
 
@@ -827,7 +587,7 @@ def strategy_motali(
         write_dist(dist1, max_1, min_1, d1_path)
         write_dist(dist2, max_2, min_2, d2_path)
 
-        fasta_path = cfg.fasta_path
+        fasta_path = cfg.get("fasta_path")
         if fasta_path is None and sequences is not None:
             fasta_path = os.path.join(tmp, "sequences.fa")
             write_fasta(sequences, fasta_path)
@@ -835,7 +595,7 @@ def strategy_motali(
         if fasta_path is None:
             raise ValueError("Motali strategy requires 'sequences' or comparator.fasta_path for FASTA input.")
 
-        score, offset, orient = run_motali(
+        score, offset, orientation = run_motali(
             fasta_path,
             m1_path,
             m2_path,
@@ -848,8 +608,8 @@ def strategy_motali(
             os.path.join(tmp, "prc_pass.txt"),
             os.path.join(tmp, "hist_pass.txt"),
             os.path.join(tmp, "sta.txt"),
-            shift=cfg.motali_shift,
-            err=cfg.motali_err,
+            shift=cfg["motali_shift"],
+            err=cfg["motali_err"],
         )
 
         return {
@@ -857,23 +617,21 @@ def strategy_motali(
             "target": model2.name,
             "score": score,
             "offset": int(offset),
-            "orientation": orient,
+            "orientation": orientation,
         }
 
 
 def compare(
-    model1: GenericModel,
-    model2: GenericModel,
-    strategy: str,
-    config: ComparatorConfig,
-    sequences: Optional[RaggedData] = None,
-    promoters: Optional[RaggedData] = None,
+    model1: GenericModel, model2: GenericModel, strategy: str, config: dict, sequences=None, promoters=None
 ) -> dict:
     """Main entry point for motif comparison."""
-    strategy_fn = registry.get(strategy)
-    if not strategy_fn:
-        available = list(registry._strategies.keys())
-        raise ValueError(f"Strategy '{strategy}' not found. Available: {available}")
+    try:
+        strategy_fn = registry[strategy]
+    except KeyError as exc:
+        available = ", ".join(sorted(registry))
+        raise ValueError(f"Strategy '{strategy}' not found. Available: {available}") from exc
 
-    effective_config = config if promoters is None else replace(config, promoters=promoters)
+    effective_config = dict(config)
+    if promoters is not None:
+        effective_config["promoters"] = promoters
     return strategy_fn(model1, model2, sequences, effective_config)
