@@ -26,6 +26,7 @@ from mimosa.comparison import (
 )
 from mimosa.comparison import registry as comparison_registry
 from mimosa.functions import (
+    ProfileScoreOptions,
     apply_score_log_tail_table,
     batch_all_scores,
     build_profile_support,
@@ -192,9 +193,9 @@ def _reference_slim_site_score(path: Path, sequence: np.ndarray) -> float:
 
     def next_context(context: int, position: int, component_index: int, ancestor_index: int) -> int:
         width = len(dependency[position][component_index][0])
-        return (
-            context * width + int(sequence[position - component_index - ancestor_index])
-        ) % len(dependency[position][component_index])
+        return (context * width + int(sequence[position - component_index - ancestor_index])) % len(
+            dependency[position][component_index]
+        )
 
     for position in range(len(component)):
         current_nt = int(sequence[position])
@@ -624,6 +625,7 @@ def test_create_comparator_config():
     assert config.n_permutations == 0
     assert config.seed is None
     assert config.pfm_top_fraction == pytest.approx(0.05)
+    assert config.profile_normalization == "empirical_log_tail"
 
     # Test factory function with custom parameters
     config = create_comparator_config(metric="co", n_permutations=100, seed=42, pfm_top_fraction=0.2)
@@ -666,6 +668,15 @@ def test_create_comparator_config_validates_cache_mode():
 
     config = create_comparator_config(cache_mode="on")
     assert config.cache_mode == "on"
+
+
+def test_create_comparator_config_validates_profile_normalization():
+    """Profile normalization mode should accept only known strategies."""
+    with pytest.raises(ValueError, match="profile_normalization"):
+        create_comparator_config(profile_normalization="zscore")
+
+    config = create_comparator_config(profile_normalization="empirical_log_tail")
+    assert config.profile_normalization == "empirical_log_tail"
 
 
 def test_comparison_registry():
@@ -1021,7 +1032,11 @@ def test_profile_pairwise_threshold_mask_keeps_real_values(metric, expected):
     data2 = np.array([0.8], dtype=np.float32)
     offsets = np.array([0, 1], dtype=np.int64)
 
-    score, offset = fast_profile_score(data1, offsets, data2, offsets, 0, 1.0, metric=metric)
+    score, offset = fast_profile_score(
+        (data1, offsets),
+        (data2, offsets),
+        ProfileScoreOptions(search_range=0, min_value=1.0, metric=metric),
+    )
 
     assert score == pytest.approx(expected)
     assert offset == 0
@@ -1033,7 +1048,7 @@ def test_fast_profile_score_rejects_unknown_metric():
     offsets = np.array([0, 1], dtype=np.int64)
 
     with pytest.raises(ValueError, match="'co', 'dice'"):
-        fast_profile_score(data, offsets, data, offsets, 0, metric="corr")
+        fast_profile_score((data, offsets), (data, offsets), ProfileScoreOptions(search_range=0, metric="corr"))
 
 
 @pytest.mark.parametrize("metric", ["co", "dice"])
@@ -1047,7 +1062,11 @@ def test_fast_profile_score_matches_reference_for_ragged_inputs(metric, min_valu
     data1 = rng.gamma(shape=1.5, scale=1.0, size=int(offsets[-1])).astype(np.float32)
     data2 = rng.gamma(shape=1.7, scale=0.9, size=int(offsets[-1])).astype(np.float32)
 
-    score, offset = fast_profile_score(data1, offsets, data2, offsets, 3, min_value=min_value, metric=metric)
+    score, offset = fast_profile_score(
+        (data1, offsets),
+        (data2, offsets),
+        ProfileScoreOptions(search_range=3, min_value=min_value, metric=metric),
+    )
     expected_score, expected_offset = _reference_fast_profile_score(
         data1, offsets, data2, offsets, 3, min_value=min_value, metric=metric
     )
@@ -1065,7 +1084,11 @@ def test_fast_profile_score_normalizes_non_contiguous_inputs(metric):
     data2 = base2[1::2]
     offsets = np.array([0, 2, 4], dtype=np.int32)
 
-    score, offset = fast_profile_score(data1, offsets, data2, offsets, 1, min_value=0.5, metric=metric)
+    score, offset = fast_profile_score(
+        (data1, offsets),
+        (data2, offsets),
+        ProfileScoreOptions(search_range=1, min_value=0.5, metric=metric),
+    )
     expected_score, expected_offset = _reference_fast_profile_score(
         np.ascontiguousarray(data1, dtype=np.float32),
         np.ascontiguousarray(offsets, dtype=np.int64),
@@ -1090,17 +1113,10 @@ def test_fast_profile_score_accepts_precomputed_sparse_support(metric):
     support2 = build_profile_support(data2, offsets, 1.0)
 
     score, offset = fast_profile_score(
-        data1,
-        offsets,
-        data2,
-        offsets,
-        1,
-        min_value=1.0,
-        metric=metric,
-        active_idx1=support1[0],
-        active_ptr1=support1[1],
-        active_idx2=support2[0],
-        active_ptr2=support2[1],
+        (data1, offsets),
+        (data2, offsets),
+        ProfileScoreOptions(search_range=1, min_value=1.0, metric=metric),
+        supports=(support1, support2),
     )
     expected_score, expected_offset = _reference_fast_profile_score(
         data1, offsets, data2, offsets, 1, min_value=1.0, metric=metric
@@ -1141,8 +1157,8 @@ def test_strategy_profile_uses_target_relative_offset_convention():
     assert reverse["offset"] == -2
 
 
-def test_strategy_profile_empirical_uses_shared_best_strand_table():
-    """Empirical profile normalization should use one best-strand table for both strands."""
+def test_strategy_profile_empirical_uses_combined_strand_table():
+    """Empirical profile normalization should use one combined +/- calibration table."""
     site = "CAGTAAACAG"
     rng = np.random.default_rng(0)
     encoded_site = _encode_sequence(site)
@@ -1159,15 +1175,14 @@ def test_strategy_profile_empirical_uses_shared_best_strand_table():
 
     plus_scores = scan_model(dimont, ragged_sequences, "+")
     minus_scores = scan_model(dimont, ragged_sequences, "-")
-    best_scores = scan_model(dimont, ragged_sequences, "best")
-    best_table = build_score_log_tail_table(best_scores.data)
+    combined_table = build_score_log_tail_table(np.concatenate((plus_scores.data, minus_scores.data)))
 
-    expected_plus = apply_score_log_tail_table(plus_scores, best_table)
-    expected_minus = apply_score_log_tail_table(minus_scores, best_table)
+    expected_plus = apply_score_log_tail_table(plus_scores, combined_table)
+    expected_minus = apply_score_log_tail_table(minus_scores, combined_table)
 
     resolve_profile_signal = strategy_profile.__globals__["_resolve_profile_signal"]
-    resolved_plus = resolve_profile_signal(dimont, ragged_sequences, cfg, "+")
-    resolved_minus = resolve_profile_signal(dimont, ragged_sequences, cfg, "-")
+    resolved_plus = resolve_profile_signal(dimont, ragged_sequences, ragged_sequences, cfg, "+")
+    resolved_minus = resolve_profile_signal(dimont, ragged_sequences, ragged_sequences, cfg, "-")
 
     np.testing.assert_allclose(resolved_plus.data, expected_plus.data, atol=1e-6)
     np.testing.assert_allclose(resolved_minus.data, expected_minus.data, atol=1e-6)
@@ -1175,6 +1190,35 @@ def test_strategy_profile_empirical_uses_shared_best_strand_table():
     plus_slice = resolved_plus.get_slice(0)
     minus_slice = resolved_minus.get_slice(0)
     assert plus_slice[30] > minus_slice[29]
+
+
+def test_strategy_profile_uses_promoters_for_empirical_calibration():
+    """Profile normalization should use promoter scans when explicit calibration sequences are provided."""
+    representation = np.array(
+        [
+            [2.0, -1.0],
+            [-1.0, 2.0],
+            [-1.0, -1.0],
+            [-1.0, -1.0],
+            [-1.0, -1.0],
+        ],
+        dtype=np.float32,
+    )
+    model = GenericModel(type_key="pwm", name="m1", representation=representation, length=2, config={"kmer": 1})
+    sequences = ragged_from_list([_encode_sequence("ACACAC"), _encode_sequence("CAAAAA")], dtype=np.int8)
+    promoters = ragged_from_list([_encode_sequence("AAAAAA"), _encode_sequence("CCCCCC")], dtype=np.int8)
+    cfg = create_comparator_config(metric="co", promoters=promoters, n_permutations=0)
+
+    plus_scores = scan_model(model, sequences, "+")
+    promoter_plus = scan_model(model, promoters, "+")
+    promoter_minus = scan_model(model, promoters, "-")
+    table = build_score_log_tail_table(np.concatenate((promoter_plus.data, promoter_minus.data)))
+    expected_plus = apply_score_log_tail_table(plus_scores, table)
+
+    resolve_profile_signal = strategy_profile.__globals__["_resolve_profile_signal"]
+    resolved_plus = resolve_profile_signal(model, sequences, promoters, cfg, "+")
+
+    np.testing.assert_allclose(resolved_plus.data, expected_plus.data, atol=1e-6)
 
 
 def test_strategy_motif_handles_reverse_complement_for_higher_order_tensors():
@@ -1447,8 +1491,8 @@ def test_run_comparison_rejects_removed_profile_metrics(metric):
         run_comparison(config)
 
 
-def test_strategy_profile_rejects_promoters_configuration():
-    """Profile strategy should reject external promoter calibration and stay empirical on comparison sequences."""
+def test_strategy_profile_accepts_promoters_configuration():
+    """Profile strategy should accept external promoter calibration sequences."""
     scores_1 = RaggedData(np.array([0.1, 0.2, 0.3], dtype=np.float32), np.array([0, 3], dtype=np.int64))
     scores_2 = RaggedData(np.array([0.2, 0.3, 0.4], dtype=np.float32), np.array([0, 3], dtype=np.int64))
     promoters = ragged_from_list([np.array([0, 1, 2, 3, 0, 1], dtype=np.int8)], dtype=np.int8)
@@ -1456,8 +1500,22 @@ def test_strategy_profile_rejects_promoters_configuration():
     model2 = GenericModel(type_key="scores", name="s2", representation=None, length=0, config={"scores_data": scores_2})
     cfg = create_comparator_config(metric="co", promoters=promoters)
 
-    with pytest.raises(ValueError, match="does not accept promoters"):
-        strategy_profile(model1, model2, None, cfg)
+    result = strategy_profile(model1, model2, None, cfg)
+
+    assert result["metric"] == "co"
+    assert "score" in result
+
+
+def test_strategy_profile_co_has_no_default_floor():
+    """CO should not apply an implicit logFPR floor when min_logfpr is omitted."""
+    scores_1 = RaggedData(np.array([0.2, 0.2, 0.1], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    scores_2 = RaggedData(np.array([0.2, 0.2, 0.1], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    model1 = GenericModel(type_key="scores", name="s1", representation=None, length=0, config={"scores_data": scores_1})
+    model2 = GenericModel(type_key="scores", name="s2", representation=None, length=0, config={"scores_data": scores_2})
+
+    result = strategy_profile(model1, model2, None, create_comparator_config(metric="co", n_permutations=0))
+
+    assert result["score"] == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize("metric", ["co", "dice"])

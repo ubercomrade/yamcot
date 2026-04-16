@@ -440,8 +440,8 @@ def test_profile_comparison_with_empirical_logfpr_thresholding(examples_dir, tem
     assert "score" in output
 
 
-def test_profile_comparison_rejects_promoter_argument(examples_dir, temp_dir):
-    """Profile CLI should reject the removed promoter-calibration argument."""
+def test_profile_comparison_accepts_promoter_argument(examples_dir, temp_dir):
+    """Profile CLI should accept explicit promoter calibration sequences."""
     cmd = [
         "mimosa",
         "profile",
@@ -451,13 +451,14 @@ def test_profile_comparison_rejects_promoter_argument(examples_dir, temp_dir):
         "pwm",
         "--model2-type",
         "pwm",
+        "--fasta",
+        str(examples_dir / "foreground.fa"),
         "--promoters",
         str(examples_dir / "background.fa"),
     ]
 
     result = run_cli(cmd)
-    assert result.returncode != 0
-    assert "unrecognized arguments" in result.stderr
+    assert result.returncode == 0, f"Command failed with stderr: {result.stderr}"
 
 
 def test_profile_comparison_invalid_kernel_range(examples_dir, temp_dir):

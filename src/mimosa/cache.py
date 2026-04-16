@@ -6,6 +6,7 @@ import hashlib
 import os
 import shutil
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +16,18 @@ from mimosa.models import GenericModel
 from mimosa.ragged import RaggedData
 
 CACHE_VERSION = "v2"
+
+
+@dataclass(frozen=True)
+class ProfileCacheSpec:
+    """Address of one cached profile artifact."""
+
+    model: GenericModel
+    sequences: Optional[RaggedData]
+    promoters: Optional[RaggedData]
+    strand: str
+    profile_kind: str
+    cache_dir: str
 
 
 def _hash_array(array: np.ndarray) -> bytes:
@@ -108,34 +121,20 @@ def fingerprint_model(model: GenericModel) -> str:
     return fingerprint
 
 
-def _profile_cache_path(
-    model: GenericModel,
-    sequences: Optional[RaggedData],
-    promoters: Optional[RaggedData],
-    strand: str,
-    profile_kind: str,
-    cache_dir: str,
-) -> Path:
+def _profile_cache_path(spec: ProfileCacheSpec) -> Path:
     """Build the file path for a cached profile artifact."""
-    model_fp = fingerprint_model(model)
-    seq_fp = fingerprint_ragged(sequences) or "no-sequences"
-    base = Path(cache_dir) / CACHE_VERSION / "profiles" / profile_kind / seq_fp
-    prom_fp = fingerprint_ragged(promoters)
+    model_fp = fingerprint_model(spec.model)
+    seq_fp = fingerprint_ragged(spec.sequences) or "no-sequences"
+    base = Path(spec.cache_dir) / CACHE_VERSION / "profiles" / spec.profile_kind / seq_fp
+    prom_fp = fingerprint_ragged(spec.promoters)
     if prom_fp is not None:
         base = base / prom_fp
-    return base / f"{model_fp}.{strand}.npz"
+    return base / f"{model_fp}.{spec.strand}.npz"
 
 
-def load_profile_cache(
-    model: GenericModel,
-    sequences: Optional[RaggedData],
-    promoters: Optional[RaggedData],
-    strand: str,
-    profile_kind: str,
-    cache_dir: str,
-) -> Optional[RaggedData]:
+def load_profile_cache(spec: ProfileCacheSpec) -> Optional[RaggedData]:
     """Load a cached profile if it is present and readable."""
-    path = _profile_cache_path(model, sequences, promoters, strand, profile_kind, cache_dir)
+    path = _profile_cache_path(spec)
     if not path.exists():
         return None
 
@@ -153,17 +152,9 @@ def load_profile_cache(
     return RaggedData(data=data, offsets=offsets)
 
 
-def store_profile_cache(
-    model: GenericModel,
-    sequences: Optional[RaggedData],
-    promoters: Optional[RaggedData],
-    strand: str,
-    profile_kind: str,
-    cache_dir: str,
-    profile: RaggedData,
-) -> Path:
+def store_profile_cache(spec: ProfileCacheSpec, profile: RaggedData) -> Path:
     """Store a derived profile atomically on disk."""
-    path = _profile_cache_path(model, sequences, promoters, strand, profile_kind, cache_dir)
+    path = _profile_cache_path(spec)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     fd, tmp_path = tempfile.mkstemp(prefix="profile-", suffix=".npz", dir=path.parent)

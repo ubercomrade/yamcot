@@ -14,12 +14,7 @@ To address these limitations, we introduce MIMOSA, a comprehensive framework des
 
 #### Similarity Metrics
 
-MIMOSA implements several metrics to quantify the resemblance between motif importance profiles or matrix columns.
-
-**Continuous Jaccard (CJ)**
-The Continuous Jaccard index extends the classical Jaccard similarity to continuous-valued vectors $v_1, v_2$. It is defined as the ratio of the sum of element-wise intersections to the sum of element-wise unions:
-$$\text{CJ}(v_1, v_2) = \frac{\sum_i \min(v_1^i, v_2^i)}{\sum_i \max(v_1^i, v_2^i)}$$
-This metric is equivalent to averaging the binary Jaccard index across all possible thresholds, providing a threshold-independent measure of profile similarity.
+MIMOSA currently exposes two metrics for `profile` mode and three metrics for `motif` mode.
 
 **Continuous Overlap (CO)**
 The Continuous Overlap coefficient (or Szymkiewicz-Simpson coefficient) measures the sub-set relationship between two profiles, normalizing the intersection by the smaller of the two total affinities:
@@ -29,13 +24,17 @@ $$\text{CO}(v_1, v_2) = \frac{\sum_i \min(v_1^i, v_2^i)}{\min\left(\sum_i v_1^i,
 The Dice coefficient balances shared signal against the total profile mass:
 $$\text{Dice}(v_1, v_2) = \frac{2 \sum_i \min(v_1^i, v_2^i)}{\sum_i v_1^i + \sum_i v_2^i}$$
 
-**L1 Similarity**
-The normalized L1-based similarity uses the mean Manhattan distance per aligned position:
-$$\text{L1Sim}(v_1, v_2) = \frac{1}{1 + \frac{1}{L} \sum_i |v_1^i - v_2^i|}$$
-
 **Pearson Correlation Coefficient (PCC)**
 For linear correlation between profiles or motif columns, the PCC is calculated as:
 $$\text{PCC}(v_1, v_2) = \frac{\sum_i (v_1^i - \bar{v}_1)(v_2^i - \bar{v}_2)}{\sqrt{\sum_i (v_1^i - \bar{v}_1)^2 \sum_i (v_2^i - \bar{v}_2)^2}}$$
+
+**Cosine Similarity**
+For matrix and tensor alignment, cosine similarity is computed column-wise:
+$$\text{COS}(u,v) = \frac{\sum_i u_i v_i}{\sqrt{\sum_i u_i^2}\sqrt{\sum_i v_i^2}}$$
+
+**Euclidean-Distance Score (ED)**
+For `motif` mode, Euclidean distance is converted to a maximize-able score by negation:
+$$\text{EDScore}(u,v) = -\left\lVert u - v \right\rVert_2$$
 
 #### Motif Matrix/Tensor Comparison
 
@@ -53,12 +52,12 @@ When `--pfm-mode` is enabled (or model types are different), MIMOSA uses the fol
    $$
    This yields one best site (length $L$) and one best score $\hat{s}_i$ per sequence.
 
-2. **Top-scoring site filtering (25%)**  
-   Sites are sorted by $\hat{s}_i$ and only the strongest quartile is retained:
+2. **Top-scoring site filtering**  
+   Sites are sorted by $\hat{s}_i$ and only the strongest fraction is retained:
    $$
-   K = \max\left(1, \left\lfloor 0.25N \right\rfloor\right)
+   K = \max\left(1, \left\lfloor fN \right\rfloor\right)
    $$
-   where $N$ is the number of sequences.
+   where $N$ is the number of sequences and $f$ is `pfm_top_fraction` (default `0.05`).
 
 3. **PFM reconstruction from selected sites**  
    Let $\mathcal{I}_{\text{top}}$ be indices of retained sites. Raw counts are:
@@ -117,7 +116,7 @@ To estimate the statistical significance (p-values) of observed similarity score
     * **Random kernel draw**: kernel coefficients are sampled from a normal distribution and smoothed with a short filter.
     * **Identity mixing**: the random kernel is mixed with an identity (delta) kernel using the distortion coefficient `alpha` (`--distortion`), where `alpha=0` keeps identity and `alpha=1` gives fully random distortion.
     * **Optional sign flip**: the final kernel can be negated with probability 0.5.
-    * **Segment-wise convolution**: each ragged sequence segment is convolved independently, then converted back to frequency space.
+    * **Segment-wise convolution**: each ragged sequence segment is convolved independently, then re-normalized with the active profile normalization mode.
 
 2. **Permutation**: for matrix-based comparisons (`motif`), the tool performs random column-wise permutations.
    For $R$ permutations, the empirical p-value is computed as:
@@ -146,15 +145,19 @@ pip install mimosa-tool
 
 ### From Source
 
-If you want to contribute to development or build the latest version from the repository, you will need a C++ compiler with **C++17 support** (e.g., GCC, Clang, or MSVC).
+If you want to contribute to development or build the latest version from the repository, you will need a C++ compiler with **C++17 support** (e.g. GCC, Clang, or MSVC).
 
 ```bash
 # Clone the repository
 git clone https://github.com/ubercomrade/mimosa.git
 cd mimosa
 
-# Install in editable mode
-pip install -e .
+# Install development dependencies
+uv sync --group dev
+uv sync --group test
+
+# Install editable package and build the native extension
+uv pip install -e . --no-build-isolation
 ```
 
 ### Dependencies
@@ -176,7 +179,7 @@ To build the C++ extension from source, the following tools are used:
 
 ## CLI Reference
 
-The `mimosa` tool provides three operation modes.
+The `mimosa` tool provides three comparison modes and one cache-management command.
 
 ### `profile` mode
 
@@ -185,9 +188,11 @@ The `mimosa` tool provides three operation modes.
 - precomputed FASTA-like score files via `--model*-type scores`
 - motif models (`pwm`, `bamm`, `sitega`, `dimont`, `slim`) that are first scanned on sequences to obtain profiles
 
-Profile normalization is empirical on the current score sample, using
-`-log10(count(score >= threshold) / total)`. External promoter/background
-sequences are not used in `profile` mode.
+Profile normalization uses empirical log-tail calibration shared across profile workflows:
+
+- `empirical_log_tail` scans both `+` and `-` strands on the calibration set and converts scores with `-log10(count(score >= threshold) / total_scores)`.
+
+If `--promoters` is provided, calibration is fitted on the promoter set and then applied to the comparison sequences. Otherwise calibration is fitted on the same sequences that are used for comparison.
 
 **Example data**: [`examples/scores_1.fasta`](examples/scores_1.fasta), [`examples/pif4.meme`](examples/pif4.meme)
 
@@ -204,6 +209,7 @@ mimosa profile foxa2.meme gata4.meme \
   --model1-type pwm \
   --model2-type pwm \
   --fasta foreground.fa \
+  --promoters background.fa \
   --metric co \
   --permutations 1000
 ```
@@ -217,6 +223,7 @@ mimosa profile foxa2.meme gata4.meme \
 | `--model1-type` | `scores`, `pwm`, `bamm`, `sitega`, `dimont`, `slim` | Format of the first input (required). |
 | `--model2-type` | `scores`, `pwm`, `bamm`, `sitega`, `dimont`, `slim` | Format of the second input (required). |
 | `--fasta` | Path | FASTA file used to scan motif inputs. If omitted when scanning is needed, random sequences are generated. |
+| `--promoters` | Path | Optional FASTA file used to fit profile normalization before transforming the comparison sequences. |
 | `--num-sequences` | Integer | Number of generated sequences for scanning mode (default: `1000`). |
 | `--seq-length` | Integer | Length of generated sequences for scanning mode (default: `200`). |
 | `--metric` | `co`, `dice` | Similarity metric for profile comparison (default: `co`). |
@@ -225,8 +232,11 @@ mimosa profile foxa2.meme gata4.meme \
 | `--search-range` | Integer | Maximum offset range explored during alignment (default: `10`). |
 | `--min-kernel-size` | Integer | Minimum surrogate convolution kernel size; the range must include an odd value (default: `3`). |
 | `--max-kernel-size` | Integer | Maximum surrogate convolution kernel size; the range must include an odd value (default: `11`). |
+| `--min-logfpr` | Float | Optional floor applied after normalization; aligned pairs are ignored only when both values are below this threshold. |
 | `--seed` | Integer | Global random seed. |
 | `--jobs` | Integer | Number of parallel jobs (`-1` uses all cores). |
+| `--cache` | `off`, `on` | Enable lazy disk cache for derived profiles (default: `off`). |
+| `--cache-dir` | Path | Directory for cached profile artifacts (default: `.mimosa-cache`). |
 | `-v`, `--verbose` | Flag | Enable verbose logging. |
 
 ### `motif` mode
@@ -260,6 +270,7 @@ When `--pfm-mode` is enabled, or when the model types differ, MIMOSA reconstruct
 | `--permutations` | Integer | Number of Monte Carlo permutations (default: `0`). |
 | `--permute-rows` | Flag | Shuffle matrix rows in addition to positions during permutations. |
 | `--pfm-mode` | Flag | Force sequence-driven PFM reconstruction before comparison. |
+| `--pfm-top-fraction` | Float | Fraction of top-scoring reconstructed sites used for PFM reconstruction (default: `0.05`). |
 | `--seed` | Integer | Global random seed. |
 | `--jobs` | Integer | Number of parallel jobs (`-1` uses all cores). |
 | `-v`, `--verbose` | Flag | Enable verbose logging. |
@@ -295,6 +306,20 @@ mimosa motali sitega_gata2.mat gata2.meme \
 | `--shift` | Integer | Maximum motif-center shift (default: `50`). |
 | `-v`, `--verbose` | Flag | Enable verbose logging. |
 
+### `cache` command
+
+`cache clear` removes lazy profile-cache artifacts created by `profile --cache on`.
+
+```bash
+mimosa cache clear --cache-dir .mimosa-cache
+```
+
+| Flag | Value | Comment |
+| :--- | :--- | :--- |
+| `clear` | Command | Remove cached profile artifacts. |
+| `--cache-dir` | Path | Cache directory to clear (default: `.mimosa-cache`). |
+| `-v`, `--verbose` | Flag | Enable verbose logging. |
+
 ## Library Usage
 
 MIMOSA exposes a functional API. The core building blocks are:
@@ -302,7 +327,7 @@ MIMOSA exposes a functional API. The core building blocks are:
 - `GenericModel` (`mimosa.models`) as a model container with mutable runtime config.
 - `read_model(...)`, `scan_model(...)`, `get_sites(...)`, `get_pfm(...)` (`mimosa.models`) for model I/O and scanning.
 - `create_comparator_config(...)` and `compare(...)` (`mimosa.comparison`) for direct strategy execution.
-- `compare_motifs(...)`, `create_config(...)`, `run_comparison(...)` (`mimosa`) as high-level entry points.
+- `compare_motifs(...)`, `create_config(...)`, `run_comparison(...)`, `clear_cache(...)` (`mimosa`) as high-level entry points.
 
 ### Implementing a Custom Model Type
 
@@ -416,6 +441,7 @@ result = compare_motifs(
     model2=model2,
     strategy="profile",
     sequences=sequences,
+    profile_normalization="empirical_log_tail",
     metric="co",
     n_permutations=100,
     seed=42,
@@ -477,6 +503,7 @@ config = create_comparator_config(
     n_permutations=100,
     seed=42,
     search_range=10,
+    profile_normalization="empirical_log_tail",
 )
 
 result = compare(

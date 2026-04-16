@@ -59,11 +59,21 @@ test = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py312"
+target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B"]
+select = ["E", "F", "I", "B", "C90", "PLR", "SIM", "RET", "ARG"]
 ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"src/mimosa/_core/__init__.py" = ["ARG001"]
+"src/mimosa/api.py" = ["PLR0913"]
+"src/mimosa/comparison.py" = ["PLR0913"]
+"src/mimosa/execute.py" = ["PLR0913", "PLR2004"]
+"src/mimosa/functions.py" = ["PLR0913"]
+"src/mimosa/models.py" = ["PLR0913"]
+"examples/*.py" = ["PLR0913"]
+"tests/*.py" = ["ARG001", "C901", "PLR0913", "PLR2004"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

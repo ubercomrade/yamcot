@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import numpy as np
 from numba import float32, int64, njit, prange, types
 
@@ -21,18 +23,25 @@ _PROFILE_SPARSE_STATS_SIGNATURE = types.Tuple((float32[::1], float32[::1], float
 _PROFILE_REDUCER_SIGNATURE = types.Tuple((float32, int64))(float32[::1], float32[::1], float32[::1], int64)
 
 
+@dataclass(frozen=True)
+class ProfileScoreOptions:
+    """Options for overlap-based profile scoring."""
+
+    search_range: int
+    min_value: float = 0.0
+    metric: str = "co"
+
+
 def pfm_to_pwm(pfm):
     """Convert Position Frequency Matrix to Position Weight Matrix."""
-    pwm = np.log((pfm + 0.0001) / 0.25)
-    return pwm
+    return np.log((pfm + 0.0001) / 0.25)
 
 
 def pcm_to_pfm(pcm, pseudocount: float = 0.25):
     """Convert Position Count Matrix to Position Frequency Matrix."""
     number_of_sites = pcm.sum(axis=0)
     nuc_pseudo = float(pseudocount)
-    pfm = (pcm + nuc_pseudo) / (number_of_sites + 4.0 * nuc_pseudo)
-    return pfm
+    return (pcm + nuc_pseudo) / (number_of_sites + 4.0 * nuc_pseudo)
 
 
 def build_score_log_tail_table(scores: np.ndarray) -> np.ndarray:
@@ -261,10 +270,7 @@ def precision_recall_curve(classification, scores):
     number_of_true = np.sum(classification == 1)
     number_of_false = np.sum(classification == 0)
 
-    if number_of_false == 0:
-        true_false_ratio = 1.0
-    else:
-        true_false_ratio = number_of_true / number_of_false
+    true_false_ratio = 1.0 if number_of_false == 0 else number_of_true / number_of_false
 
     position = 1
     score = sorted_scores[0]
@@ -483,6 +489,79 @@ def _lower_bound_int64(arr, left, right, value):
     return left
 
 
+@njit(inline="always", cache=True)
+def _accumulate_overlap_value(inters, sum1s, sum2s, offset_idx, v1, v2):
+    """Accumulate one aligned value pair into overlap statistics."""
+    sum1s[offset_idx] += v1
+    sum2s[offset_idx] += v2
+    inters[offset_idx] += v1 if v1 < v2 else v2
+
+
+@njit(inline="always", cache=True)
+def _accumulate_dense_shift_numba(data1, base1, data2, base2, overlap, min_value, offset_idx, inters, sum1s, sum2s):
+    """Accumulate dense overlap statistics for one shift."""
+    thresholded = min_value > np.float32(0.0)
+    for pos in range(overlap):
+        v1 = data1[base1 + pos]
+        v2 = data2[base2 + pos]
+        if thresholded and v1 < min_value and v2 < min_value:
+            continue
+        _accumulate_overlap_value(inters, sum1s, sum2s, offset_idx, v1, v2)
+
+
+@njit(inline="always", cache=True)
+def _accumulate_sparse_shift_numba(
+    data1,
+    start1,
+    active_idx1,
+    a_lo,
+    a_hi,
+    data2,
+    start2,
+    active_idx2,
+    b_lo,
+    b_hi,
+    shift,
+    offset_idx,
+    inters,
+    sum1s,
+    sum2s,
+    sentinel,
+    negative_shift,
+):
+    """Accumulate sparse overlap statistics for one shift direction."""
+    ia = a_lo
+    ib = b_lo
+    while ia < a_hi or ib < b_hi:
+        pos_a = active_idx1[ia] if ia < a_hi else sentinel
+        if ib < b_hi:
+            raw_b = active_idx2[ib]
+            pos_b = raw_b - shift if negative_shift else raw_b + shift
+        else:
+            pos_b = sentinel
+
+        if pos_a < pos_b:
+            pos = pos_a
+            ia += 1
+        elif pos_b < pos_a:
+            pos = pos_b
+            ib += 1
+        else:
+            pos = pos_a
+            ia += 1
+            ib += 1
+
+        paired_pos = pos + shift if negative_shift else pos - shift
+        _accumulate_overlap_value(
+            inters,
+            sum1s,
+            sum2s,
+            offset_idx,
+            data1[start1 + pos],
+            data2[start2 + paired_pos],
+        )
+
+
 @njit(_PROFILE_SPARSE_STATS_SIGNATURE, fastmath=True, cache=True)
 def _accumulate_profile_stats_sparse_numba(
     data1,
@@ -527,29 +606,25 @@ def _accumulate_profile_stats_sparse_numba(
             a_hi = _lower_bound_int64(active_idx1, a_lo, a_end, overlap)
             b_lo = _lower_bound_int64(active_idx2, b_begin, b_end, neg_shift)
             b_hi = _lower_bound_int64(active_idx2, b_lo, b_end, neg_shift + overlap)
-
-            ia = a_lo
-            ib = b_lo
-            while ia < a_hi or ib < b_hi:
-                pos_a = active_idx1[ia] if ia < a_hi else sentinel
-                pos_b = active_idx2[ib] - neg_shift if ib < b_hi else sentinel
-
-                if pos_a < pos_b:
-                    pos = pos_a
-                    ia += 1
-                elif pos_b < pos_a:
-                    pos = pos_b
-                    ib += 1
-                else:
-                    pos = pos_a
-                    ia += 1
-                    ib += 1
-
-                v1 = data1[start1 + pos]
-                v2 = data2[start2 + pos + neg_shift]
-                sum1s[offset_idx] += v1
-                sum2s[offset_idx] += v2
-                inters[offset_idx] += v1 if v1 < v2 else v2
+            _accumulate_sparse_shift_numba(
+                data1,
+                start1,
+                active_idx1,
+                a_lo,
+                a_hi,
+                data2,
+                start2,
+                active_idx2,
+                b_lo,
+                b_hi,
+                neg_shift,
+                offset_idx,
+                inters,
+                sum1s,
+                sum2s,
+                sentinel,
+                True,
+            )
 
         for pos_shift in range(search_range + 1):
             offset_idx = center + pos_shift
@@ -561,83 +636,32 @@ def _accumulate_profile_stats_sparse_numba(
             a_hi = _lower_bound_int64(active_idx1, a_lo, a_end, pos_shift + overlap)
             b_lo = b_begin
             b_hi = _lower_bound_int64(active_idx2, b_lo, b_end, overlap)
-
-            ia = a_lo
-            ib = b_lo
-            while ia < a_hi or ib < b_hi:
-                pos_a = active_idx1[ia] if ia < a_hi else sentinel
-                pos_b = active_idx2[ib] + pos_shift if ib < b_hi else sentinel
-
-                if pos_a < pos_b:
-                    pos = pos_a
-                    ia += 1
-                elif pos_b < pos_a:
-                    pos = pos_b
-                    ib += 1
-                else:
-                    pos = pos_a
-                    ia += 1
-                    ib += 1
-
-                v1 = data1[start1 + pos]
-                v2 = data2[start2 + pos - pos_shift]
-                sum1s[offset_idx] += v1
-                sum2s[offset_idx] += v2
-                inters[offset_idx] += v1 if v1 < v2 else v2
-
-    return inters, sum1s, sum2s
-
-
-@njit(_PROFILE_STATS_SIGNATURE, fastmath=True, cache=True)
-def _accumulate_profile_stats_no_threshold_numba(data1, offsets1, data2, offsets2, search_range):
-    """Accumulate overlap statistics for all offsets without threshold masking."""
-    n_seq = len(offsets1) - 1
-    n_offsets = 2 * search_range + 1
-    center = search_range
-    inters = np.zeros(n_offsets, dtype=np.float32)
-    sum1s = np.zeros(n_offsets, dtype=np.float32)
-    sum2s = np.zeros(n_offsets, dtype=np.float32)
-
-    for i in range(n_seq):
-        start1 = offsets1[i]
-        end1 = offsets1[i + 1]
-        start2 = offsets2[i]
-        end2 = offsets2[i + 1]
-        vlen1 = end1 - start1
-        vlen2 = end2 - start2
-
-        for neg_shift in range(1, search_range + 1):
-            offset_idx = center - neg_shift
-            overlap = min(vlen1, vlen2 - neg_shift)
-            base1 = start1
-            base2 = start2 + neg_shift
-
-            for j in range(overlap):
-                v1 = data1[base1 + j]
-                v2 = data2[base2 + j]
-                sum1s[offset_idx] += v1
-                sum2s[offset_idx] += v2
-                inters[offset_idx] += v1 if v1 < v2 else v2
-
-        for pos_shift in range(search_range + 1):
-            offset_idx = center + pos_shift
-            overlap = min(vlen1 - pos_shift, vlen2)
-            base1 = start1 + pos_shift
-            base2 = start2
-
-            for j in range(overlap):
-                v1 = data1[base1 + j]
-                v2 = data2[base2 + j]
-                sum1s[offset_idx] += v1
-                sum2s[offset_idx] += v2
-                inters[offset_idx] += v1 if v1 < v2 else v2
+            _accumulate_sparse_shift_numba(
+                data1,
+                start1,
+                active_idx1,
+                a_lo,
+                a_hi,
+                data2,
+                start2,
+                active_idx2,
+                b_lo,
+                b_hi,
+                pos_shift,
+                offset_idx,
+                inters,
+                sum1s,
+                sum2s,
+                sentinel,
+                False,
+            )
 
     return inters, sum1s, sum2s
 
 
 @njit(_PROFILE_STATS_THRESHOLD_SIGNATURE, fastmath=True, cache=True)
-def _accumulate_profile_stats_threshold_numba(data1, offsets1, data2, offsets2, search_range, min_value):
-    """Accumulate overlap statistics for all offsets with threshold masking."""
+def _accumulate_profile_stats_dense_numba(data1, offsets1, data2, offsets2, search_range, min_value):
+    """Accumulate overlap statistics for all offsets with optional threshold masking."""
     n_seq = len(offsets1) - 1
     n_offsets = 2 * search_range + 1
     center = search_range
@@ -656,32 +680,42 @@ def _accumulate_profile_stats_threshold_numba(data1, offsets1, data2, offsets2, 
         for neg_shift in range(1, search_range + 1):
             offset_idx = center - neg_shift
             overlap = min(vlen1, vlen2 - neg_shift)
+            if overlap <= 0:
+                continue
             base1 = start1
             base2 = start2 + neg_shift
-
-            for j in range(overlap):
-                v1 = data1[base1 + j]
-                v2 = data2[base2 + j]
-                if v1 < min_value and v2 < min_value:
-                    continue
-                sum1s[offset_idx] += v1
-                sum2s[offset_idx] += v2
-                inters[offset_idx] += v1 if v1 < v2 else v2
+            _accumulate_dense_shift_numba(
+                data1,
+                base1,
+                data2,
+                base2,
+                overlap,
+                min_value,
+                offset_idx,
+                inters,
+                sum1s,
+                sum2s,
+            )
 
         for pos_shift in range(search_range + 1):
             offset_idx = center + pos_shift
             overlap = min(vlen1 - pos_shift, vlen2)
+            if overlap <= 0:
+                continue
             base1 = start1 + pos_shift
             base2 = start2
-
-            for j in range(overlap):
-                v1 = data1[base1 + j]
-                v2 = data2[base2 + j]
-                if v1 < min_value and v2 < min_value:
-                    continue
-                sum1s[offset_idx] += v1
-                sum2s[offset_idx] += v2
-                inters[offset_idx] += v1 if v1 < v2 else v2
+            _accumulate_dense_shift_numba(
+                data1,
+                base1,
+                data2,
+                base2,
+                overlap,
+                min_value,
+                offset_idx,
+                inters,
+                sum1s,
+                sum2s,
+            )
 
     return inters, sum1s, sum2s
 
@@ -744,6 +778,20 @@ def _normalize_profile_support_inputs(active_idx, active_ptr):
     )
 
 
+def _unpack_profile_input(profile):
+    """Return profile arrays from RaggedData or a raw ``(data, offsets)`` pair."""
+    if isinstance(profile, RaggedData):
+        return profile.data, profile.offsets
+    return profile
+
+
+def _normalize_support_pair(support):
+    """Return one optional support pair as contiguous arrays."""
+    if support is None:
+        return None
+    return _normalize_profile_support_inputs(*support)
+
+
 def build_profile_support(data, offsets, min_value):
     """Build sparse support for profile positions that meet the threshold."""
     data, offsets = _normalize_profile_score_inputs(data, offsets)
@@ -752,59 +800,52 @@ def build_profile_support(data, offsets, min_value):
 
 
 def fast_profile_score(
-    data1,
-    offsets1,
-    data2,
-    offsets2,
-    search_range,
-    min_value=0.0,
-    metric="co",
-    active_idx1=None,
-    active_ptr1=None,
-    active_idx2=None,
-    active_ptr2=None,
+    profile1,
+    profile2,
+    options: ProfileScoreOptions,
+    supports=None,
 ):
     """Dispatch profile similarity scoring to specialized overlap-based kernels."""
-    data1, offsets1 = _normalize_profile_score_inputs(data1, offsets1)
-    data2, offsets2 = _normalize_profile_score_inputs(data2, offsets2)
-    search_range = np.int64(search_range)
-    min_value = np.float32(min_value)
+    data1, offsets1 = _normalize_profile_score_inputs(*_unpack_profile_input(profile1))
+    data2, offsets2 = _normalize_profile_score_inputs(*_unpack_profile_input(profile2))
+    search_range = np.int64(options.search_range)
+    min_value = np.float32(options.min_value)
     thresholded = min_value > np.float32(0.0)
+    support1, support2 = (None, None) if supports is None else supports
+    normalized_support1 = _normalize_support_pair(support1)
+    normalized_support2 = _normalize_support_pair(support2)
 
-    use_sparse = (
-        active_idx1 is not None and active_ptr1 is not None and active_idx2 is not None and active_ptr2 is not None
-    )
+    use_sparse = normalized_support1 is not None and normalized_support2 is not None
     if thresholded and not use_sparse:
-        active_idx1, active_ptr1 = build_profile_support(data1, offsets1, min_value)
-        active_idx2, active_ptr2 = build_profile_support(data2, offsets2, min_value)
+        normalized_support1 = build_profile_support(data1, offsets1, min_value)
+        normalized_support2 = build_profile_support(data2, offsets2, min_value)
         use_sparse = True
 
     if use_sparse:
-        active_idx1, active_ptr1 = _normalize_profile_support_inputs(active_idx1, active_ptr1)
-        active_idx2, active_ptr2 = _normalize_profile_support_inputs(active_idx2, active_ptr2)
         inters, sum1s, sum2s = _accumulate_profile_stats_sparse_numba(
             data1,
             offsets1,
-            active_idx1,
-            active_ptr1,
+            normalized_support1[0],
+            normalized_support1[1],
             data2,
             offsets2,
-            active_idx2,
-            active_ptr2,
+            normalized_support2[0],
+            normalized_support2[1],
             search_range,
         )
-    elif thresholded:
-        inters, sum1s, sum2s = _accumulate_profile_stats_threshold_numba(
-            data1, offsets1, data2, offsets2, search_range, min_value
-        )
     else:
-        inters, sum1s, sum2s = _accumulate_profile_stats_no_threshold_numba(
-            data1, offsets1, data2, offsets2, search_range
+        inters, sum1s, sum2s = _accumulate_profile_stats_dense_numba(
+            data1,
+            offsets1,
+            data2,
+            offsets2,
+            search_range,
+            min_value,
         )
 
-    if metric == "co":
+    if options.metric == "co":
         return _best_profile_score_co_numba(inters, sum1s, sum2s, search_range)
-    if metric == "dice":
+    if options.metric == "dice":
         return _best_profile_score_dice_numba(inters, sum1s, sum2s, search_range)
 
     raise ValueError("metric must be one of: 'co', 'dice'")

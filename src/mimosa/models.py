@@ -35,10 +35,12 @@ from mimosa.io import (
     write_sitega,
 )
 from mimosa.ragged import RaggedData
+from mimosa.validation import validate_site_mode
 
 StrandMode = Literal["best", "+", "-"]
 _SEQ_DECODER = np.array(["A", "C", "G", "T", "N"], dtype="U1")
 _RC_TABLE = np.array([3, 2, 1, 0, 4], dtype=np.int8)
+_NUCLEOTIDE_CARDINALITY = 4
 
 
 @dataclass(eq=False)
@@ -50,6 +52,25 @@ class GenericModel:
     representation: Any = dc_field(hash=False)
     length: int
     config: dict = dc_field(default_factory=dict, hash=False)
+
+
+@dataclass(frozen=True)
+class HitSelectionConfig:
+    """Inputs that define one hit-extraction request."""
+
+    mode: str = "best"
+    fpr_threshold: Optional[float] = None
+    background_sequences: Optional[RaggedData] = None
+    threshold_table: Optional[np.ndarray] = dc_field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
+class ResolvedHits:
+    """Resolved hit arrays plus the threshold metadata used to produce them."""
+
+    hit_arrays: dict[str, np.ndarray]
+    threshold_table: Optional[np.ndarray]
+    score_threshold: Optional[float]
 
 
 class ModelRegistry:
@@ -291,6 +312,35 @@ def _resolve_hit_threshold_table(
     return calculate_threshold_table(model, calibration_sequences, strand="best")
 
 
+def _resolve_hits(
+    model: GenericModel,
+    sequences: RaggedData,
+    selection: HitSelectionConfig,
+    *,
+    include_threshold_table: bool,
+) -> ResolvedHits:
+    """Resolve hit arrays and optional threshold metadata for one request."""
+    mode = validate_site_mode(selection.mode, selection.fpr_threshold)
+    threshold_table = None
+    score_threshold = None
+
+    if include_threshold_table or mode == "threshold":
+        threshold_table = _resolve_hit_threshold_table(
+            model,
+            sequences,
+            selection.background_sequences,
+            selection.threshold_table,
+        )
+
+    if mode == "threshold":
+        score_threshold = _tail_probability_to_score(float(selection.fpr_threshold), threshold_table)
+        logger = logging.getLogger(__name__)
+        logger.info("FPR threshold: %s -> score threshold: %.4f", selection.fpr_threshold, score_threshold)
+
+    hit_arrays = _sort_hit_arrays(_collect_hits(model, sequences, mode, score_threshold))
+    return ResolvedHits(hit_arrays=hit_arrays, threshold_table=threshold_table, score_threshold=score_threshold)
+
+
 def _extract_site_matrix(
     sequences: RaggedData,
     seq_indices: np.ndarray,
@@ -330,7 +380,7 @@ def _build_pcm_from_site_matrix(site_matrix: np.ndarray, motif_length: int) -> n
     if site_matrix.size == 0:
         return pcm
 
-    valid_mask = site_matrix < 4
+    valid_mask = site_matrix < _NUCLEOTIDE_CARDINALITY
     col_idx = np.broadcast_to(np.arange(motif_length, dtype=np.int64), site_matrix.shape)
     np.add.at(pcm, (site_matrix[valid_mask], col_idx[valid_mask]), 1.0)
     return pcm
@@ -360,6 +410,72 @@ def _select_top_hit_arrays(hit_arrays: dict[str, np.ndarray], top_fraction: Opti
     return {key: values[keep_idx] for key, values in hit_arrays.items()}
 
 
+def _empty_sites_frame() -> pd.DataFrame:
+    """Return an empty site table with the public schema."""
+    return pd.DataFrame(
+        {
+            "seq_index": np.empty(0, dtype=np.int64),
+            "start": np.empty(0, dtype=np.int64),
+            "end": np.empty(0, dtype=np.int64),
+            "strand": np.empty(0, dtype=object),
+            "score": np.empty(0, dtype=np.float32),
+            "log_tail": np.empty(0, dtype=np.float64),
+            "site": np.empty(0, dtype=object),
+        }
+    )
+
+
+def _build_sites_frame(
+    model: GenericModel,
+    sequences: RaggedData,
+    hit_arrays: dict[str, np.ndarray],
+    threshold_table: np.ndarray,
+) -> pd.DataFrame:
+    """Build the public site table from resolved hits."""
+    if hit_arrays["score"].size == 0:
+        return _empty_sites_frame()
+
+    site_matrix = _extract_site_matrix(
+        sequences,
+        hit_arrays["seq_index"],
+        hit_arrays["start"],
+        model.length,
+        hit_arrays["strand_idx"],
+    )
+    return pd.DataFrame(
+        {
+            "seq_index": hit_arrays["seq_index"],
+            "start": hit_arrays["start"],
+            "end": hit_arrays["start"] + model.length,
+            "strand": np.where(hit_arrays["strand_idx"] == 0, "+", "-"),
+            "score": hit_arrays["score"],
+            "log_tail": _scores_to_log_tail_array(hit_arrays["score"], threshold_table),
+            "site": _site_matrix_to_strings(site_matrix),
+        }
+    )
+
+
+def _hits_to_pfm(
+    model: GenericModel,
+    sequences: RaggedData,
+    hit_arrays: dict[str, np.ndarray],
+    pseudocount: float,
+) -> np.ndarray:
+    """Convert a selected hit set to a PFM."""
+    if hit_arrays["score"].size == 0:
+        raise ValueError("No sites found")
+
+    site_matrix = _extract_site_matrix(
+        sequences,
+        hit_arrays["seq_index"],
+        hit_arrays["start"],
+        model.length,
+        hit_arrays["strand_idx"],
+    )
+    pcm = _build_pcm_from_site_matrix(site_matrix, model.length)
+    return pcm_to_pfm(pcm, pseudocount=pseudocount).astype(np.float32, copy=False)
+
+
 def get_sites(
     model: GenericModel,
     sequences: RaggedData,
@@ -369,59 +485,21 @@ def get_sites(
     threshold_table: Optional[np.ndarray] = None,
 ) -> pd.DataFrame:
     """Find motif binding sites in sequences."""
-    if mode not in ["best", "threshold"]:
-        raise ValueError(f"mode must be 'best' or 'threshold', got {mode}")
-    if mode == "threshold" and fpr_threshold is None:
-        raise ValueError("fpr_threshold is required for mode='threshold'")
-
-    resolved_threshold_table = _resolve_hit_threshold_table(model, sequences, background_sequences, threshold_table)
-
-    score_threshold = (
-        _tail_probability_to_score(float(fpr_threshold), resolved_threshold_table)
-        if mode == "threshold" and fpr_threshold is not None
-        else None
+    resolved = _resolve_hits(
+        model,
+        sequences,
+        HitSelectionConfig(
+            mode=mode,
+            fpr_threshold=fpr_threshold,
+            background_sequences=background_sequences,
+            threshold_table=threshold_table,
+        ),
+        include_threshold_table=True,
     )
-    if score_threshold is not None:
-        logger = logging.getLogger(__name__)
-        logger.info(f"FPR threshold: {fpr_threshold} -> score threshold: {score_threshold:.4f}")
-
-    hit_arrays = _collect_hits(model, sequences, mode, score_threshold)
-    hit_arrays = _sort_hit_arrays(hit_arrays)
-
-    if hit_arrays["score"].size == 0:
-        df = pd.DataFrame(
-            {
-                "seq_index": np.empty(0, dtype=np.int64),
-                "start": np.empty(0, dtype=np.int64),
-                "end": np.empty(0, dtype=np.int64),
-                "strand": np.empty(0, dtype=object),
-                "score": np.empty(0, dtype=np.float32),
-                "log_tail": np.empty(0, dtype=np.float64),
-                "site": np.empty(0, dtype=object),
-            }
-        )
-    else:
-        site_matrix = _extract_site_matrix(
-            sequences,
-            hit_arrays["seq_index"],
-            hit_arrays["start"],
-            model.length,
-            hit_arrays["strand_idx"],
-        )
-        df = pd.DataFrame(
-            {
-                "seq_index": hit_arrays["seq_index"],
-                "start": hit_arrays["start"],
-                "end": hit_arrays["start"] + model.length,
-                "strand": np.where(hit_arrays["strand_idx"] == 0, "+", "-"),
-                "score": hit_arrays["score"],
-                "log_tail": _scores_to_log_tail_array(hit_arrays["score"], resolved_threshold_table),
-                "site": _site_matrix_to_strings(site_matrix),
-            }
-        )
+    df = _build_sites_frame(model, sequences, resolved.hit_arrays, resolved.threshold_table)
 
     logger = logging.getLogger(__name__)
-    logger.info(f"Found {len(df)} site(s) in {sequences.num_sequences} sequence(s)")
+    logger.info("Found %s site(s) in %s sequence(s)", len(df), sequences.num_sequences)
     return df
 
 
@@ -440,43 +518,22 @@ def get_pfm(
     del force_recompute
 
     logger = logging.getLogger(__name__)
-    logger.info(f"Computing PFM for model: {model.name}")
-
-    if mode not in ["best", "threshold"]:
-        raise ValueError(f"mode must be 'best' or 'threshold', got {mode}")
-    if mode == "threshold" and fpr_threshold is None:
-        raise ValueError("fpr_threshold is required for mode='threshold'")
-
-    resolved_threshold_table = None
-    if mode == "threshold":
-        resolved_threshold_table = _resolve_hit_threshold_table(model, sequences, background_sequences, threshold_table)
-
-    score_threshold = (
-        _tail_probability_to_score(float(fpr_threshold), resolved_threshold_table)
-        if mode == "threshold" and fpr_threshold is not None and resolved_threshold_table is not None
-        else None
-    )
-
-    hit_arrays = _collect_hits(model, sequences, mode, score_threshold)
-    if hit_arrays["score"].size == 0:
-        raise ValueError("No sites found")
-
-    selected_hits = _select_top_hit_arrays(hit_arrays, top_fraction)
-    if top_fraction is not None:
-        logger.info(f"Selected top {top_fraction * 100:.1f}%: {selected_hits['score'].size} sites")
-
-    site_matrix = _extract_site_matrix(
+    logger.info("Computing PFM for model: %s", model.name)
+    resolved = _resolve_hits(
+        model,
         sequences,
-        selected_hits["seq_index"],
-        selected_hits["start"],
-        model.length,
-        selected_hits["strand_idx"],
+        HitSelectionConfig(
+            mode=mode,
+            fpr_threshold=fpr_threshold,
+            background_sequences=background_sequences,
+            threshold_table=threshold_table,
+        ),
+        include_threshold_table=mode == "threshold",
     )
-    pcm = _build_pcm_from_site_matrix(site_matrix, model.length)
-
-    pfm = pcm_to_pfm(pcm, pseudocount=pseudocount).astype(np.float32, copy=False)
-
-    return pfm
+    selected_hits = _select_top_hit_arrays(resolved.hit_arrays, top_fraction)
+    if top_fraction is not None:
+        logger.info("Selected top %.1f%%: %s sites", top_fraction * 100.0, selected_hits["score"].size)
+    return _hits_to_pfm(model, sequences, selected_hits, pseudocount)
 
 
 def _tail_probability_to_score(tail_probability: float, threshold_table: np.ndarray) -> float:
@@ -497,14 +554,13 @@ def _scan_with_batch_kernel(
 
     if strand == "+":
         return batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=False, with_context=with_context)
-    elif strand == "-":
+    if strand == "-":
         return batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=True, with_context=with_context)
-    elif strand == "best":
+    if strand == "best":
         sf = batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=False, with_context=with_context)
         sr = batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=True, with_context=with_context)
         return RaggedData(np.maximum(sf.data, sr.data), sf.offsets)
-    else:
-        raise ValueError(f"Invalid strand mode: {strand}")
+    raise ValueError(f"Invalid strand mode: {strand}")
 
 
 @registry.register("pwm")
@@ -543,7 +599,7 @@ class PwmStrategy:
                     "Unsupported PWM pickle format: source PFM is missing from model.config['_source_pfm']."
                 )
             return model
-        elif ext == ".meme":
+        if ext == ".meme":
             pfm, info, _ = read_meme(path, index=kwargs.get("index", 0))
             name, length = info
         elif ext == ".pfm":
@@ -586,17 +642,16 @@ class SitegaStrategy:
         maximum = model.config.get("maximum")
         if minimum is not None and maximum is not None:
             return minimum, maximum
-        else:
-            return _score_bounds_from_representation(model.representation)
+        return _score_bounds_from_representation(model.representation)
 
     @staticmethod
-    def load(path: str, kwargs: dict) -> GenericModel:
+    def load(path: str, _kwargs: dict) -> GenericModel:
         """Load SiteGA model from file."""
         _, ext = os.path.splitext(path.lower())
 
         if ext == ".pkl":
             return joblib.load(path)
-        elif ext == ".mat":
+        if ext == ".mat":
             representation, name, length, minimum, maximum = read_sitega(path)
         else:
             raise ValueError(f"Unsupported SiteGA format: {path}")
@@ -643,8 +698,7 @@ class BammStrategy:
         _, max_order, _ = parse_file_content(path)
         target_order = kwargs.get("order")
         target_order = max_order if target_order is None else int(target_order)
-        if target_order > max_order:
-            target_order = max_order
+        target_order = min(target_order, max_order)
 
         representation = read_bamm(path, target_order)
         name = os.path.splitext(os.path.basename(path))[0]
@@ -678,13 +732,13 @@ class DimontStrategy:
         return _score_bounds_from_representation(model.representation)
 
     @staticmethod
-    def load(path: str, kwargs: dict) -> GenericModel:
+    def load(path: str, _kwargs: dict) -> GenericModel:
         """Load a Dimont XML model."""
         _, ext = os.path.splitext(path.lower())
 
         if ext == ".pkl":
             return joblib.load(path)
-        elif ext == ".xml":
+        if ext == ".xml":
             representation, length, span = read_dimont(path)
         else:
             raise ValueError(f"Unsupported Dimont format: {path}")
@@ -719,13 +773,13 @@ class SlimStrategy:
         return _score_bounds_from_representation(model.representation)
 
     @staticmethod
-    def load(path: str, kwargs: dict) -> GenericModel:
+    def load(path: str, _kwargs: dict) -> GenericModel:
         """Load a Slim XML model."""
         _, ext = os.path.splitext(path.lower())
 
         if ext == ".pkl":
             return joblib.load(path)
-        elif ext == ".xml":
+        if ext == ".xml":
             representation, length, span = read_slim(path)
         else:
             raise ValueError(f"Unsupported Slim format: {path}")
@@ -745,7 +799,7 @@ class ScoresStrategy:
     """Numerical score-profile strategy implementation."""
 
     @staticmethod
-    def scan(model: GenericModel, sequences: Optional[RaggedData] = None, strand: StrandMode = "best") -> RaggedData:
+    def scan(model: GenericModel, _sequences: Optional[RaggedData] = None, _strand: StrandMode = "best") -> RaggedData:
         """Return stored score profiles directly."""
         return model.config["scores_data"]
 
@@ -763,7 +817,7 @@ class ScoresStrategy:
         return float(np.min(scores_data.data)), float(np.max(scores_data.data))
 
     @staticmethod
-    def load(path: str, kwargs: dict) -> GenericModel:
+    def load(path: str, _kwargs: dict) -> GenericModel:
         """Load numerical score profiles from a FASTA-like text file."""
 
         scores_data = read_scores(path)

@@ -10,6 +10,7 @@ from mimosa.comparison import ComparatorConfig, compare, create_comparator_confi
 from mimosa.io import read_fasta
 from mimosa.models import GenericModel, read_model
 from mimosa.ragged import RaggedData, ragged_from_list
+from mimosa.validation import validate_file_exists, validate_positive_int
 
 ModelRef = Union[GenericModel, str, Path]
 SequenceRef = Union[RaggedData, str, Path]
@@ -147,12 +148,6 @@ def run_comparison(config: ComparisonConfig) -> dict:
     if config.promoters is not None:
         promoters = _resolve_sequences(config.promoters, config)
 
-    if strategy == "profile" and promoters is not None:
-        raise ValueError(
-            "Profile strategy uses empirical normalization on the comparison sequences "
-            "and does not accept promoters."
-        )
-
     needs_sequences = _needs_sequences(strategy, config.comparator, model1, model2)
     if strategy == "motali" and config.sequences is None and promoters is not None:
         sequences = None
@@ -203,9 +198,7 @@ def _needs_sequences(strategy: str, comparator: ComparatorConfig, model1: Generi
         return model1.type_key != "scores" or model2.type_key != "scores"
     if strategy == "motali":
         return True
-    if strategy == "motif" and (comparator.pfm_mode or model1.type_key != model2.type_key):
-        return True
-    return False
+    return strategy == "motif" and (comparator.pfm_mode or model1.type_key != model2.type_key)
 
 
 def _validate_models_for_strategy(strategy: str, model1: GenericModel, model2: GenericModel) -> None:
@@ -238,20 +231,15 @@ def _resolve_sequences(source: Optional[SequenceRef], config: ComparisonConfig) 
     if isinstance(source, RaggedData):
         return source
     if isinstance(source, (str, Path)):
-        path = Path(source)
-        if not path.exists():
-            raise FileNotFoundError(f"Sequence file not found: {path}")
+        path = validate_file_exists(source, "Sequence file")
         return read_fasta(path)
     raise TypeError(f"Unsupported sequence source type: {type(source)!r}")
 
 
 def _generate_random_sequences(num_sequences: int, seq_length: int, seed: int) -> RaggedData:
     """Generate random A/C/G/T integer-encoded sequences."""
-
-    if num_sequences <= 0:
-        raise ValueError(f"num_sequences must be positive, got {num_sequences}")
-    if seq_length <= 0:
-        raise ValueError(f"seq_length must be positive, got {seq_length}")
+    num_sequences = validate_positive_int("num_sequences", num_sequences)
+    seq_length = validate_positive_int("seq_length", seq_length)
 
     rng = np.random.default_rng(seed)
     sequences = [rng.integers(0, 4, size=seq_length, dtype=np.int8) for _ in range(num_sequences)]

@@ -1,13 +1,13 @@
 import argparse
 import json
 import logging
-import os
 import sys
 from typing import Any, Dict
 
 from mimosa.api import create_config, run_comparison
 from mimosa.cache import clear_cache
 from mimosa.comparison import create_comparator_config
+from mimosa.validation import validate_file_exists
 
 PROFILE_MODEL_TYPES = ["scores", "pwm", "bamm", "sitega", "dimont", "slim"]
 MOTIF_MODEL_TYPES = ["pwm", "bamm", "sitega", "dimont", "slim"]
@@ -60,46 +60,125 @@ Examples:
     return parser
 
 
+def _add_input_file_arguments(
+    parser: argparse.ArgumentParser,
+    model_types: list[str],
+    first_help: str,
+    second_help: str,
+) -> argparse._ArgumentGroup:
+    """Add required model inputs and types to one parser."""
+    parser.add_argument("model1", help=first_help)
+    parser.add_argument("model2", help=second_help)
+    io_group = parser.add_argument_group("Input Options")
+    io_group.add_argument(
+        "--model1-type",
+        choices=model_types,
+        required=True,
+        help=f"Format of the first input. Choices: {', '.join(model_types)}.",
+    )
+    io_group.add_argument(
+        "--model2-type",
+        choices=model_types,
+        required=True,
+        help=f"Format of the second input. Choices: {', '.join(model_types)}.",
+    )
+    return io_group
+
+
+def _add_sequence_generation_arguments(
+    io_group: argparse._ArgumentGroup,
+    *,
+    fasta_help: str,
+    num_sequences_default: int,
+    seq_length_default: int,
+    promoters_help: str | None = None,
+) -> None:
+    """Add FASTA- and random-sequence-related arguments."""
+    io_group.add_argument("--fasta", help=fasta_help)
+    if promoters_help is not None:
+        io_group.add_argument("--promoters", help=promoters_help)
+    io_group.add_argument(
+        "--num-sequences",
+        type=int,
+        default=num_sequences_default,
+        help="Number of random sequences to generate when FASTA input is omitted. (default: %(default)s)",
+    )
+    io_group.add_argument(
+        "--seq-length",
+        type=int,
+        default=seq_length_default,
+        help="Length of random sequences generated when FASTA input is omitted. (default: %(default)s)",
+    )
+
+
+def _add_common_technical_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    include_seed: bool = True,
+    include_jobs: bool = True,
+    include_cache: bool = False,
+) -> argparse._ArgumentGroup:
+    """Add shared technical arguments for profile/motif parsers."""
+    technical_group = parser.add_argument_group("Technical Options")
+    technical_group.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging.",
+    )
+    if include_seed:
+        technical_group.add_argument(
+            "--seed",
+            type=int,
+            default=127,
+            help="Global random seed for reproducible stochastic steps. (default: %(default)s)",
+        )
+    if include_jobs:
+        technical_group.add_argument(
+            "--jobs",
+            type=int,
+            default=-1,
+            help="Number of parallel jobs. Use -1 for all cores. (default: %(default)s)",
+        )
+    if include_cache:
+        technical_group.add_argument(
+            "--cache",
+            choices=["off", "on"],
+            default="off",
+            help="Enable lazy disk cache for derived profiles. (default: %(default)s)",
+        )
+        technical_group.add_argument(
+            "--cache-dir",
+            default=".mimosa-cache",
+            help="Directory used for lazy profile cache files. (default: %(default)s)",
+        )
+    return technical_group
+
+
 def _add_profile_parser(subparsers: argparse._SubParsersAction) -> None:
     """Add the profile mode parser."""
     parser = subparsers.add_parser(
         "profile",
         help="Compare motifs via score profiles: either precomputed scores or profiles generated from motif scans.",
     )
-    parser.add_argument("model1", help="Path to the first input model or score-profile file.")
-    parser.add_argument("model2", help="Path to the second input model or score-profile file.")
-
-    io_group = parser.add_argument_group("Input Options")
-    io_group.add_argument(
-        "--model1-type",
-        choices=PROFILE_MODEL_TYPES,
-        required=True,
-        help="Format of the first input. Choices: scores, pwm, bamm, sitega, dimont, slim.",
+    io_group = _add_input_file_arguments(
+        parser,
+        PROFILE_MODEL_TYPES,
+        "Path to the first input model or score-profile file.",
+        "Path to the second input model or score-profile file.",
     )
-    io_group.add_argument(
-        "--model2-type",
-        choices=PROFILE_MODEL_TYPES,
-        required=True,
-        help="Format of the second input. Choices: scores, pwm, bamm, sitega, dimont, slim.",
-    )
-    io_group.add_argument(
-        "--fasta",
-        help=(
+    _add_sequence_generation_arguments(
+        io_group,
+        fasta_help=(
             "Path to FASTA sequences used to scan motif inputs. "
             "If omitted and motif scanning is required, random sequences are generated."
         ),
-    )
-    io_group.add_argument(
-        "--num-sequences",
-        type=int,
-        default=1000,
-        help="Number of random sequences to generate when motif scanning is required. (default: %(default)s)",
-    )
-    io_group.add_argument(
-        "--seq-length",
-        type=int,
-        default=200,
-        help="Length of random sequences generated for motif scanning. (default: %(default)s)",
+        promoters_help=(
+            "Optional FASTA sequences used to calibrate profile normalization. "
+            "If omitted, normalization is fitted on the comparison sequences."
+        ),
+        num_sequences_default=1000,
+        seq_length_default=200,
     )
     profile_group = parser.add_argument_group("Profile Comparison Options")
     profile_group.add_argument(
@@ -145,36 +224,7 @@ def _add_profile_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Ignore aligned positions only when both profile values are below this logFPR threshold.",
     )
 
-    technical_group = parser.add_argument_group("Technical Options")
-    technical_group.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable verbose logging.",
-    )
-    technical_group.add_argument(
-        "--seed",
-        type=int,
-        default=127,
-        help="Global random seed for reproducible stochastic steps. (default: %(default)s)",
-    )
-    technical_group.add_argument(
-        "--jobs",
-        type=int,
-        default=-1,
-        help="Number of parallel jobs. Use -1 for all cores. (default: %(default)s)",
-    )
-    technical_group.add_argument(
-        "--cache",
-        choices=["off", "on"],
-        default="off",
-        help="Enable lazy disk cache for derived profiles. (default: %(default)s)",
-    )
-    technical_group.add_argument(
-        "--cache-dir",
-        default=".mimosa-cache",
-        help="Directory used for lazy profile cache files. (default: %(default)s)",
-    )
+    _add_common_technical_arguments(parser, include_cache=True)
 
 
 def _add_motif_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -183,40 +233,20 @@ def _add_motif_parser(subparsers: argparse._SubParsersAction) -> None:
         "motif",
         help="Compare motifs directly by aligning their matrix or tensor representations.",
     )
-    parser.add_argument("model1", help="Path to the first motif model file.")
-    parser.add_argument("model2", help="Path to the second motif model file.")
-
-    io_group = parser.add_argument_group("Input Options")
-    io_group.add_argument(
-        "--model1-type",
-        choices=MOTIF_MODEL_TYPES,
-        required=True,
-        help="Format of the first motif. Choices: pwm, bamm, sitega, dimont, slim.",
+    io_group = _add_input_file_arguments(
+        parser,
+        MOTIF_MODEL_TYPES,
+        "Path to the first motif model file.",
+        "Path to the second motif model file.",
     )
-    io_group.add_argument(
-        "--model2-type",
-        choices=MOTIF_MODEL_TYPES,
-        required=True,
-        help="Format of the second motif. Choices: pwm, bamm, sitega, dimont, slim.",
-    )
-    io_group.add_argument(
-        "--fasta",
-        help=(
+    _add_sequence_generation_arguments(
+        io_group,
+        fasta_help=(
             "Optional FASTA sequences used for PFM reconstruction. "
             "If omitted when reconstruction is required, random sequences are generated."
         ),
-    )
-    io_group.add_argument(
-        "--num-sequences",
-        type=int,
-        default=20000,
-        help="Number of random sequences to generate for PFM reconstruction. (default: %(default)s)",
-    )
-    io_group.add_argument(
-        "--seq-length",
-        type=int,
-        default=100,
-        help="Length of random sequences for PFM reconstruction. (default: %(default)s)",
+        num_sequences_default=20000,
+        seq_length_default=100,
     )
 
     motif_group = parser.add_argument_group("Motif Comparison Options")
@@ -249,25 +279,7 @@ def _add_motif_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Fraction of top-scoring reconstructed sites used for cross-type PFM comparison. (default: %(default)s)",
     )
 
-    technical_group = parser.add_argument_group("Technical Options")
-    technical_group.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable verbose logging.",
-    )
-    technical_group.add_argument(
-        "--seed",
-        type=int,
-        default=127,
-        help="Global random seed for reproducible stochastic steps. (default: %(default)s)",
-    )
-    technical_group.add_argument(
-        "--jobs",
-        type=int,
-        default=-1,
-        help="Number of parallel jobs. Use -1 for all cores. (default: %(default)s)",
-    )
+    _add_common_technical_arguments(parser)
 
 
 def _add_motali_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -367,43 +379,23 @@ def validate_inputs(args) -> None:
     if args.mode == "cache":
         return
 
-    def validate_kernel_size_range(min_kernel_size: int, max_kernel_size: int) -> None:
-        """Validate kernel-size bounds used by surrogate generation."""
-        if min_kernel_size <= 0 or max_kernel_size <= 0:
-            logger.error("Kernel sizes must be positive integers.")
-            sys.exit(1)
-        if min_kernel_size > max_kernel_size:
-            logger.error(
-                "Invalid kernel-size range: min-kernel-size (%s) must be <= max-kernel-size (%s).",
-                min_kernel_size,
-                max_kernel_size,
-            )
-            sys.exit(1)
-        first_odd = min_kernel_size if min_kernel_size % 2 == 1 else min_kernel_size + 1
-        if first_odd > max_kernel_size:
-            logger.error("Kernel-size range must include at least one odd value.")
-            sys.exit(1)
-
-    def validate_file(path: str, label: str) -> None:
-        """Validate that a required input file exists."""
-        if not os.path.exists(path):
-            logger.error("%s not found: %s", label, path)
-            sys.exit(1)
-
-    validate_file(args.model1, "Input file")
-    validate_file(args.model2, "Input file")
-
+    file_checks = [
+        (args.model1, "Input file"),
+        (args.model2, "Input file"),
+    ]
     if getattr(args, "fasta", None):
-        validate_file(args.fasta, "FASTA file")
-
+        file_checks.append((args.fasta, "FASTA file"))
     if getattr(args, "promoters", None):
-        validate_file(args.promoters, "Promoter FASTA file")
+        file_checks.append((args.promoters, "Promoter FASTA file"))
 
-    if args.mode == "profile":
-        validate_kernel_size_range(args.min_kernel_size, args.max_kernel_size)
-        if args.min_logfpr is not None and args.min_logfpr < 0:
-            logger.error("min-logfpr must be non-negative.")
-            sys.exit(1)
+    try:
+        for path, label in file_checks:
+            validate_file_exists(path, label)
+        if args.mode in {"profile", "motif"}:
+            create_comparator_config(**map_args_to_comparator_kwargs(args))
+    except (FileNotFoundError, ValueError) as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
 
 
 def map_args_to_comparator_kwargs(args) -> Dict[str, Any]:

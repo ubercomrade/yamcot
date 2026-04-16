@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
@@ -14,6 +15,30 @@ import numpy as np
 from mimosa.ragged import RaggedData
 
 _JSTACS_NUMERIC_RE = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[Ee][-+]?\d+)?")
+_LOG_UNIFORM_BASE = float(np.log(4.0))
+_SITEGA_EPS = 1e-9
+
+
+@dataclass(frozen=True)
+class SlimParameters:
+    """Normalized SLIM parameters ready for tensor materialization."""
+
+    length: int
+    span: int
+    alphabet_size: int
+    component_log_probs: list[np.ndarray]
+    ancestor_log_probs: list[list[np.ndarray]]
+    dependency_log_probs: list[list[np.ndarray]]
+
+
+@dataclass(frozen=True)
+class DimontParameters:
+    """Parsed Dimont tree state ready for tensor materialization."""
+
+    length: int
+    span: int
+    nodes: list[dict]
+    root_offsets: np.ndarray
 
 
 def read_fasta(path: str | Path) -> RaggedData:
@@ -167,8 +192,7 @@ def read_meme(path: str, index: int = 0) -> Tuple[np.ndarray, Tuple[str, int], i
     if target_motif is None:
         if motif_count == 0:
             raise ValueError(f"No motifs found in {path}")
-        else:
-            raise IndexError(f"Motif index {index} out of range. File contains {motif_count} motifs.")
+        raise IndexError(f"Motif index {index} out of range. File contains {motif_count} motifs.")
 
     assert target_info is not None
 
@@ -360,15 +384,11 @@ def _build_position_tensor(
 def _context_value(full_context: Tuple[int, ...], span: int, position: int, absolute_position: int) -> int:
     """Map one absolute parent position to the corresponding dense context axis."""
     if absolute_position < 0:
-        raise ValueError(
-            f"Model references position {absolute_position} before the motif start at position {position}"
-        )
+        raise ValueError(f"Model references position {absolute_position} before the motif start at position {position}")
 
     axis = absolute_position - (position - span)
     if axis < 0 or axis >= span:
-        raise ValueError(
-            f"Context position {absolute_position} at motif position {position} does not fit span {span}"
-        )
+        raise ValueError(f"Context position {absolute_position} at motif position {position} does not fit span {span}")
 
     return full_context[axis]
 
@@ -378,38 +398,28 @@ def _iter_full_contexts(span: int) -> Iterable[Tuple[int, ...]]:
     return itertools.product(range(4), repeat=span)
 
 
-def read_slim(path: str) -> tuple[np.ndarray, int, int]:
-    """Read a Jstacs Slim XML model into a dense log-odds tensor."""
-    root = ET.parse(path).getroot()
-    slim = root.find(".//SLIM")
-    if slim is None:
-        raise ValueError(f"Could not find SLIM model in {path}")
+def _find_xml_element(root: ET.Element, xpath: str, error_message: str) -> ET.Element:
+    """Return one required XML element or raise a descriptive error."""
+    element = root.find(xpath)
+    if element is None:
+        raise ValueError(error_message)
+    return element
 
+
+def _parse_slim_model(path: str) -> tuple[int, list, list, list]:
+    """Parse raw SLIM arrays from XML."""
+    root = ET.parse(path).getroot()
+    slim = _find_xml_element(root, ".//SLIM", f"Could not find SLIM model in {path}")
     length = int(_xml_numeric_value(slim.find("length")))
     _distance = int(_xml_numeric_value(slim.find("distance")))
     component_params = _xml_array(slim.find("componentMixtureParameters"))
     ancestor_params = _xml_array(slim.find("ancestorMixtureParameters"))
     dependency_params = _xml_array(slim.find("dependencyParameters"))
-    uniform_log_odds_offset = np.log(4.0)
-    alphabet_size = len(dependency_params[0][0][0])
+    return length, component_params, ancestor_params, dependency_params
 
-    component_log_probs = [
-        _log_normalize(np.asarray(component_params[position], dtype=np.float64)) for position in range(length)
-    ]
-    ancestor_log_probs = [
-        [_log_normalize(np.asarray(component, dtype=np.float64)) for component in ancestor_params[position]]
-        for position in range(length)
-    ]
-    dependency_log_probs = [
-        [
-            np.vstack(
-                [_log_normalize(np.asarray(row, dtype=np.float64)) for row in dependency_params[position][component]]
-            )
-            for component in range(len(dependency_params[position]))
-        ]
-        for position in range(length)
-    ]
 
+def _slim_span(length: int, component_params: list, ancestor_params: list, path: str) -> int:
+    """Compute the dense context span implied by a SLIM model."""
     span = 0
     for position in range(length):
         for component_index in range(1, len(component_params[position])):
@@ -417,58 +427,100 @@ def read_slim(path: str) -> tuple[np.ndarray, int, int]:
             if ancestor_count <= 0:
                 raise ValueError(f"Malformed SLIM model in {path}: empty ancestor mixture at position {position}")
             span = max(span, component_index + ancestor_count - 1)
+    return span
 
-    tensor = np.empty((5,) * (span + 1) + (length,), dtype=np.float32)
-    context_axes = list(range(span))
-    full_contexts = list(_iter_full_contexts(span))
 
-    for position in range(length):
-        context_log_probs = {}
+def _normalize_slim_parameters(path: str) -> SlimParameters:
+    """Normalize raw SLIM parameters to log-probability tables."""
+    length, component_params, ancestor_params, dependency_params = _parse_slim_model(path)
+    return SlimParameters(
+        length=length,
+        span=_slim_span(length, component_params, ancestor_params, path),
+        alphabet_size=len(dependency_params[0][0][0]),
+        component_log_probs=[
+            _log_normalize(np.asarray(component_params[position], dtype=np.float64)) for position in range(length)
+        ],
+        ancestor_log_probs=[
+            [_log_normalize(np.asarray(component, dtype=np.float64)) for component in ancestor_params[position]]
+            for position in range(length)
+        ],
+        dependency_log_probs=[
+            [
+                np.vstack(
+                    [
+                        _log_normalize(np.asarray(row, dtype=np.float64))
+                        for row in dependency_params[position][component]
+                    ]
+                )
+                for component in range(len(dependency_params[position]))
+            ]
+            for position in range(length)
+        ],
+    )
 
-        for full_context in full_contexts:
-            symbol_log_probs = np.empty(4, dtype=np.float64)
 
-            for symbol in range(4):
-                local_scores = np.empty(len(component_log_probs[position]), dtype=np.float64)
-                local_scores[0] = component_log_probs[position][0] + dependency_log_probs[position][0][0, symbol]
+def _slim_symbol_log_probs(
+    position: int,
+    symbol: int,
+    full_context: Tuple[int, ...],
+    params: SlimParameters,
+) -> float:
+    """Evaluate one SLIM position for a concrete symbol and context."""
+    local_scores = np.empty(len(params.component_log_probs[position]), dtype=np.float64)
+    local_scores[0] = params.component_log_probs[position][0] + params.dependency_log_probs[position][0][0, symbol]
 
-                for component_index in range(1, len(component_log_probs[position])):
-                    ancestor_count = len(ancestor_log_probs[position][component_index])
-                    context_index = 0
+    for component_index in range(1, len(params.component_log_probs[position])):
+        ancestor_count = len(params.ancestor_log_probs[position][component_index])
+        context_index = 0
 
-                    for current_order in range(1, component_index):
-                        parent_position = position - current_order
-                        context_index = (
-                            context_index * alphabet_size
-                            + _context_value(full_context, span, position, parent_position)
-                        )
+        for current_order in range(1, component_index):
+            parent_position = position - current_order
+            context_index = context_index * params.alphabet_size + _context_value(
+                full_context, params.span, position, parent_position
+            )
 
-                    ancestor_scores = np.empty(ancestor_count, dtype=np.float64)
-                    total_contexts = dependency_log_probs[position][component_index].shape[0]
-                    width = dependency_log_probs[position][component_index].shape[1]
+        ancestor_scores = np.empty(ancestor_count, dtype=np.float64)
+        dependency = params.dependency_log_probs[position][component_index]
+        total_contexts = dependency.shape[0]
+        width = dependency.shape[1]
 
-                    for ancestor_index in range(ancestor_count):
-                        parent_position = position - component_index - ancestor_index
-                        context_index = (
-                            context_index * width
-                            + _context_value(full_context, span, position, parent_position)
-                        ) % total_contexts
-                        ancestor_scores[ancestor_index] = (
-                            ancestor_log_probs[position][component_index][ancestor_index]
-                            + dependency_log_probs[position][component_index][context_index, symbol]
-                        )
+        for ancestor_index in range(ancestor_count):
+            parent_position = position - component_index - ancestor_index
+            context_index = (
+                context_index * width + _context_value(full_context, params.span, position, parent_position)
+            ) % total_contexts
+            ancestor_scores[ancestor_index] = (
+                params.ancestor_log_probs[position][component_index][ancestor_index] + dependency[context_index, symbol]
+            )
 
-                    local_scores[component_index] = (
-                        component_log_probs[position][component_index] + _logsumexp(ancestor_scores)
-                    )
+        local_scores[component_index] = params.component_log_probs[position][component_index] + _logsumexp(
+            ancestor_scores
+        )
 
-                symbol_log_probs[symbol] = _logsumexp(local_scores) + uniform_log_odds_offset
+    return _logsumexp(local_scores) + _LOG_UNIFORM_BASE
 
-            context_log_probs[full_context] = symbol_log_probs
 
-        tensor[..., position] = _build_position_tensor(context_log_probs, context_axes, span)
+def _build_slim_position_tensor(
+    position: int, params: SlimParameters, full_contexts: list[Tuple[int, ...]]
+) -> np.ndarray:
+    """Materialize one SLIM position into a dense tensor."""
+    context_log_probs = {}
+    for full_context in full_contexts:
+        symbol_log_probs = np.empty(4, dtype=np.float64)
+        for symbol in range(4):
+            symbol_log_probs[symbol] = _slim_symbol_log_probs(position, symbol, full_context, params)
+        context_log_probs[full_context] = symbol_log_probs
+    return _build_position_tensor(context_log_probs, list(range(params.span)), params.span)
 
-    return tensor, length, span
+
+def read_slim(path: str) -> tuple[np.ndarray, int, int]:
+    """Read a Jstacs Slim XML model into a dense log-odds tensor."""
+    params = _normalize_slim_parameters(path)
+    tensor = np.empty((5,) * (params.span + 1) + (params.length,), dtype=np.float32)
+    full_contexts = list(_iter_full_contexts(params.span))
+    for position in range(params.length):
+        tensor[..., position] = _build_slim_position_tensor(position, params, full_contexts)
+    return tensor, params.length, params.span
 
 
 def _parse_dimont_treeelement(elem: ET.Element) -> dict:
@@ -496,28 +548,23 @@ def _parse_dimont_treeelement(elem: ET.Element) -> dict:
     return node
 
 
-def read_dimont(path: str) -> tuple[np.ndarray, int, int]:
-    """Read a Jstacs Dimont XML model into a dense log-odds tensor."""
+def _parse_dimont_model(path: str) -> tuple[list[list[int]], list[dict]]:
+    """Parse Dimont context positions and parameter trees from XML."""
     root = ET.parse(path).getroot()
-    model = root.find(".//ThresholdedStrandChIPper/function/pos/MarkovModelDiffSM")
-    if model is None:
-        raise ValueError(f"Could not find Dimont motif model in {path}")
-    uniform_log_odds_offset = np.log(4.0)
-
-    trees = model.find("bayesianNetworkSF/trees")
-    if trees is None:
-        raise ValueError(f"Malformed Dimont model in {path}: missing trees")
-
-    tree_elements = [pos for pos in trees if pos.tag == "pos"]
-    length = len(tree_elements)
+    model = _find_xml_element(
+        root,
+        ".//ThresholdedStrandChIPper/function/pos/MarkovModelDiffSM",
+        f"Could not find Dimont motif model in {path}",
+    )
+    trees = _find_xml_element(model, "bayesianNetworkSF/trees", f"Malformed Dimont model in {path}: missing trees")
     context_positions: List[List[int]] = []
     nodes = []
-
-    for pos in tree_elements:
-        parameter_tree = pos.find("parameterTree")
-        if parameter_tree is None:
-            raise ValueError(f"Malformed Dimont model in {path}: missing parameter tree")
-
+    for pos in trees:
+        if pos.tag != "pos":
+            continue
+        parameter_tree = _find_xml_element(
+            pos, "parameterTree", f"Malformed Dimont model in {path}: missing parameter tree"
+        )
         context_pos_elem = parameter_tree.find("contextPoss")
         current_context_positions = (
             [int(_xml_numeric_value(child)) for child in context_pos_elem if child.tag == "pos"]
@@ -526,38 +573,73 @@ def read_dimont(path: str) -> tuple[np.ndarray, int, int]:
         )
         context_positions.append(current_context_positions)
         nodes.append(_parse_dimont_treeelement(parameter_tree.find("root/treeElement")))
+    return context_positions, nodes
 
+
+def _dimont_span(context_positions: list[list[int]]) -> int:
+    """Compute the dense context span implied by Dimont parent links."""
     span = 0
     for position, positions in enumerate(context_positions):
         if positions:
             span = max(span, max(position - parent for parent in positions))
+    return span
 
-    tensor = np.empty((5,) * (span + 1) + (length,), dtype=np.float32)
-    context_axes = list(range(span))
-    full_contexts = list(_iter_full_contexts(span))
-    root_offsets = np.zeros(length, dtype=np.float64)
 
+def _dimont_root_offsets(path: str, nodes: list[dict], context_positions: list[list[int]]) -> np.ndarray:
+    """Compute Dimont root normalizers for positions without parents."""
+    root_offsets = np.zeros(len(nodes), dtype=np.float64)
     for position, positions in enumerate(context_positions):
         if positions:
             continue
         if "scores" not in nodes[position]:
             raise ValueError(f"Malformed Dimont model in {path}: root position {position} is not a leaf")
         root_offsets[position] = _logsumexp(nodes[position]["scores"] + nodes[position]["log_z"])
+    return root_offsets
 
-    for position, node in enumerate(nodes):
-        context_log_probs = {}
 
-        for full_context in full_contexts:
-            current = node
-            while "scores" not in current:
-                parent_nt = _context_value(full_context, span, position, current["context_pos"])
-                current = current["children"][parent_nt]
+def _normalize_dimont_parameters(path: str) -> DimontParameters:
+    """Normalize Dimont XML state to a tensor-materialization plan."""
+    context_positions, nodes = _parse_dimont_model(path)
+    return DimontParameters(
+        length=len(nodes),
+        span=_dimont_span(context_positions),
+        nodes=nodes,
+        root_offsets=_dimont_root_offsets(path, nodes, context_positions),
+    )
 
-            context_log_probs[full_context] = current["scores"] + uniform_log_odds_offset - root_offsets[position]
 
-        tensor[..., position] = _build_position_tensor(context_log_probs, context_axes, span)
+def _build_dimont_position_tensor(
+    position: int,
+    node: dict,
+    root_offset: float,
+    span: int,
+    full_contexts: list[Tuple[int, ...]],
+) -> np.ndarray:
+    """Materialize one Dimont position into a dense tensor."""
+    context_log_probs = {}
+    for full_context in full_contexts:
+        current = node
+        while "scores" not in current:
+            parent_nt = _context_value(full_context, span, position, current["context_pos"])
+            current = current["children"][parent_nt]
+        context_log_probs[full_context] = current["scores"] + _LOG_UNIFORM_BASE - root_offset
+    return _build_position_tensor(context_log_probs, list(range(span)), span)
 
-    return tensor, length, span
+
+def read_dimont(path: str) -> tuple[np.ndarray, int, int]:
+    """Read a Jstacs Dimont XML model into a dense log-odds tensor."""
+    params = _normalize_dimont_parameters(path)
+    tensor = np.empty((5,) * (params.span + 1) + (params.length,), dtype=np.float32)
+    full_contexts = list(_iter_full_contexts(params.span))
+    for position, node in enumerate(params.nodes):
+        tensor[..., position] = _build_dimont_position_tensor(
+            position,
+            node,
+            float(params.root_offsets[position]),
+            params.span,
+            full_contexts,
+        )
+    return tensor, params.length, params.span
 
 
 def write_sitega(model, path: str) -> None:
@@ -573,14 +655,14 @@ def write_sitega(model, path: str) -> None:
 
     for nuc1 in range(4):
         for nuc2 in range(4):
-            if np.all(np.abs(sitega_matrix[nuc1, nuc2, :]) <= 1e-9):
+            if np.all(np.abs(sitega_matrix[nuc1, nuc2, :]) <= _SITEGA_EPS):
                 continue
 
             dinucleotide = converter[nuc1] + converter[nuc2]
             pos = 0
 
             while pos < model.length:
-                while pos < model.length and abs(sitega_matrix[nuc1, nuc2, pos]) <= 1e-9:
+                while pos < model.length and abs(sitega_matrix[nuc1, nuc2, pos]) <= _SITEGA_EPS:
                     pos += 1
 
                 if pos >= model.length:
@@ -589,7 +671,7 @@ def write_sitega(model, path: str) -> None:
                 start_pos = pos
                 current_val = sitega_matrix[nuc1, nuc2, pos]
 
-                while pos + 1 < model.length and abs(sitega_matrix[nuc1, nuc2, pos + 1] - current_val) < 1e-9:
+                while pos + 1 < model.length and abs(sitega_matrix[nuc1, nuc2, pos + 1] - current_val) < _SITEGA_EPS:
                     pos += 1
 
                 segments.append({"start": start_pos, "stop": pos, "val": current_val, "dinucl": dinucleotide})
@@ -612,7 +694,7 @@ def write_sitega(model, path: str) -> None:
             f.write(f"{seg['start']}\t{seg['stop']}\t{total_value:.12f}\t{dinuc_index}\t{seg['dinucl'].lower()}\n")
 
 
-def write_pfm(pfm: np.ndarray, name: str, length: int, path: str) -> None:
+def write_pfm(pfm: np.ndarray, name: str, _length: int, path: str) -> None:
     """Write a Position Frequency Matrix to a file."""
     with open(path, "w") as f:
         f.write(f">{name}\n")
