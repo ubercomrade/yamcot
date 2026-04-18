@@ -29,6 +29,7 @@ from mimosa.comparison import registry as comparison_registry
 from mimosa.functions import (
     apply_score_log_tail_table,
     batch_all_scores,
+    batch_all_scores_strands,
     build_profile_score_options,
     build_score_log_tail_table,
     cut_prc,
@@ -1030,6 +1031,47 @@ def test_batch_all_scores_reverse_complement_with_context_preserves_positions():
 
 
 @pytest.mark.parametrize(
+    ("representation", "kmer", "with_context"),
+    [
+        (
+            np.array(
+                [
+                    [1.0, 0.1, 0.3],
+                    [0.2, 1.1, 0.2],
+                    [0.3, 0.2, 1.2],
+                    [0.4, 0.5, 0.6],
+                    [0.0, 0.0, 0.0],
+                ],
+                dtype=np.float32,
+            ),
+            1,
+            False,
+        ),
+        (np.arange(25 * 3, dtype=np.float32).reshape(25, 3) / 10.0, 2, True),
+    ],
+)
+def test_batch_all_scores_strands_matches_separate_calls(representation, kmer, with_context):
+    """Two-strand batch scanning should match separate forward and reverse passes."""
+    sequences = make_sequence_batch(
+        [
+            np.array([0, 1, 2, 3, 0, 1], dtype=np.int8),
+            np.array([3, 2, 1, 0, 3], dtype=np.int8),
+        ]
+    )
+
+    expected_plus = batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=False, with_context=with_context)
+    expected_minus = batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=True, with_context=with_context)
+    plus_batch, minus_batch = batch_all_scores_strands(sequences, representation, kmer=kmer, with_context=with_context)
+
+    np.testing.assert_allclose(plus_batch["values"], expected_plus["values"])
+    np.testing.assert_array_equal(plus_batch["mask"], expected_plus["mask"])
+    np.testing.assert_array_equal(plus_batch["lengths"], expected_plus["lengths"])
+    np.testing.assert_allclose(minus_batch["values"], expected_minus["values"])
+    np.testing.assert_array_equal(minus_batch["mask"], expected_minus["mask"])
+    np.testing.assert_array_equal(minus_batch["lengths"], expected_minus["lengths"])
+
+
+@pytest.mark.parametrize(
     ("metric", "expected"),
     [
         ("co", 1.0),
@@ -1434,21 +1476,73 @@ def test_strategy_profile_uses_disk_cache_for_target_and_query(tmp_path, monkeyp
 
     fresh_query = make_model("query")
     fresh_target = make_model("target")
-    original_scan = strategy_profile.__globals__["scan_model"]
+    original_scan_strands = strategy_profile.__globals__["scan_model_strands"]
 
-    def guarded_scan(model, current_sequences, strand):
+    def guarded_scan_strands(model, current_sequences):
         if model.name == "query":
             raise AssertionError("query scan should be served from disk cache")
         if model.name == "target":
             raise AssertionError("target scan should be served from disk cache")
-        return original_scan(model, current_sequences, strand)
+        return original_scan_strands(model, current_sequences)
 
-    monkeypatch.setitem(strategy_profile.__globals__, "scan_model", guarded_scan)
+    monkeypatch.setitem(strategy_profile.__globals__, "scan_model_strands", guarded_scan_strands)
     second = strategy_profile(fresh_query, fresh_target, sequences, cfg)
 
     assert second["target"] == "target"
     assert second["score"] == pytest.approx(first["score"])
     assert second["orientation"] == first["orientation"]
+
+
+def test_strategy_profile_permutations_use_batched_surrogate_scoring(monkeypatch):
+    """Profile permutations should score plus/minus surrogates in one batched call."""
+    scores_1 = _score_batch_from_flat(
+        np.array([0.0, 0.8, 1.7, 0.2, 0.0, 1.1, 0.4, 0.0], dtype=np.float32),
+        np.array([0, 4, 8], dtype=np.int64),
+    )
+    scores_2 = _score_batch_from_flat(
+        np.array([0.0, 1.0, 1.6, 0.3, 0.0, 0.9, 0.5, 0.0], dtype=np.float32),
+        np.array([0, 4, 8], dtype=np.int64),
+    )
+    model1 = GenericModel(
+        type_key="scores",
+        name="q",
+        representation=None,
+        length=0,
+        config={"scores_data": scores_1},
+    )
+    model2 = GenericModel(
+        type_key="scores",
+        name="t",
+        representation=None,
+        length=0,
+        config={"scores_data": scores_2},
+    )
+    cfg = create_comparator_config(metric="co", n_permutations=1, n_jobs=1, search_range=2)
+
+    call_sizes = []
+    original_orientations = strategy_profile.__globals__["fast_profile_score_orientations"]
+
+    def recording_orientations(profile_pairs, options):
+        call_sizes.append(len(profile_pairs))
+        return original_orientations(profile_pairs, options)
+
+    def fake_run_montecarlo(obs_score_func, surrogate_generator_func, n_permutations, n_jobs, seed, *args):
+        value = surrogate_generator_func(np.random.default_rng(0), *args)
+        null_scores = np.array([value], dtype=np.float32)
+        return null_scores, float(null_scores.mean()), float(null_scores.std())
+
+    monkeypatch.setitem(
+        strategy_profile.__globals__,
+        "fast_profile_score_orientations",
+        recording_orientations,
+    )
+    monkeypatch.setitem(strategy_profile.__globals__, "run_montecarlo", fake_run_montecarlo)
+
+    result = strategy_profile(model1, model2, None, cfg)
+
+    assert result["score"] >= 0.0
+    assert 4 in call_sizes
+    assert 2 in call_sizes
 
 
 def test_clear_cache_removes_cached_profiles(tmp_path):

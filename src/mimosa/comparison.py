@@ -18,13 +18,19 @@ from mimosa.functions import (
     apply_score_log_tail_table,
     build_profile_score_options,
     build_score_log_tail_table,
-    fast_profile_score,
     fast_profile_score_orientations,
     normalize_empirical_log_tail_pair,
     scores_to_empirical_log_tail,
 )
 from mimosa.io import write_dist, write_fasta
-from mimosa.models import GenericModel, calculate_threshold_table, get_pfm, get_score_bounds, scan_model, write_model
+from mimosa.models import (
+    GenericModel,
+    calculate_threshold_table,
+    get_pfm,
+    get_score_bounds,
+    scan_model_strands,
+    write_model,
+)
 from mimosa.validation import (
     validate_cache_mode,
     validate_kernel_size_range,
@@ -130,15 +136,32 @@ def _resolve_raw_profile_scores(model: GenericModel, sequences, strand: str, run
     if runtime_key in runtime_cache:
         return runtime_cache[runtime_key]
 
-    if model.type_key == "scores":
-        scores = scan_model(model, None, strand)
-    else:
-        if sequences is None:
-            raise ValueError("Profile strategy requires sequences when comparing motif models.")
-        scores = scan_model(model, sequences, strand)
+    if strand not in {"+", "-"}:
+        raise ValueError(f"Unsupported strand for profile scoring: {strand}")
 
-    runtime_cache[runtime_key] = scores
-    return scores
+    plus_scores, minus_scores = _resolve_raw_profile_score_pair(model, sequences, runtime_cache)
+    return plus_scores if strand == "+" else minus_scores
+
+
+def _resolve_raw_profile_score_pair(model: GenericModel, sequences, runtime_cache: dict | None = None):
+    """Resolve raw profile scores for both strands, caching the pair together."""
+    runtime_cache = {} if runtime_cache is None else runtime_cache
+    sequence_fp = fingerprint_batch(sequences) or "no-sequences"
+    plus_key = ("raw_scores", model.name, "+", sequence_fp)
+    minus_key = ("raw_scores", model.name, "-", sequence_fp)
+
+    cached_plus = runtime_cache.get(plus_key)
+    cached_minus = runtime_cache.get(minus_key)
+    if cached_plus is not None and cached_minus is not None:
+        return cached_plus, cached_minus
+
+    if model.type_key != "scores" and sequences is None:
+        raise ValueError("Profile strategy requires sequences when comparing motif models.")
+
+    plus_scores, minus_scores = scan_model_strands(model, sequences)
+    runtime_cache[plus_key] = plus_scores
+    runtime_cache[minus_key] = minus_scores
+    return plus_scores, minus_scores
 
 
 def _fit_profile_normalizer(model: GenericModel, calibration_sequences, cfg: dict, runtime_cache: dict | None = None):
@@ -149,8 +172,7 @@ def _fit_profile_normalizer(model: GenericModel, calibration_sequences, cfg: dic
     if runtime_key in runtime_cache:
         return runtime_cache[runtime_key]
 
-    calibration_plus = _resolve_raw_profile_scores(model, calibration_sequences, "+", runtime_cache)
-    calibration_minus = _resolve_raw_profile_scores(model, calibration_sequences, "-", runtime_cache)
+    calibration_plus, calibration_minus = _resolve_raw_profile_score_pair(model, calibration_sequences, runtime_cache)
     calibration_sample = np.concatenate((flatten_valid(calibration_plus), flatten_valid(calibration_minus)))
     strategy = _get_profile_normalization_strategy(cfg["profile_normalization"])
     normalizer = (cfg["profile_normalization"], strategy["fit"](calibration_sample))
@@ -232,8 +254,7 @@ def _resolve_profile_bundle(model: GenericModel, sequences, calibration_sequence
                 return {"plus": cached_plus, "minus": cached_minus}
 
         runtime_cache: dict = {}
-        raw_plus = _resolve_raw_profile_scores(model, sequences, "+", runtime_cache)
-        raw_minus = _resolve_raw_profile_scores(model, sequences, "-", runtime_cache)
+        raw_plus, raw_minus = _resolve_raw_profile_score_pair(model, sequences, runtime_cache)
         normalized_plus, normalized_minus = normalize_empirical_log_tail_pair(raw_plus, raw_minus)
 
         if plus_cache_spec is not None and minus_cache_spec is not None:
@@ -583,9 +604,11 @@ def strategy_profile(model1: GenericModel, model2: GenericModel, sequences, cfg:
 
         def surrogate_gen(rng):
             surrogate = _create_surrogate_batch(best_target_profile, rng, cfg)
-            score_plus, _ = fast_profile_score(bundle1["plus"], surrogate, score_options)
-            score_minus, _ = fast_profile_score(bundle1["minus"], surrogate, score_options)
-            return max(score_plus, score_minus)
+            scores, _ = fast_profile_score_orientations(
+                [(bundle1["plus"], surrogate), (bundle1["minus"], surrogate)],
+                score_options,
+            )
+            return float(np.max(scores, initial=0.0))
 
         nulls, null_mean, null_std = run_montecarlo(
             lambda value: value,

@@ -14,6 +14,7 @@ import pandas as pd
 from mimosa.batches import SCORE_PADDING, pack_batch, row_values
 from mimosa.functions import (
     batch_all_scores,
+    batch_all_scores_strands,
     build_score_log_tail_table,
     lookup_score_for_tail_probability,
     pcm_to_pfm,
@@ -54,19 +55,27 @@ class GenericModel:
 registry: Dict[str, dict] = {}
 
 
-def _register_model_handler(key: str, *, scan, load, write, score_bounds) -> None:
+def _register_model_handler(key: str, *, scan, load, write, score_bounds, scan_both=None) -> None:
     """Register one model handler bundle."""
     registry[key] = {
         "scan": scan,
+        "scan_both": scan_both,
         "load": load,
         "write": write,
         "score_bounds": score_bounds,
     }
 
 
-def register_model_handler(key: str, *, scan, load, write, score_bounds) -> None:
+def register_model_handler(key: str, *, scan, load, write, score_bounds, scan_both=None) -> None:
     """Register one public model handler bundle."""
-    _register_model_handler(key, scan=scan, load=load, write=write, score_bounds=score_bounds)
+    _register_model_handler(
+        key,
+        scan=scan,
+        load=load,
+        write=write,
+        score_bounds=score_bounds,
+        scan_both=scan_both,
+    )
 
 
 def _get_model_handler(key: str) -> dict:
@@ -83,6 +92,15 @@ def scan_model(model: GenericModel, sequences=None, strand: Optional[StrandMode]
     handler = _get_model_handler(model.type_key)
     strand_mode = strand or model.config.get("strand_mode", "best")
     return handler["scan"](model, sequences, strand_mode)
+
+
+def scan_model_strands(model: GenericModel, sequences=None):
+    """Scan one model on both strands, using a shared backend call when available."""
+    handler = _get_model_handler(model.type_key)
+    scan_both = handler.get("scan_both")
+    if scan_both is not None:
+        return scan_both(model, sequences)
+    return handler["scan"](model, sequences, "+"), handler["scan"](model, sequences, "-")
 
 
 def write_model(model: GenericModel, path: str) -> None:
@@ -138,7 +156,7 @@ def _empty_hit_arrays() -> dict[str, np.ndarray]:
 
 def _scan_both_strands(model: GenericModel, sequences):
     """Scan sequences on both strands."""
-    return scan_model(model, sequences, strand="+"), scan_model(model, sequences, strand="-")
+    return scan_model_strands(model, sequences)
 
 
 def _collect_best_hits(sequences, s_fwd_batch, s_rev_batch) -> dict[str, np.ndarray]:
@@ -461,12 +479,18 @@ def _scan_with_batch_kernel(model: GenericModel, sequences, strand: StrandMode, 
     if strand == "-":
         return batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=True, with_context=with_context)
     if strand == "best":
-        sf = batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=False, with_context=with_context)
-        sr = batch_all_scores(sequences, representation, kmer=kmer, is_revcomp=True, with_context=with_context)
+        sf, sr = batch_all_scores_strands(sequences, representation, kmer=kmer, with_context=with_context)
         values = np.full(sf["values"].shape, SCORE_PADDING, dtype=np.float32)
         values[sf["mask"]] = np.maximum(sf["values"][sf["mask"]], sr["values"][sr["mask"]])
         return pack_batch(values, sf["mask"], sf["lengths"], SCORE_PADDING)
     raise ValueError(f"Invalid strand mode: {strand}")
+
+
+def _scan_with_batch_kernel_strands(model: GenericModel, sequences, *, with_context: bool = False):
+    """Scan a tensor-based motif model on both strands in one shared JAX call."""
+    representation = np.asarray(model.representation, dtype=np.float32)
+    kmer = int(model.config.get("kmer", 1))
+    return batch_all_scores_strands(sequences, representation, kmer=kmer, with_context=with_context)
 
 
 def _score_bounds_from_model(model: GenericModel) -> tuple[float, float]:
@@ -476,6 +500,10 @@ def _score_bounds_from_model(model: GenericModel) -> tuple[float, float]:
 
 def _scan_pwm(model: GenericModel, sequences, strand: StrandMode):
     return _scan_with_batch_kernel(model, sequences, strand, with_context=False)
+
+
+def _scan_pwm_both(model: GenericModel, sequences):
+    return _scan_with_batch_kernel_strands(model, sequences, with_context=False)
 
 
 def _write_pwm(model: GenericModel, path: str) -> None:
@@ -514,6 +542,10 @@ def _scan_sitega(model: GenericModel, sequences, strand: StrandMode):
     return _scan_with_batch_kernel(model, sequences, strand, with_context=False)
 
 
+def _scan_sitega_both(model: GenericModel, sequences):
+    return _scan_with_batch_kernel_strands(model, sequences, with_context=False)
+
+
 def _write_sitega(model: GenericModel, path: str) -> None:
     write_sitega(model, path)
 
@@ -547,6 +579,10 @@ def _scan_bamm(model: GenericModel, sequences, strand: StrandMode):
     return _scan_with_batch_kernel(model, sequences, strand, with_context=True)
 
 
+def _scan_bamm_both(model: GenericModel, sequences):
+    return _scan_with_batch_kernel_strands(model, sequences, with_context=True)
+
+
 def _load_bamm(path: str, kwargs: dict) -> GenericModel:
     if not path.endswith(".ihbcp") and not os.path.exists(path):
         ihbcp_path = f"{path}.ihbcp"
@@ -577,6 +613,10 @@ def _scan_dimont(model: GenericModel, sequences, strand: StrandMode):
     return _scan_with_batch_kernel(model, sequences, strand, with_context=int(model.config.get("kmer", 1)) > 1)
 
 
+def _scan_dimont_both(model: GenericModel, sequences):
+    return _scan_with_batch_kernel_strands(model, sequences, with_context=int(model.config.get("kmer", 1)) > 1)
+
+
 def _load_dimont(path: str, _kwargs: dict) -> GenericModel:
     _, ext = os.path.splitext(path.lower())
     if ext == ".pkl":
@@ -593,6 +633,10 @@ def _scan_slim(model: GenericModel, sequences, strand: StrandMode):
     return _scan_with_batch_kernel(model, sequences, strand, with_context=int(model.config.get("kmer", 1)) > 1)
 
 
+def _scan_slim_both(model: GenericModel, sequences):
+    return _scan_with_batch_kernel_strands(model, sequences, with_context=int(model.config.get("kmer", 1)) > 1)
+
+
 def _load_slim(path: str, _kwargs: dict) -> GenericModel:
     _, ext = os.path.splitext(path.lower())
     if ext == ".pkl":
@@ -607,6 +651,11 @@ def _load_slim(path: str, _kwargs: dict) -> GenericModel:
 
 def _scan_scores(model: GenericModel, _sequences=None, _strand: StrandMode = "best"):
     return model.config["scores_data"]
+
+
+def _scan_scores_both(model: GenericModel, _sequences=None):
+    scores = model.config["scores_data"]
+    return scores, scores
 
 
 def _write_scores(_model: GenericModel, _path: str) -> None:
@@ -628,19 +677,51 @@ def _load_scores(path: str, _kwargs: dict) -> GenericModel:
     return GenericModel("scores", name, None, 0, {"scores_data": scores_data})
 
 
-_register_model_handler("pwm", scan=_scan_pwm, load=_load_pwm, write=_write_pwm, score_bounds=_score_bounds_from_model)
 _register_model_handler(
-    "sitega", scan=_scan_sitega, load=_load_sitega, write=_write_sitega, score_bounds=_sitega_score_bounds
+    "pwm",
+    scan=_scan_pwm,
+    scan_both=_scan_pwm_both,
+    load=_load_pwm,
+    write=_write_pwm,
+    score_bounds=_score_bounds_from_model,
 )
 _register_model_handler(
-    "bamm", scan=_scan_bamm, load=_load_bamm, write=_dump_model, score_bounds=_score_bounds_from_model
+    "sitega",
+    scan=_scan_sitega,
+    scan_both=_scan_sitega_both,
+    load=_load_sitega,
+    write=_write_sitega,
+    score_bounds=_sitega_score_bounds,
 )
 _register_model_handler(
-    "dimont", scan=_scan_dimont, load=_load_dimont, write=_dump_model, score_bounds=_score_bounds_from_model
+    "bamm",
+    scan=_scan_bamm,
+    scan_both=_scan_bamm_both,
+    load=_load_bamm,
+    write=_dump_model,
+    score_bounds=_score_bounds_from_model,
 )
 _register_model_handler(
-    "slim", scan=_scan_slim, load=_load_slim, write=_dump_model, score_bounds=_score_bounds_from_model
+    "dimont",
+    scan=_scan_dimont,
+    scan_both=_scan_dimont_both,
+    load=_load_dimont,
+    write=_dump_model,
+    score_bounds=_score_bounds_from_model,
 )
 _register_model_handler(
-    "scores", scan=_scan_scores, load=_load_scores, write=_write_scores, score_bounds=_scores_score_bounds
+    "slim",
+    scan=_scan_slim,
+    scan_both=_scan_slim_both,
+    load=_load_slim,
+    write=_dump_model,
+    score_bounds=_score_bounds_from_model,
+)
+_register_model_handler(
+    "scores",
+    scan=_scan_scores,
+    scan_both=_scan_scores_both,
+    load=_load_scores,
+    write=_write_scores,
+    score_bounds=_scores_score_bounds,
 )
