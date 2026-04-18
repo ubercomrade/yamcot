@@ -19,6 +19,8 @@ from mimosa.functions import (
     build_profile_score_options,
     build_score_log_tail_table,
     fast_profile_score,
+    fast_profile_score_orientations,
+    normalize_empirical_log_tail_pair,
     scores_to_empirical_log_tail,
 )
 from mimosa.io import write_dist, write_fasta
@@ -163,6 +165,20 @@ def _apply_profile_normalizer(scores, normalizer):
     return strategy["apply"](scores, params)
 
 
+def _build_profile_cache_spec(
+    model: GenericModel, sequences, calibration_sequences, cfg: dict, strand: str, profile_kind: str
+) -> dict:
+    """Build one cache descriptor for a normalized profile."""
+    return {
+        "model": model,
+        "sequences": sequences,
+        "promoters": calibration_sequences,
+        "strand": strand,
+        "profile_kind": profile_kind,
+        "cache_dir": cfg["cache_dir"],
+    }
+
+
 def _resolve_profile_signal(
     model: GenericModel, sequences, calibration_sequences, cfg: dict, strand: str, runtime_cache=None
 ):
@@ -179,14 +195,7 @@ def _resolve_profile_signal(
 
     cache_spec = None
     if cfg["cache_mode"] == "on":
-        cache_spec = {
-            "model": model,
-            "sequences": sequences,
-            "promoters": calibration_sequences,
-            "strand": strand,
-            "profile_kind": profile_kind,
-            "cache_dir": cfg["cache_dir"],
-        }
+        cache_spec = _build_profile_cache_spec(model, sequences, calibration_sequences, cfg, strand, profile_kind)
         cached = load_profile_cache(cache_spec)
         if cached is not None:
             runtime_cache[runtime_key] = cached
@@ -207,6 +216,36 @@ def _resolve_profile_signal(
 
 def _resolve_profile_bundle(model: GenericModel, sequences, calibration_sequences, cfg: dict) -> dict:
     """Resolve normalized profile signals for both strands."""
+    profile_kind = cfg["profile_normalization"]
+    if profile_kind == "empirical_log_tail" and sequences is calibration_sequences:
+        plus_cache_spec = None
+        minus_cache_spec = None
+        if cfg["cache_mode"] == "on":
+            plus_cache_spec = _build_profile_cache_spec(model, sequences, calibration_sequences, cfg, "+", profile_kind)
+            minus_cache_spec = _build_profile_cache_spec(
+                model, sequences, calibration_sequences, cfg, "-", profile_kind
+            )
+            cached_plus = load_profile_cache(plus_cache_spec)
+            cached_minus = load_profile_cache(minus_cache_spec)
+            if cached_plus is not None and cached_minus is not None:
+                logger.debug("Profile cache hit for model '%s' (both strands).", model.name)
+                return {"plus": cached_plus, "minus": cached_minus}
+
+        runtime_cache: dict = {}
+        raw_plus = _resolve_raw_profile_scores(model, sequences, "+", runtime_cache)
+        raw_minus = _resolve_raw_profile_scores(model, sequences, "-", runtime_cache)
+        normalized_plus, normalized_minus = normalize_empirical_log_tail_pair(raw_plus, raw_minus)
+
+        if plus_cache_spec is not None and minus_cache_spec is not None:
+            store_profile_cache(plus_cache_spec, normalized_plus)
+            store_profile_cache(minus_cache_spec, normalized_minus)
+            logger.debug("Stored profile cache for model '%s' (both strands).", model.name)
+
+        return {
+            "plus": normalized_plus,
+            "minus": normalized_minus,
+        }
+
     runtime_cache: dict = {}
     return {
         "plus": _resolve_profile_signal(model, sequences, calibration_sequences, cfg, "+", runtime_cache),
@@ -503,19 +542,24 @@ def strategy_profile(model1: GenericModel, model2: GenericModel, sequences, cfg:
         metric=cfg["metric"],
     )
 
-    candidates = []
-    for orientation, query_profile, target_profile in (
+    orientation_pairs = (
         ("++", bundle1["plus"], bundle2["plus"]),
         ("--", bundle1["minus"], bundle2["minus"]),
         ("+-", bundle1["plus"], bundle2["minus"]),
         ("-+", bundle1["minus"], bundle2["plus"]),
+    )
+    profile_pairs = [(query_profile, target_profile) for _, query_profile, target_profile in orientation_pairs]
+    orientation_scores, orientation_offsets = fast_profile_score_orientations(profile_pairs, score_options)
+
+    candidates = []
+    for (orientation, query_profile, target_profile), score, offset in zip(
+        orientation_pairs, orientation_scores, orientation_offsets, strict=False
     ):
-        score, offset = fast_profile_score(query_profile, target_profile, score_options)
         candidates.append(
             {
                 "orientation": orientation,
-                "score": score,
-                "offset": offset,
+                "score": float(score),
+                "offset": int(offset),
                 "query_profile": query_profile,
                 "target_profile": target_profile,
             }

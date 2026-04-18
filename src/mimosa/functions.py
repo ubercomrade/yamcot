@@ -38,9 +38,9 @@ def pcm_to_pfm(pcm, pseudocount: float = 0.25):
 
 def build_score_log_tail_table(scores: np.ndarray) -> np.ndarray:
     """Build a score-to-log-tail lookup table from one score sample."""
-    flat = np.asarray(scores, dtype=np.float64).ravel()
+    flat = np.asarray(scores, dtype=np.float32).ravel()
     if flat.size == 0:
-        return np.array([[0.0, 0.0]], dtype=np.float64)
+        return np.array([[0.0, 0.0]], dtype=np.float32)
 
     scores_sorted = np.sort(flat)[::-1]
     unique_scores, counts = np.unique(scores_sorted, return_counts=True)
@@ -50,7 +50,7 @@ def build_score_log_tail_table(scores: np.ndarray) -> np.ndarray:
     cum_counts = np.cumsum(counts)
     tail_probabilities = cum_counts / flat.size
     log_tail = -np.log10(tail_probabilities)
-    return np.column_stack([unique_scores, log_tail]).astype(np.float64)
+    return np.column_stack([unique_scores, log_tail]).astype(np.float32, copy=False)
 
 
 def apply_score_log_tail_table(score_batch, table: np.ndarray):
@@ -60,14 +60,45 @@ def apply_score_log_tail_table(score_batch, table: np.ndarray):
         empty_values = np.full_like(score_batch["values"], SCORE_PADDING)
         return batch_with_values(score_batch, empty_values, padding_value=SCORE_PADDING)
 
-    scores_col = table[:, 0]
-    log_tail_col = table[:, 1]
+    scores_col = np.asarray(table[:, 0], dtype=np.float32)
+    log_tail_col = np.asarray(table[:, 1], dtype=np.float32)
     idx = np.searchsorted(-scores_col, -flat, side="left")
     idx = np.clip(idx, 0, len(log_tail_col) - 1)
 
     mapped = np.full(score_batch["values"].shape, SCORE_PADDING, dtype=np.float32)
-    mapped[score_batch["mask"]] = log_tail_col[idx].astype(np.float32)
+    mapped[score_batch["mask"]] = log_tail_col[idx]
     return batch_with_values(score_batch, mapped, padding_value=SCORE_PADDING)
+
+
+def normalize_empirical_log_tail_pair(score_batch_plus, score_batch_minus):
+    """Normalize two strand score batches using one shared empirical log-tail mapping."""
+    flat_plus = flatten_valid(score_batch_plus).astype(np.float32, copy=False)
+    flat_minus = flatten_valid(score_batch_minus).astype(np.float32, copy=False)
+    total_size = int(flat_plus.size + flat_minus.size)
+
+    if total_size == 0:
+        empty_plus = np.full(score_batch_plus["values"].shape, SCORE_PADDING, dtype=np.float32)
+        empty_minus = np.full(score_batch_minus["values"].shape, SCORE_PADDING, dtype=np.float32)
+        return (
+            batch_with_values(score_batch_plus, empty_plus, padding_value=SCORE_PADDING),
+            batch_with_values(score_batch_minus, empty_minus, padding_value=SCORE_PADDING),
+        )
+
+    combined = np.concatenate((flat_plus, flat_minus)).astype(np.float32, copy=False)
+    _, inverse_idx, counts = np.unique(combined, return_inverse=True, return_counts=True)
+    tail_counts = np.cumsum(counts[::-1], dtype=np.int64)[::-1]
+    log_tail = (-np.log10(tail_counts / float(total_size))).astype(np.float32, copy=False)
+    mapped = log_tail[inverse_idx]
+
+    values_plus = np.full(score_batch_plus["values"].shape, SCORE_PADDING, dtype=np.float32)
+    values_minus = np.full(score_batch_minus["values"].shape, SCORE_PADDING, dtype=np.float32)
+    values_plus[score_batch_plus["mask"]] = mapped[: flat_plus.size]
+    values_minus[score_batch_minus["mask"]] = mapped[flat_plus.size :]
+
+    return (
+        batch_with_values(score_batch_plus, values_plus, padding_value=SCORE_PADDING),
+        batch_with_values(score_batch_minus, values_minus, padding_value=SCORE_PADDING),
+    )
 
 
 def lookup_log_tail(table: np.ndarray, score: float) -> float:
@@ -368,8 +399,7 @@ def scores_to_empirical_log_tail(score_batch):
     return apply_score_log_tail_table(score_batch, table)
 
 
-@partial(jax.jit, static_argnames=("search_range", "metric"))
-def _profile_score_kernel(values1, mask1, values2, mask2, *, search_range: int, min_value: float, metric: str):
+def _profile_score_kernel_impl(values1, mask1, values2, mask2, *, search_range: int, min_value: float, metric: str):
     """Compute the best profile similarity score for all offsets."""
     width1 = values1.shape[1]
     width2 = values2.shape[1]
@@ -409,6 +439,40 @@ def _profile_score_kernel(values1, mask1, values2, mask2, *, search_range: int, 
     return jnp.where(valid, best_score, 0.0), jnp.where(valid, best_offset, 0)
 
 
+@partial(jax.jit, static_argnames=("search_range", "metric"))
+def _profile_score_kernel(values1, mask1, values2, mask2, *, search_range: int, min_value: float, metric: str):
+    """JIT wrapper for one profile-pair score."""
+    return _profile_score_kernel_impl(
+        values1,
+        mask1,
+        values2,
+        mask2,
+        search_range=search_range,
+        min_value=min_value,
+        metric=metric,
+    )
+
+
+@partial(jax.jit, static_argnames=("search_range", "metric"))
+def _profile_score_orientations_kernel(
+    values1_stack, mask1_stack, values2_stack, mask2_stack, *, search_range: int, min_value: float, metric: str
+):
+    """Compute profile similarity for multiple orientation pairs in one JAX call."""
+
+    def score_one(values1, mask1, values2, mask2):
+        return _profile_score_kernel_impl(
+            values1,
+            mask1,
+            values2,
+            mask2,
+            search_range=search_range,
+            min_value=min_value,
+            metric=metric,
+        )
+
+    return jax.vmap(score_one)(values1_stack, mask1_stack, values2_stack, mask2_stack)
+
+
 def fast_profile_score(profile1, profile2, options: dict):
     """Compute the best overlap-based similarity score for two dense score batches."""
     if profile1["values"].shape[0] != profile2["values"].shape[0]:
@@ -432,6 +496,46 @@ def fast_profile_score(profile1, profile2, options: dict):
         metric=str(options.get("metric", "co")),
     )
     return float(score), int(offset)
+
+
+def fast_profile_score_orientations(profile_pairs: list[tuple[dict, dict]], options: dict):
+    """Compute profile similarity for all orientation pairs in one JAX call."""
+    if not profile_pairs:
+        return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.int32)
+
+    first_left, first_right = profile_pairs[0]
+    expected_rows = int(first_left["values"].shape[0])
+    expected_left_width = int(first_left["values"].shape[1])
+    expected_right_width = int(first_right["values"].shape[1])
+
+    for left_profile, right_profile in profile_pairs:
+        if left_profile["values"].shape[0] != expected_rows or right_profile["values"].shape[0] != expected_rows:
+            raise ValueError("all profile pairs must have the same number of rows")
+        if left_profile["values"].shape[1] != expected_left_width:
+            raise ValueError("left profile widths must match across orientation pairs")
+        if right_profile["values"].shape[1] != expected_right_width:
+            raise ValueError("right profile widths must match across orientation pairs")
+
+    if expected_left_width == 0 or expected_right_width == 0:
+        n_pairs = len(profile_pairs)
+        return np.zeros(n_pairs, dtype=np.float32), np.zeros(n_pairs, dtype=np.int32)
+
+    values1_stack = np.stack([np.asarray(pair[0]["values"], dtype=np.float32) for pair in profile_pairs], axis=0)
+    mask1_stack = np.stack([np.asarray(pair[0]["mask"], dtype=bool) for pair in profile_pairs], axis=0)
+    values2_stack = np.stack([np.asarray(pair[1]["values"], dtype=np.float32) for pair in profile_pairs], axis=0)
+    mask2_stack = np.stack([np.asarray(pair[1]["mask"], dtype=bool) for pair in profile_pairs], axis=0)
+
+    scores, offsets = _profile_score_orientations_kernel(
+        jnp.asarray(values1_stack),
+        jnp.asarray(mask1_stack),
+        jnp.asarray(values2_stack),
+        jnp.asarray(mask2_stack),
+        search_range=int(options["search_range"]),
+        min_value=float(options.get("min_value", 0.0)),
+        metric=str(options.get("metric", "co")),
+    )
+
+    return np.asarray(scores, dtype=np.float32), np.asarray(offsets, dtype=np.int32)
 
 
 def format_params(params: dict) -> str:

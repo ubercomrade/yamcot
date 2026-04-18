@@ -34,7 +34,9 @@ from mimosa.functions import (
     cut_prc,
     cut_roc,
     fast_profile_score,
+    fast_profile_score_orientations,
     format_params,
+    normalize_empirical_log_tail_pair,
     pcm_to_pfm,
     pfm_to_pwm,
     precision_recall_curve,
@@ -442,6 +444,12 @@ def test_scores_to_empirical_log_tail_basic():
     assert transformed["values"].shape == score_batch["values"].shape
     assert transformed["mask"].shape == score_batch["mask"].shape
     np.testing.assert_array_equal(transformed["lengths"], score_batch["lengths"])
+
+
+def test_build_score_log_tail_table_returns_float32():
+    """Score log-tail tables should use float32 for faster downstream lookup."""
+    table = build_score_log_tail_table(np.array([0.1, 0.3, 0.2, 0.3], dtype=np.float64))
+    assert table.dtype == np.float32
 
 
 def test_read_scores_basic(tmp_path):
@@ -1129,6 +1137,37 @@ def test_fast_profile_score_thresholded_mask_matches_reference(metric):
     assert offset == expected_offset
 
 
+@pytest.mark.parametrize("metric", ["co", "dice"])
+def test_fast_profile_score_orientations_matches_pairwise(metric):
+    """Batch orientation scorer should match pairwise profile scoring."""
+    rng = np.random.default_rng(13)
+    lengths = np.array([4, 6, 5], dtype=np.int64)
+    offsets = np.zeros(lengths.size + 1, dtype=np.int64)
+    offsets[1:] = np.cumsum(lengths)
+
+    query_plus = _score_batch_from_flat(rng.uniform(0.0, 3.0, size=int(offsets[-1])).astype(np.float32), offsets)
+    query_minus = _score_batch_from_flat(rng.uniform(0.0, 3.0, size=int(offsets[-1])).astype(np.float32), offsets)
+    target_plus = _score_batch_from_flat(rng.uniform(0.0, 3.0, size=int(offsets[-1])).astype(np.float32), offsets)
+    target_minus = _score_batch_from_flat(rng.uniform(0.0, 3.0, size=int(offsets[-1])).astype(np.float32), offsets)
+    options = build_profile_score_options(search_range=2, min_value=0.5, metric=metric)
+
+    orientation_pairs = [
+        (query_plus, target_plus),
+        (query_minus, target_minus),
+        (query_plus, target_minus),
+        (query_minus, target_plus),
+    ]
+    scores, orientation_offsets = fast_profile_score_orientations(orientation_pairs, options)
+
+    assert scores.shape == (4,)
+    assert orientation_offsets.shape == (4,)
+
+    for pair_index, (query_profile, target_profile) in enumerate(orientation_pairs):
+        expected_score, expected_offset = fast_profile_score(query_profile, target_profile, options)
+        assert scores[pair_index] == pytest.approx(expected_score)
+        assert int(orientation_offsets[pair_index]) == expected_offset
+
+
 def test_strategy_functions_exist():
     """Test that all strategy functions are properly defined"""
     # Test that strategy functions exist and are callable
@@ -1224,6 +1263,39 @@ def test_strategy_profile_uses_promoters_for_empirical_calibration():
     resolved_plus = resolve_profile_signal(model, sequences, promoters, cfg, "+")
 
     np.testing.assert_allclose(flatten_valid(resolved_plus), flatten_valid(expected_plus), atol=1e-6)
+
+
+def test_resolve_profile_bundle_joint_empirical_fast_path_matches_direct_normalization():
+    """Joint empirical fast-path should match direct two-strand normalization exactly."""
+    representation = np.array(
+        [
+            [1.2, -0.3],
+            [-0.4, 1.0],
+            [-0.5, -0.4],
+            [-0.3, -0.5],
+            [-0.5, -0.5],
+        ],
+        dtype=np.float32,
+    )
+    model = GenericModel(type_key="pwm", name="joint", representation=representation, length=2, config={"kmer": 1})
+    sequences = make_sequence_batch(
+        [
+            _encode_sequence("ACGTAC"),
+            _encode_sequence("TGCATG"),
+            _encode_sequence("AAAAAC"),
+        ]
+    )
+    cfg = create_comparator_config(metric="co", n_permutations=0, cache_mode="off")
+
+    resolve_profile_bundle = strategy_profile.__globals__["_resolve_profile_bundle"]
+    resolved = resolve_profile_bundle(model, sequences, sequences, cfg)
+
+    plus_scores = scan_model(model, sequences, "+")
+    minus_scores = scan_model(model, sequences, "-")
+    expected_plus, expected_minus = normalize_empirical_log_tail_pair(plus_scores, minus_scores)
+
+    np.testing.assert_allclose(flatten_valid(resolved["plus"]), flatten_valid(expected_plus), atol=1e-6)
+    np.testing.assert_allclose(flatten_valid(resolved["minus"]), flatten_valid(expected_minus), atol=1e-6)
 
 
 def test_strategy_motif_handles_reverse_complement_for_higher_order_tensors():
