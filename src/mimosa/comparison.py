@@ -15,6 +15,7 @@ from mimosa.batches import SCORE_PADDING, batch_with_values, flatten_valid
 from mimosa.cache import fingerprint_batch, load_profile_cache, store_profile_cache
 from mimosa.execute import run_motali
 from mimosa.functions import (
+    _prepare_profile_bundle_for_scoring,
     apply_score_log_tail_table,
     build_profile_score_options,
     build_score_log_tail_table,
@@ -562,18 +563,20 @@ def strategy_profile(model1: GenericModel, model2: GenericModel, sequences, cfg:
         min_value=0.0 if cfg["min_logfpr"] is None else float(cfg["min_logfpr"]),
         metric=cfg["metric"],
     )
+    prepared_bundle1 = _prepare_profile_bundle_for_scoring(bundle1, float(score_options["min_value"]))
+    prepared_bundle2 = _prepare_profile_bundle_for_scoring(bundle2, float(score_options["min_value"]))
 
     orientation_pairs = (
-        ("++", bundle1["plus"], bundle2["plus"]),
-        ("--", bundle1["minus"], bundle2["minus"]),
-        ("+-", bundle1["plus"], bundle2["minus"]),
-        ("-+", bundle1["minus"], bundle2["plus"]),
+        ("++", prepared_bundle1["plus"], prepared_bundle2["plus"], bundle2["plus"]),
+        ("--", prepared_bundle1["minus"], prepared_bundle2["minus"], bundle2["minus"]),
+        ("+-", prepared_bundle1["plus"], prepared_bundle2["minus"], bundle2["minus"]),
+        ("-+", prepared_bundle1["minus"], prepared_bundle2["plus"], bundle2["plus"]),
     )
-    profile_pairs = [(query_profile, target_profile) for _, query_profile, target_profile in orientation_pairs]
+    profile_pairs = [(query_profile, target_profile) for _, query_profile, target_profile, _ in orientation_pairs]
     orientation_scores, orientation_offsets = fast_profile_score_orientations(profile_pairs, score_options)
 
     candidates = []
-    for (orientation, query_profile, target_profile), score, offset in zip(
+    for (orientation, _query_profile, _target_profile, target_profile_raw), score, offset in zip(
         orientation_pairs, orientation_scores, orientation_offsets, strict=False
     ):
         candidates.append(
@@ -581,8 +584,7 @@ def strategy_profile(model1: GenericModel, model2: GenericModel, sequences, cfg:
                 "orientation": orientation,
                 "score": float(score),
                 "offset": int(offset),
-                "query_profile": query_profile,
-                "target_profile": target_profile,
+                "target_profile_raw": target_profile_raw,
             }
         )
 
@@ -600,12 +602,14 @@ def strategy_profile(model1: GenericModel, model2: GenericModel, sequences, cfg:
     }
 
     if cfg["n_permutations"] > 0:
-        best_target_profile = best["target_profile"]
+        best_target_profile = best["target_profile_raw"]
+        prepared_query_plus = prepared_bundle1["plus"]
+        prepared_query_minus = prepared_bundle1["minus"]
 
         def surrogate_gen(rng):
             surrogate = _create_surrogate_batch(best_target_profile, rng, cfg)
             scores, _ = fast_profile_score_orientations(
-                [(bundle1["plus"], surrogate), (bundle1["minus"], surrogate)],
+                [(prepared_query_plus, surrogate), (prepared_query_minus, surrogate)],
                 score_options,
             )
             return float(np.max(scores, initial=0.0))

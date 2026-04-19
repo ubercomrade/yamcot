@@ -269,7 +269,7 @@ def _reference_fast_profile_score(data1, offsets1, data2, offsets2, search_range
             for j in range(overlap):
                 v1 = float(seq1[idx1_start + j])
                 v2 = float(seq2[idx2_start + j])
-                if min_value > 0.0 and v1 < min_value and v2 < min_value:
+                if min_value > 0.0 and (v1 < min_value or v2 < min_value):
                     continue
                 sum1s[k] += v1
                 sum2s[k] += v2
@@ -1074,12 +1074,12 @@ def test_batch_all_scores_strands_matches_separate_calls(representation, kmer, w
 @pytest.mark.parametrize(
     ("metric", "expected"),
     [
-        ("co", 1.0),
-        ("dice", 4.0 / 7.0),
+        ("co", 0.0),
+        ("dice", 0.0),
     ],
 )
-def test_profile_pairwise_threshold_mask_keeps_real_values(metric, expected):
-    """Profile metrics should ignore only dual-below-threshold pairs."""
+def test_profile_pairwise_threshold_mask_requires_both_values_above_threshold(metric, expected):
+    """Profile metrics should keep pairs only when both values satisfy the threshold."""
     data1 = np.array([2.0], dtype=np.float32)
     data2 = np.array([0.8], dtype=np.float32)
     offsets = np.array([0, 1], dtype=np.int64)
@@ -1219,7 +1219,7 @@ def test_strategy_functions_exist():
 
 
 def test_strategy_profile_uses_target_relative_offset_convention():
-    """Profile strategy should report target-relative offsets with the same sign in both directions."""
+    """Profile strategy should report offsets using the same target-relative convention as pairwise scoring."""
     scores_1 = _score_batch_from_flat(
         np.array([0.0, 1.0, 4.0, 2.0, 0.0, 0.0, 0.0], dtype=np.float32),
         np.array([0, 7], dtype=np.int64),
@@ -1231,14 +1231,19 @@ def test_strategy_profile_uses_target_relative_offset_convention():
     model1 = GenericModel(type_key="scores", name="s1", representation=None, length=0, config={"scores_data": scores_1})
     model2 = GenericModel(type_key="scores", name="s2", representation=None, length=0, config={"scores_data": scores_2})
     cfg = create_comparator_config(metric="co", search_range=4, min_logfpr=0.1, n_permutations=0)
+    options = build_profile_score_options(search_range=4, min_value=0.1, metric="co")
 
     forward = strategy_profile(model1, model2, None, cfg)
     reverse = strategy_profile(model2, model1, None, cfg)
+    expected_forward_score, expected_forward_offset = fast_profile_score(scores_1, scores_2, options)
+    expected_reverse_score, expected_reverse_offset = fast_profile_score(scores_2, scores_1, options)
 
     assert forward["orientation"] == "++"
     assert reverse["orientation"] == "++"
-    assert forward["offset"] == 2
-    assert reverse["offset"] == -2
+    assert forward["score"] == pytest.approx(expected_forward_score)
+    assert reverse["score"] == pytest.approx(expected_reverse_score)
+    assert forward["offset"] == -expected_forward_offset
+    assert reverse["offset"] == -expected_reverse_offset
 
 
 def test_strategy_profile_empirical_uses_combined_strand_table():

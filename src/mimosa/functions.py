@@ -504,22 +504,49 @@ def scores_to_empirical_log_tail(score_batch):
     return apply_score_log_tail_table(score_batch, table)
 
 
-def _profile_score_kernel_impl(values1, mask1, values2, mask2, *, search_range: int, min_value: float, metric: str):
+def _build_profile_threshold_mask(values, mask, min_value: float):
+    """Build the effective mask used by thresholded profile scoring."""
+    if min_value <= 0.0:
+        return mask
+    return mask & (values >= min_value)
+
+
+def _prepare_profile_for_scoring(profile, min_value: float):
+    """Convert one raw profile batch to device arrays used by the scoring kernels."""
+    if "values_device" in profile and "above_device" in profile and profile.get("min_value") == float(min_value):
+        return profile
+
+    values = jnp.asarray(profile["values"], dtype=jnp.float32)
+    mask = jnp.asarray(profile["mask"], dtype=bool)
+    return {
+        "values_device": values,
+        "above_device": _build_profile_threshold_mask(values, mask, float(min_value)),
+        "min_value": float(min_value),
+    }
+
+
+def _prepare_profile_bundle_for_scoring(bundle: dict, min_value: float) -> dict:
+    """Prepare one strand bundle for repeated profile comparisons."""
+    return {
+        "plus": _prepare_profile_for_scoring(bundle["plus"], min_value),
+        "minus": _prepare_profile_for_scoring(bundle["minus"], min_value),
+    }
+
+
+def _profile_score_kernel_impl(values1, above1, values2, above2, *, search_range: int, metric: str):
     """Compute the best profile similarity score for all offsets."""
     width1 = values1.shape[1]
-    width2 = values2.shape[1]
-    positions1 = jnp.arange(width1, dtype=jnp.int32)
     offsets = jnp.arange(-search_range, search_range + 1, dtype=jnp.int32)
+    left_pad = int(search_range)
+    right_pad = int(search_range + width1)
+    values2_padded = jnp.pad(values2, ((0, 0), (left_pad, right_pad)), constant_values=0.0)
+    above2_padded = jnp.pad(above2, ((0, 0), (left_pad, right_pad)), constant_values=False)
 
     def offset_stats(offset):
-        pos2 = positions1 - offset
-        safe_pos2 = jnp.clip(pos2, 0, width2 - 1)
-        gathered_values2 = values2[:, safe_pos2]
-        gathered_mask2 = mask2[:, safe_pos2]
-
-        pair_mask = mask1 & gathered_mask2 & ((pos2 >= 0) & (pos2 < width2))[None, :]
-        threshold_mask = (values1 >= min_value) | (gathered_values2 >= min_value)
-        pair_mask = pair_mask & jnp.where(min_value > 0.0, threshold_mask, jnp.ones_like(pair_mask))
+        start = left_pad - offset
+        gathered_values2 = jax.lax.dynamic_slice_in_dim(values2_padded, start, width1, axis=1)
+        gathered_above2 = jax.lax.dynamic_slice_in_dim(above2_padded, start, width1, axis=1)
+        pair_mask = above1 & gathered_above2
 
         inter = jnp.sum(jnp.where(pair_mask, jnp.minimum(values1, gathered_values2), 0.0))
         sum1 = jnp.sum(jnp.where(pair_mask, values1, 0.0))
@@ -545,59 +572,65 @@ def _profile_score_kernel_impl(values1, mask1, values2, mask2, *, search_range: 
 
 
 @partial(jax.jit, static_argnames=("search_range", "metric"))
-def _profile_score_kernel(values1, mask1, values2, mask2, *, search_range: int, min_value: float, metric: str):
+def _profile_score_kernel(values1, above1, values2, above2, *, search_range: int, metric: str):
     """JIT wrapper for one profile-pair score."""
     return _profile_score_kernel_impl(
         values1,
-        mask1,
+        above1,
         values2,
-        mask2,
+        above2,
         search_range=search_range,
-        min_value=min_value,
         metric=metric,
     )
 
 
 @partial(jax.jit, static_argnames=("search_range", "metric"))
 def _profile_score_orientations_kernel(
-    values1_stack, mask1_stack, values2_stack, mask2_stack, *, search_range: int, min_value: float, metric: str
+    values1_unique,
+    above1_unique,
+    left_indices,
+    values2_unique,
+    above2_unique,
+    right_indices,
+    *,
+    search_range: int,
+    metric: str,
 ):
     """Compute profile similarity for multiple orientation pairs in one JAX call."""
 
-    def score_one(values1, mask1, values2, mask2):
+    def score_one(left_index, right_index):
         return _profile_score_kernel_impl(
-            values1,
-            mask1,
-            values2,
-            mask2,
+            values1_unique[left_index],
+            above1_unique[left_index],
+            values2_unique[right_index],
+            above2_unique[right_index],
             search_range=search_range,
-            min_value=min_value,
             metric=metric,
         )
 
-    return jax.vmap(score_one)(values1_stack, mask1_stack, values2_stack, mask2_stack)
+    return jax.vmap(score_one)(left_indices, right_indices)
 
 
 def fast_profile_score(profile1, profile2, options: dict):
     """Compute the best overlap-based similarity score for two dense score batches."""
-    if profile1["values"].shape[0] != profile2["values"].shape[0]:
-        raise ValueError("profile batches must have the same number of rows")
+    min_value = float(options.get("min_value", 0.0))
+    prepared1 = _prepare_profile_for_scoring(profile1, min_value)
+    prepared2 = _prepare_profile_for_scoring(profile2, min_value)
+    values1 = prepared1["values_device"]
+    values2 = prepared2["values_device"]
 
-    values1 = jnp.asarray(profile1["values"], dtype=jnp.float32)
-    mask1 = jnp.asarray(profile1["mask"], dtype=bool)
-    values2 = jnp.asarray(profile2["values"], dtype=jnp.float32)
-    mask2 = jnp.asarray(profile2["mask"], dtype=bool)
+    if values1.shape[0] != values2.shape[0]:
+        raise ValueError("profile batches must have the same number of rows")
 
     if values1.shape[1] == 0 or values2.shape[1] == 0:
         return 0.0, 0
 
     score, offset = _profile_score_kernel(
         values1,
-        mask1,
+        prepared1["above_device"],
         values2,
-        mask2,
+        prepared2["above_device"],
         search_range=int(options["search_range"]),
-        min_value=float(options.get("min_value", 0.0)),
         metric=str(options.get("metric", "co")),
     )
     return float(score), int(offset)
@@ -608,35 +641,69 @@ def fast_profile_score_orientations(profile_pairs: list[tuple[dict, dict]], opti
     if not profile_pairs:
         return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.int32)
 
-    first_left, first_right = profile_pairs[0]
-    expected_rows = int(first_left["values"].shape[0])
-    expected_left_width = int(first_left["values"].shape[1])
-    expected_right_width = int(first_right["values"].shape[1])
+    min_value = float(options.get("min_value", 0.0))
+    prepared_cache = {}
 
-    for left_profile, right_profile in profile_pairs:
-        if left_profile["values"].shape[0] != expected_rows or right_profile["values"].shape[0] != expected_rows:
+    def prepare_cached(profile):
+        key = id(profile)
+        cached = prepared_cache.get(key)
+        if cached is None:
+            cached = _prepare_profile_for_scoring(profile, min_value)
+            prepared_cache[key] = cached
+        return cached
+
+    prepared_pairs = [(prepare_cached(left_profile), prepare_cached(right_profile)) for left_profile, right_profile in profile_pairs]
+
+    first_left, first_right = prepared_pairs[0]
+    expected_rows = int(first_left["values_device"].shape[0])
+    expected_left_width = int(first_left["values_device"].shape[1])
+    expected_right_width = int(first_right["values_device"].shape[1])
+
+    for left_profile, right_profile in prepared_pairs:
+        if left_profile["values_device"].shape[0] != expected_rows or right_profile["values_device"].shape[0] != expected_rows:
             raise ValueError("all profile pairs must have the same number of rows")
-        if left_profile["values"].shape[1] != expected_left_width:
+        if left_profile["values_device"].shape[1] != expected_left_width:
             raise ValueError("left profile widths must match across orientation pairs")
-        if right_profile["values"].shape[1] != expected_right_width:
+        if right_profile["values_device"].shape[1] != expected_right_width:
             raise ValueError("right profile widths must match across orientation pairs")
 
     if expected_left_width == 0 or expected_right_width == 0:
         n_pairs = len(profile_pairs)
         return np.zeros(n_pairs, dtype=np.float32), np.zeros(n_pairs, dtype=np.int32)
 
-    values1_stack = jnp.stack([jnp.asarray(pair[0]["values"], dtype=jnp.float32) for pair in profile_pairs], axis=0)
-    mask1_stack = jnp.stack([jnp.asarray(pair[0]["mask"], dtype=bool) for pair in profile_pairs], axis=0)
-    values2_stack = jnp.stack([jnp.asarray(pair[1]["values"], dtype=jnp.float32) for pair in profile_pairs], axis=0)
-    mask2_stack = jnp.stack([jnp.asarray(pair[1]["mask"], dtype=bool) for pair in profile_pairs], axis=0)
+    left_unique = []
+    left_index = {}
+    right_unique = []
+    right_index = {}
+    left_indices = []
+    right_indices = []
+
+    for left_profile, right_profile in prepared_pairs:
+        left_key = id(left_profile)
+        if left_key not in left_index:
+            left_index[left_key] = len(left_unique)
+            left_unique.append(left_profile)
+        left_indices.append(left_index[left_key])
+
+        right_key = id(right_profile)
+        if right_key not in right_index:
+            right_index[right_key] = len(right_unique)
+            right_unique.append(right_profile)
+        right_indices.append(right_index[right_key])
+
+    values1_unique = jnp.stack([profile["values_device"] for profile in left_unique], axis=0)
+    above1_unique = jnp.stack([profile["above_device"] for profile in left_unique], axis=0)
+    values2_unique = jnp.stack([profile["values_device"] for profile in right_unique], axis=0)
+    above2_unique = jnp.stack([profile["above_device"] for profile in right_unique], axis=0)
 
     scores, offsets = _profile_score_orientations_kernel(
-        values1_stack,
-        mask1_stack,
-        values2_stack,
-        mask2_stack,
+        values1_unique,
+        above1_unique,
+        jnp.asarray(left_indices, dtype=jnp.int32),
+        values2_unique,
+        above2_unique,
+        jnp.asarray(right_indices, dtype=jnp.int32),
         search_range=int(options["search_range"]),
-        min_value=float(options.get("min_value", 0.0)),
         metric=str(options.get("metric", "co")),
     )
 

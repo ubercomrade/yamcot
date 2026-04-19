@@ -7,7 +7,7 @@ from typing import Iterable
 import numpy as np
 
 NUCLEOTIDE_PADDING = np.int8(4)
-SCORE_PADDING = np.float32(4.0)
+SCORE_PADDING = np.float32(0.0)
 BATCH_NDIM = 2
 
 
