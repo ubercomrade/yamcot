@@ -1,18 +1,16 @@
-"""Numerical helpers and JAX-backed scoring kernels."""
+"""Numerical helpers and Numba-backed scoring kernels."""
 
 from __future__ import annotations
 
-from functools import partial
-
-import jax
-import jax.numpy as jnp
 import numpy as np
+from numba import njit, prange
 
 from mimosa.batches import SCORE_PADDING, batch_with_values, flatten_valid, pack_batch
 
 RC_TABLE = np.array([3, 2, 1, 0, 4], dtype=np.int8)
 PROFILE_EPS = np.float32(1e-6)
-_JAX_RC_TABLE = jnp.asarray(RC_TABLE, dtype=jnp.int32)
+_PROFILE_METRIC_CO = 0
+_PROFILE_METRIC_DICE = 1
 
 
 def build_profile_score_options(search_range: int, min_value: float = 0.0, metric: str = "co") -> dict:
@@ -153,115 +151,156 @@ def score_seq(num_site, kmer, model):
 def _prepare_model_rows(matrix: np.ndarray) -> np.ndarray:
     """Return one motif tensor as a flat 5-ary row table."""
     arr = np.asarray(matrix, dtype=np.float32)
-    return arr.reshape((-1, arr.shape[-1]))
+    return np.ascontiguousarray(arr.reshape((-1, arr.shape[-1])), dtype=np.float32)
 
 
-def _score_dense_sources(seq_row, length, src, *, max_len, powers, model_rows, term_idx, apply_revcomp: bool):
-    """Score one source-index tensor against the shared flattened motif rows."""
-    safe_src = jnp.clip(src, 0, max_len - 1)
-    picked = seq_row[safe_src]
-    valid_src = (src >= 0) & (src < length)
-    encoded = jnp.where(valid_src, picked, 4)
-
-    if apply_revcomp:
-        encoded = _JAX_RC_TABLE[encoded]
-
-    codes = jnp.sum(encoded * powers, axis=-1)
-    contributions = model_rows[codes, term_idx[None, :]]
-    return jnp.sum(contributions, axis=-1)
-
-
-@partial(jax.jit, static_argnames=("kmer", "with_context", "is_revcomp"))
-def _scan_dense_kernel(values, lengths, model_rows, *, kmer: int, with_context: bool, is_revcomp: bool):
-    """Score one dense encoded sequence batch with a shared JAX kernel."""
-    max_len = values.shape[1]
-    motif_len = model_rows.shape[-1]
+def _resolve_scan_layout(kmer: int, motif_len: int, with_context: bool) -> tuple[int, int, int]:
+    """Resolve the geometry used by the sequence-scanning kernels."""
     context_len = kmer - 1 if with_context else 0
     window_size = motif_len + context_len
     n_terms = window_size - kmer + 1
-    max_scores = max(max_len - motif_len + 1, 0)
-
-    positions = jnp.arange(max_scores, dtype=jnp.int32)
-    term_idx = jnp.arange(n_terms, dtype=jnp.int32)
-    kmer_idx = jnp.arange(kmer, dtype=jnp.int32)
-    powers = (5 ** jnp.arange(kmer - 1, -1, -1, dtype=jnp.int32)).astype(jnp.int32)
-
-    def scan_row(seq_row, length):
-        n_scores = jnp.maximum(length - motif_len + 1, 0)
-        valid_positions = positions < n_scores
-
-        if is_revcomp:
-            src = positions[:, None, None] + (window_size - 1 - (term_idx[None, :, None] + kmer_idx[None, None, :]))
-        else:
-            src = positions[:, None, None] - context_len + term_idx[None, :, None] + kmer_idx[None, None, :]
-
-        scores = _score_dense_sources(
-            seq_row,
-            length,
-            src,
-            max_len=max_len,
-            powers=powers,
-            model_rows=model_rows,
-            term_idx=term_idx,
-            apply_revcomp=is_revcomp,
-        )
-        padded_scores = jnp.where(valid_positions, scores, jnp.float32(SCORE_PADDING))
-        return padded_scores, valid_positions
-
-    return jax.vmap(scan_row)(values, lengths)
+    return context_len, window_size, n_terms
 
 
-@partial(jax.jit, static_argnames=("kmer", "with_context"))
-def _scan_dense_strands_kernel(values, lengths, model_rows, *, kmer: int, with_context: bool):
-    """Score one dense encoded batch on both strands in a single JAX call."""
-    max_len = values.shape[1]
+def _prepare_scan_inputs(sequences, matrix: np.ndarray):
+    """Normalize scan inputs to contiguous arrays and derived geometry."""
+    values = np.ascontiguousarray(sequences["values"], dtype=np.int8)
+    lengths = np.ascontiguousarray(sequences["lengths"], dtype=np.int64)
+    model_rows = _prepare_model_rows(matrix)
+    motif_len = int(model_rows.shape[-1])
+    max_scores = max(int(values.shape[1]) - motif_len + 1, 0)
+    out_lengths = np.maximum(lengths - motif_len + 1, 0)
+    return values, lengths, model_rows, motif_len, max_scores, out_lengths
+
+
+@njit(cache=True)
+def _score_window_forward(seq_row, length: int, model_rows, pos: int, kmer: int, context_len: int, n_terms: int):
+    """Score one forward-aligned window."""
+    total = np.float32(0.0)
+    for term in range(n_terms):
+        code = 0
+        src_start = pos - context_len + term
+        for offset in range(kmer):
+            src = src_start + offset
+            encoded = 4
+            if 0 <= src < length:
+                encoded = int(seq_row[src])
+            code = code * 5 + encoded
+        total += model_rows[code, term]
+    return total
+
+
+@njit(cache=True)
+def _score_window_reverse(seq_row, length: int, model_rows, pos: int, kmer: int, window_size: int, n_terms: int):
+    """Score one reverse-complement-aligned window."""
+    total = np.float32(0.0)
+    for term in range(n_terms):
+        code = 0
+        for offset in range(kmer):
+            src = pos + (window_size - 1 - (term + offset))
+            encoded = 4
+            if 0 <= src < length:
+                encoded = int(RC_TABLE[int(seq_row[src])])
+            code = code * 5 + encoded
+        total += model_rows[code, term]
+    return total
+
+
+@njit(cache=True, parallel=True)
+def _scan_dense_kernel_numba(values, lengths, model_rows, kmer: int, context_len: int, n_terms: int):
+    """Score one dense encoded sequence batch for one strand."""
+    n_rows, _ = values.shape
     motif_len = model_rows.shape[-1]
-    context_len = kmer - 1 if with_context else 0
-    window_size = motif_len + context_len
-    n_terms = window_size - kmer + 1
-    max_scores = max(max_len - motif_len + 1, 0)
+    max_scores = max(values.shape[1] - motif_len + 1, 0)
+    scores = np.zeros((n_rows, max_scores), dtype=np.float32)
+    mask = np.zeros((n_rows, max_scores), dtype=np.bool_)
 
-    positions = jnp.arange(max_scores, dtype=jnp.int32)
-    term_idx = jnp.arange(n_terms, dtype=jnp.int32)
-    kmer_idx = jnp.arange(kmer, dtype=jnp.int32)
-    powers = (5 ** jnp.arange(kmer - 1, -1, -1, dtype=jnp.int32)).astype(jnp.int32)
+    for row_index in prange(n_rows):
+        length = int(lengths[row_index])
+        n_scores = max(length - motif_len + 1, 0)
+        if n_scores == 0:
+            continue
 
-    def scan_row(seq_row, length):
-        n_scores = jnp.maximum(length - motif_len + 1, 0)
-        valid_positions = positions < n_scores
-        forward_src = positions[:, None, None] - context_len + term_idx[None, :, None] + kmer_idx[None, None, :]
-        reverse_src = positions[:, None, None] + (
-            window_size - 1 - (term_idx[None, :, None] + kmer_idx[None, None, :])
-        )
+        seq_row = values[row_index]
+        for pos in range(n_scores):
+            scores[row_index, pos] = _score_window_forward(
+                seq_row,
+                length,
+                model_rows,
+                pos,
+                kmer,
+                context_len,
+                n_terms,
+            )
+            mask[row_index, pos] = True
 
-        forward_scores = _score_dense_sources(
-            seq_row,
-            length,
-            forward_src,
-            max_len=max_len,
-            powers=powers,
-            model_rows=model_rows,
-            term_idx=term_idx,
-            apply_revcomp=False,
-        )
-        reverse_scores = _score_dense_sources(
-            seq_row,
-            length,
-            reverse_src,
-            max_len=max_len,
-            powers=powers,
-            model_rows=model_rows,
-            term_idx=term_idx,
-            apply_revcomp=True,
-        )
+    return scores, mask
 
-        padded_forward = jnp.where(valid_positions, forward_scores, jnp.float32(SCORE_PADDING))
-        padded_reverse = jnp.where(valid_positions, reverse_scores, jnp.float32(SCORE_PADDING))
-        strand_scores = jnp.stack((padded_forward, padded_reverse), axis=0)
-        strand_mask = jnp.stack((valid_positions, valid_positions), axis=0)
-        return strand_scores, strand_mask
 
-    return jax.vmap(scan_row)(values, lengths)
+@njit(cache=True, parallel=True)
+def _scan_dense_reverse_kernel_numba(values, lengths, model_rows, kmer: int, window_size: int, n_terms: int):
+    """Score one dense encoded sequence batch on the reverse-complement strand."""
+    n_rows, _ = values.shape
+    motif_len = model_rows.shape[-1]
+    max_scores = max(values.shape[1] - motif_len + 1, 0)
+    scores = np.zeros((n_rows, max_scores), dtype=np.float32)
+    mask = np.zeros((n_rows, max_scores), dtype=np.bool_)
+
+    for row_index in prange(n_rows):
+        length = int(lengths[row_index])
+        n_scores = max(length - motif_len + 1, 0)
+        if n_scores == 0:
+            continue
+
+        seq_row = values[row_index]
+        for pos in range(n_scores):
+            scores[row_index, pos] = _score_window_reverse(seq_row, length, model_rows, pos, kmer, window_size, n_terms)
+            mask[row_index, pos] = True
+
+    return scores, mask
+
+
+@njit(cache=True, parallel=True)
+def _scan_dense_strands_kernel_numba(
+    values, lengths, model_rows, kmer: int, context_len: int, window_size: int, n_terms: int
+):
+    """Score one dense encoded batch on both strands in one call."""
+    n_rows, _ = values.shape
+    motif_len = model_rows.shape[-1]
+    max_scores = max(values.shape[1] - motif_len + 1, 0)
+    scores = np.zeros((n_rows, 2, max_scores), dtype=np.float32)
+    mask = np.zeros((n_rows, 2, max_scores), dtype=np.bool_)
+
+    for row_index in prange(n_rows):
+        length = int(lengths[row_index])
+        n_scores = max(length - motif_len + 1, 0)
+        if n_scores == 0:
+            continue
+
+        seq_row = values[row_index]
+        for pos in range(n_scores):
+            scores[row_index, 0, pos] = _score_window_forward(
+                seq_row,
+                length,
+                model_rows,
+                pos,
+                kmer,
+                context_len,
+                n_terms,
+            )
+            scores[row_index, 1, pos] = _score_window_reverse(
+                seq_row,
+                length,
+                model_rows,
+                pos,
+                kmer,
+                window_size,
+                n_terms,
+            )
+            mask[row_index, 0, pos] = True
+            mask[row_index, 1, pos] = True
+
+    return scores, mask
 
 
 def _empty_score_scan_batch(n_rows: int, max_scores: int, out_lengths: np.ndarray):
@@ -275,61 +314,53 @@ def batch_all_scores(
     sequences, matrix: np.ndarray, kmer: int = 1, is_revcomp: bool = False, with_context: bool = False
 ):
     """Compute scores for all sequences in one dense masked batch."""
-    values_raw = sequences["values"]
-    lengths_raw = sequences["lengths"]
-    n_rows = int(values_raw.shape[0])
-
-    model_rows_np = _prepare_model_rows(matrix)
-    motif_len = int(model_rows_np.shape[-1])
-    max_scores = max(int(values_raw.shape[1]) - motif_len + 1, 0)
-    lengths_np = np.asarray(lengths_raw, dtype=np.int64)
-    out_lengths = np.maximum(lengths_np - motif_len + 1, 0)
+    values, lengths, model_rows, motif_len, max_scores, out_lengths = _prepare_scan_inputs(sequences, matrix)
+    n_rows = int(values.shape[0])
 
     if n_rows == 0 or max_scores == 0:
         return _empty_score_scan_batch(n_rows, max_scores, out_lengths)
 
-    values = jnp.asarray(values_raw, dtype=jnp.int32)
-    lengths = jnp.asarray(lengths_raw, dtype=jnp.int32)
-    model_rows = jnp.asarray(model_rows_np, dtype=jnp.float32)
-
-    scored_values, scored_mask = _scan_dense_kernel(
-        values,
-        lengths,
-        model_rows,
-        kmer=int(kmer),
-        with_context=bool(with_context),
-        is_revcomp=bool(is_revcomp),
-    )
+    context_len, window_size, n_terms = _resolve_scan_layout(int(kmer), motif_len, bool(with_context))
+    if is_revcomp:
+        scored_values, scored_mask = _scan_dense_reverse_kernel_numba(
+            values,
+            lengths,
+            model_rows,
+            int(kmer),
+            window_size,
+            n_terms,
+        )
+    else:
+        scored_values, scored_mask = _scan_dense_kernel_numba(
+            values,
+            lengths,
+            model_rows,
+            int(kmer),
+            context_len,
+            n_terms,
+        )
 
     return pack_batch(scored_values, scored_mask, out_lengths, SCORE_PADDING)
 
 
 def batch_all_scores_strands(sequences, matrix: np.ndarray, kmer: int = 1, with_context: bool = False):
     """Compute scores for both strands in one dense masked batch call."""
-    values_raw = sequences["values"]
-    lengths_raw = sequences["lengths"]
-    n_rows = int(values_raw.shape[0])
-
-    model_rows_np = _prepare_model_rows(matrix)
-    motif_len = int(model_rows_np.shape[-1])
-    max_scores = max(int(values_raw.shape[1]) - motif_len + 1, 0)
-    lengths_np = np.asarray(lengths_raw, dtype=np.int64)
-    out_lengths = np.maximum(lengths_np - motif_len + 1, 0)
+    values, lengths, model_rows, motif_len, max_scores, out_lengths = _prepare_scan_inputs(sequences, matrix)
+    n_rows = int(values.shape[0])
 
     if n_rows == 0 or max_scores == 0:
         empty_batch = _empty_score_scan_batch(n_rows, max_scores, out_lengths)
         return empty_batch, _empty_score_scan_batch(n_rows, max_scores, out_lengths)
 
-    values = jnp.asarray(values_raw, dtype=jnp.int32)
-    lengths = jnp.asarray(lengths_raw, dtype=jnp.int32)
-    model_rows = jnp.asarray(model_rows_np, dtype=jnp.float32)
-
-    scored_values, scored_mask = _scan_dense_strands_kernel(
+    context_len, window_size, n_terms = _resolve_scan_layout(int(kmer), motif_len, bool(with_context))
+    scored_values, scored_mask = _scan_dense_strands_kernel_numba(
         values,
         lengths,
         model_rows,
-        kmer=int(kmer),
-        with_context=bool(with_context),
+        int(kmer),
+        context_len,
+        window_size,
+        n_terms,
     )
 
     plus_batch = pack_batch(scored_values[:, 0, :], scored_mask[:, 0, :], out_lengths, SCORE_PADDING)
@@ -512,16 +543,15 @@ def _build_profile_threshold_mask(values, mask, min_value: float):
 
 
 def _prepare_profile_for_scoring(profile, min_value: float):
-    """Convert one raw profile batch to device arrays used by the scoring kernels."""
-    if "values_device" in profile and "above_device" in profile and profile.get("min_value") == float(min_value):
+    """Normalize one raw profile batch for compiled scoring kernels."""
+    if "active_mask" in profile and "mask" not in profile:
         return profile
 
-    values = jnp.asarray(profile["values"], dtype=jnp.float32)
-    mask = jnp.asarray(profile["mask"], dtype=bool)
+    values = np.ascontiguousarray(profile["values"], dtype=np.float32)
+    mask = np.ascontiguousarray(profile["mask"], dtype=bool)
     return {
-        "values_device": values,
-        "above_device": _build_profile_threshold_mask(values, mask, float(min_value)),
-        "min_value": float(min_value),
+        "values": values,
+        "active_mask": np.ascontiguousarray(_build_profile_threshold_mask(values, mask, float(min_value)), dtype=bool),
     }
 
 
@@ -533,82 +563,93 @@ def _prepare_profile_bundle_for_scoring(bundle: dict, min_value: float) -> dict:
     }
 
 
-def _profile_score_kernel_impl(values1, above1, values2, above2, *, search_range: int, metric: str):
-    """Compute the best profile similarity score for all offsets."""
-    width1 = values1.shape[1]
-    offsets = jnp.arange(-search_range, search_range + 1, dtype=jnp.int32)
-    left_pad = int(search_range)
-    right_pad = int(search_range + width1)
-    values2_padded = jnp.pad(values2, ((0, 0), (left_pad, right_pad)), constant_values=0.0)
-    above2_padded = jnp.pad(above2, ((0, 0), (left_pad, right_pad)), constant_values=False)
-
-    def offset_stats(offset):
-        start = left_pad - offset
-        gathered_values2 = jax.lax.dynamic_slice_in_dim(values2_padded, start, width1, axis=1)
-        gathered_above2 = jax.lax.dynamic_slice_in_dim(above2_padded, start, width1, axis=1)
-        pair_mask = above1 & gathered_above2
-
-        inter = jnp.sum(jnp.where(pair_mask, jnp.minimum(values1, gathered_values2), 0.0))
-        sum1 = jnp.sum(jnp.where(pair_mask, values1, 0.0))
-        sum2 = jnp.sum(jnp.where(pair_mask, gathered_values2, 0.0))
-        return inter, sum1, sum2
-
-    inters, sum1s, sum2s = jax.vmap(offset_stats)(offsets)
-
+def _resolve_profile_metric_code(metric: str) -> int:
+    """Resolve one public profile metric name to the internal kernel code."""
     if metric == "co":
-        denom = jnp.minimum(sum1s, sum2s)
-        scores = jnp.where(denom > PROFILE_EPS, inters / denom, -1.0)
-    elif metric == "dice":
-        denom = sum1s + sum2s
-        scores = jnp.where(denom > PROFILE_EPS, (2.0 * inters) / denom, -1.0)
-    else:
-        raise ValueError("metric must be one of: 'co', 'dice'")
-
-    best_index = jnp.argmax(scores)
-    best_score = scores[best_index]
-    best_offset = offsets[best_index]
-    valid = best_score >= 0.0
-    return jnp.where(valid, best_score, 0.0), jnp.where(valid, best_offset, 0)
+        return _PROFILE_METRIC_CO
+    if metric == "dice":
+        return _PROFILE_METRIC_DICE
+    raise ValueError("metric must be one of: 'co', 'dice'")
 
 
-@partial(jax.jit, static_argnames=("search_range", "metric"))
-def _profile_score_kernel(values1, above1, values2, above2, *, search_range: int, metric: str):
-    """JIT wrapper for one profile-pair score."""
-    return _profile_score_kernel_impl(
-        values1,
-        above1,
-        values2,
-        above2,
-        search_range=search_range,
-        metric=metric,
-    )
+@njit(cache=True)
+def _profile_score_numba(values1, active1, values2, active2, search_range: int, metric_code: int):
+    """Compute the best profile similarity score for all offsets."""
+    n_rows = values1.shape[0]
+    width1 = values1.shape[1]
+    width2 = values2.shape[1]
+    best_score = -1.0
+    best_offset = 0
+
+    for offset in range(-search_range, search_range + 1):
+        start1 = offset if offset > 0 else 0
+        start2 = -offset if offset < 0 else 0
+        remaining = width2 - start2
+        overlap = min(width1 - start1, remaining)
+
+        inter = 0.0
+        sum1 = 0.0
+        sum2 = 0.0
+
+        if overlap > 0:
+            for row_index in range(n_rows):
+                for delta in range(overlap):
+                    col1 = start1 + delta
+                    col2 = start2 + delta
+                    if active1[row_index, col1] and active2[row_index, col2]:
+                        value1 = float(values1[row_index, col1])
+                        value2 = float(values2[row_index, col2])
+                        inter += value1 if value1 < value2 else value2
+                        sum1 += value1
+                        sum2 += value2
+
+        if metric_code == _PROFILE_METRIC_CO:
+            denom = sum1 if sum1 < sum2 else sum2
+            score = inter / denom if denom > PROFILE_EPS else -1.0
+        else:
+            denom = sum1 + sum2
+            score = (2.0 * inter) / denom if denom > PROFILE_EPS else -1.0
+
+        if score > best_score:
+            best_score = score
+            best_offset = offset
+
+    if best_score < 0.0:
+        return np.float32(0.0), np.int32(0)
+    return np.float32(best_score), np.int32(best_offset)
 
 
-@partial(jax.jit, static_argnames=("search_range", "metric"))
-def _profile_score_orientations_kernel(
+@njit(cache=True, parallel=True)
+def _profile_score_orientations_numba(
     values1_unique,
-    above1_unique,
+    active1_unique,
     left_indices,
     values2_unique,
-    above2_unique,
+    active2_unique,
     right_indices,
-    *,
     search_range: int,
-    metric: str,
+    metric_code: int,
 ):
-    """Compute profile similarity for multiple orientation pairs in one JAX call."""
+    """Compute profile similarity for multiple orientation pairs in one call."""
+    n_pairs = left_indices.shape[0]
+    scores = np.zeros(n_pairs, dtype=np.float32)
+    offsets = np.zeros(n_pairs, dtype=np.int32)
 
-    def score_one(left_index, right_index):
-        return _profile_score_kernel_impl(
+    for pair_index in prange(n_pairs):
+        left_index = left_indices[pair_index]
+        right_index = right_indices[pair_index]
+        score, offset = _profile_score_numba(
             values1_unique[left_index],
-            above1_unique[left_index],
+            active1_unique[left_index],
             values2_unique[right_index],
-            above2_unique[right_index],
-            search_range=search_range,
-            metric=metric,
+            active2_unique[right_index],
+            search_range,
+            metric_code,
         )
+        scores[pair_index] = score
+        offsets[pair_index] = offset
 
-    return jax.vmap(score_one)(left_indices, right_indices)
+    return scores, offsets
 
 
 def fast_profile_score(profile1, profile2, options: dict):
@@ -616,8 +657,8 @@ def fast_profile_score(profile1, profile2, options: dict):
     min_value = float(options.get("min_value", 0.0))
     prepared1 = _prepare_profile_for_scoring(profile1, min_value)
     prepared2 = _prepare_profile_for_scoring(profile2, min_value)
-    values1 = prepared1["values_device"]
-    values2 = prepared2["values_device"]
+    values1 = prepared1["values"]
+    values2 = prepared2["values"]
 
     if values1.shape[0] != values2.shape[0]:
         raise ValueError("profile batches must have the same number of rows")
@@ -625,23 +666,19 @@ def fast_profile_score(profile1, profile2, options: dict):
     if values1.shape[1] == 0 or values2.shape[1] == 0:
         return 0.0, 0
 
-    score, offset = _profile_score_kernel(
+    score, offset = _profile_score_numba(
         values1,
-        prepared1["above_device"],
+        prepared1["active_mask"],
         values2,
-        prepared2["above_device"],
-        search_range=int(options["search_range"]),
-        metric=str(options.get("metric", "co")),
+        prepared2["active_mask"],
+        int(options["search_range"]),
+        _resolve_profile_metric_code(str(options.get("metric", "co"))),
     )
     return float(score), int(offset)
 
 
-def fast_profile_score_orientations(profile_pairs: list[tuple[dict, dict]], options: dict):
-    """Compute profile similarity for all orientation pairs in one JAX call."""
-    if not profile_pairs:
-        return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.int32)
-
-    min_value = float(options.get("min_value", 0.0))
+def _prepare_profile_pairs(profile_pairs: list[tuple[dict, dict]], min_value: float) -> list[tuple[dict, dict]]:
+    """Prepare all profile pairs while reusing repeated inputs."""
     prepared_cache = {}
 
     def prepare_cached(profile):
@@ -652,25 +689,32 @@ def fast_profile_score_orientations(profile_pairs: list[tuple[dict, dict]], opti
             prepared_cache[key] = cached
         return cached
 
-    prepared_pairs = [(prepare_cached(left_profile), prepare_cached(right_profile)) for left_profile, right_profile in profile_pairs]
+    return [
+        (prepare_cached(left_profile), prepare_cached(right_profile))
+        for left_profile, right_profile in profile_pairs
+    ]
 
+
+def _validate_profile_pair_shapes(prepared_pairs: list[tuple[dict, dict]]) -> tuple[int, int, int]:
+    """Validate that all prepared profile pairs share the same geometry."""
     first_left, first_right = prepared_pairs[0]
-    expected_rows = int(first_left["values_device"].shape[0])
-    expected_left_width = int(first_left["values_device"].shape[1])
-    expected_right_width = int(first_right["values_device"].shape[1])
+    expected_rows = int(first_left["values"].shape[0])
+    expected_left_width = int(first_left["values"].shape[1])
+    expected_right_width = int(first_right["values"].shape[1])
 
     for left_profile, right_profile in prepared_pairs:
-        if left_profile["values_device"].shape[0] != expected_rows or right_profile["values_device"].shape[0] != expected_rows:
+        if left_profile["values"].shape[0] != expected_rows or right_profile["values"].shape[0] != expected_rows:
             raise ValueError("all profile pairs must have the same number of rows")
-        if left_profile["values_device"].shape[1] != expected_left_width:
+        if left_profile["values"].shape[1] != expected_left_width:
             raise ValueError("left profile widths must match across orientation pairs")
-        if right_profile["values_device"].shape[1] != expected_right_width:
+        if right_profile["values"].shape[1] != expected_right_width:
             raise ValueError("right profile widths must match across orientation pairs")
 
-    if expected_left_width == 0 or expected_right_width == 0:
-        n_pairs = len(profile_pairs)
-        return np.zeros(n_pairs, dtype=np.float32), np.zeros(n_pairs, dtype=np.int32)
+    return expected_rows, expected_left_width, expected_right_width
 
+
+def _index_unique_profiles(prepared_pairs: list[tuple[dict, dict]]):
+    """Deduplicate prepared profiles and keep pair indices for the kernel call."""
     left_unique = []
     left_index = {}
     right_unique = []
@@ -691,20 +735,50 @@ def fast_profile_score_orientations(profile_pairs: list[tuple[dict, dict]], opti
             right_unique.append(right_profile)
         right_indices.append(right_index[right_key])
 
-    values1_unique = jnp.stack([profile["values_device"] for profile in left_unique], axis=0)
-    above1_unique = jnp.stack([profile["above_device"] for profile in left_unique], axis=0)
-    values2_unique = jnp.stack([profile["values_device"] for profile in right_unique], axis=0)
-    above2_unique = jnp.stack([profile["above_device"] for profile in right_unique], axis=0)
+    return left_unique, left_indices, right_unique, right_indices
 
-    scores, offsets = _profile_score_orientations_kernel(
+
+def fast_profile_score_orientations(profile_pairs: list[tuple[dict, dict]], options: dict):
+    """Compute profile similarity for all orientation pairs in one call."""
+    if not profile_pairs:
+        return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.int32)
+
+    min_value = float(options.get("min_value", 0.0))
+    prepared_pairs = _prepare_profile_pairs(profile_pairs, min_value)
+    _, expected_left_width, expected_right_width = _validate_profile_pair_shapes(prepared_pairs)
+
+    if expected_left_width == 0 or expected_right_width == 0:
+        n_pairs = len(profile_pairs)
+        return np.zeros(n_pairs, dtype=np.float32), np.zeros(n_pairs, dtype=np.int32)
+
+    left_unique, left_indices, right_unique, right_indices = _index_unique_profiles(prepared_pairs)
+
+    values1_unique = np.ascontiguousarray(
+        np.stack([profile["values"] for profile in left_unique], axis=0),
+        dtype=np.float32,
+    )
+    active1_unique = np.ascontiguousarray(
+        np.stack([profile["active_mask"] for profile in left_unique], axis=0),
+        dtype=bool,
+    )
+    values2_unique = np.ascontiguousarray(
+        np.stack([profile["values"] for profile in right_unique], axis=0),
+        dtype=np.float32,
+    )
+    active2_unique = np.ascontiguousarray(
+        np.stack([profile["active_mask"] for profile in right_unique], axis=0),
+        dtype=bool,
+    )
+
+    scores, offsets = _profile_score_orientations_numba(
         values1_unique,
-        above1_unique,
-        jnp.asarray(left_indices, dtype=jnp.int32),
+        active1_unique,
+        np.asarray(left_indices, dtype=np.int32),
         values2_unique,
-        above2_unique,
-        jnp.asarray(right_indices, dtype=jnp.int32),
-        search_range=int(options["search_range"]),
-        metric=str(options.get("metric", "co")),
+        active2_unique,
+        np.asarray(right_indices, dtype=np.int32),
+        int(options["search_range"]),
+        _resolve_profile_metric_code(str(options.get("metric", "co"))),
     )
 
     return np.asarray(scores, dtype=np.float32), np.asarray(offsets, dtype=np.int32)

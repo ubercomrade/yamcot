@@ -470,7 +470,7 @@ def get_pfm(
 
 
 def _scan_with_batch_kernel(model: GenericModel, sequences, strand: StrandMode, *, with_context: bool = False):
-    """Scan a tensor-based motif model with the shared JAX batch kernel."""
+    """Scan a tensor-based motif model with the shared Numba batch kernel."""
     representation = np.asarray(model.representation, dtype=np.float32)
     kmer = int(model.config.get("kmer", 1))
 
@@ -487,7 +487,7 @@ def _scan_with_batch_kernel(model: GenericModel, sequences, strand: StrandMode, 
 
 
 def _scan_with_batch_kernel_strands(model: GenericModel, sequences, *, with_context: bool = False):
-    """Scan a tensor-based motif model on both strands in one shared JAX call."""
+    """Scan a tensor-based motif model on both strands in one shared Numba call."""
     representation = np.asarray(model.representation, dtype=np.float32)
     kmer = int(model.config.get("kmer", 1))
     return batch_all_scores_strands(sequences, representation, kmer=kmer, with_context=with_context)

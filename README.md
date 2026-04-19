@@ -168,7 +168,7 @@ When installing via `pip`, the following dependencies are resolved automatically
 * `scipy` (>= 1.14.1)
 * `pandas` (>= 2.2.3)
 * `joblib` (>= 1.5.3)
-* `jax` (>= 0.6.2)
+* `numba` (>= 0.65.0)
 
 ### Build Requirements (Source only)
 
