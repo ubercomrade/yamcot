@@ -11,7 +11,15 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from mimosa.batches import SCORE_PADDING, pack_batch, row_values
+from mimosa.batches import (
+    MINUS_STRAND,
+    PLUS_STRAND,
+    SCORE_PADDING,
+    make_strand_bundle,
+    pack_batch,
+    profile_row_values,
+    row_values,
+)
 from mimosa.functions import (
     batch_all_scores,
     batch_all_scores_strands,
@@ -99,8 +107,11 @@ def scan_model_strands(model: GenericModel, sequences=None):
     handler = _get_model_handler(model.type_key)
     scan_both = handler.get("scan_both")
     if scan_both is not None:
-        return scan_both(model, sequences)
-    return handler["scan"](model, sequences, "+"), handler["scan"](model, sequences, "-")
+        plus_scores, minus_scores = scan_both(model, sequences)
+    else:
+        plus_scores = handler["scan"](model, sequences, "+")
+        minus_scores = handler["scan"](model, sequences, "-")
+    return make_strand_bundle(plus_scores, minus_scores)
 
 
 def write_model(model: GenericModel, path: str) -> None:
@@ -159,7 +170,7 @@ def _scan_both_strands(model: GenericModel, sequences):
     return scan_model_strands(model, sequences)
 
 
-def _collect_best_hits(sequences, s_fwd_batch, s_rev_batch) -> dict[str, np.ndarray]:
+def _collect_best_hits(sequences, score_bundle) -> dict[str, np.ndarray]:
     """Collect the single best hit per sequence as numeric arrays."""
     seq_indices: list[int] = []
     starts: list[int] = []
@@ -167,8 +178,8 @@ def _collect_best_hits(sequences, s_fwd_batch, s_rev_batch) -> dict[str, np.ndar
     scores: list[float] = []
 
     for seq_idx in range(len(sequences["lengths"])):
-        s_fwd = row_values(s_fwd_batch, seq_idx)
-        s_rev = row_values(s_rev_batch, seq_idx)
+        s_fwd = profile_row_values(score_bundle, PLUS_STRAND, seq_idx)
+        s_rev = profile_row_values(score_bundle, MINUS_STRAND, seq_idx)
         f_max = s_fwd.max() if s_fwd.size > 0 else -np.inf
         r_max = s_rev.max() if s_rev.size > 0 else -np.inf
 
@@ -196,29 +207,29 @@ def _collect_best_hits(sequences, s_fwd_batch, s_rev_batch) -> dict[str, np.ndar
     }
 
 
-def _collect_threshold_hits(s_fwd_batch, s_rev_batch, score_threshold: float) -> dict[str, np.ndarray]:
+def _collect_threshold_hits(score_bundle, score_threshold: float) -> dict[str, np.ndarray]:
     """Collect all hits above threshold as numeric arrays."""
     seq_indices_parts = []
     start_parts = []
     strand_parts = []
     score_parts = []
 
-    for seq_idx in range(len(s_fwd_batch["lengths"])):
-        s_fwd = row_values(s_fwd_batch, seq_idx)
-        s_rev = row_values(s_rev_batch, seq_idx)
+    for seq_idx in range(len(score_bundle["lengths"])):
+        s_fwd = profile_row_values(score_bundle, PLUS_STRAND, seq_idx)
+        s_rev = profile_row_values(score_bundle, MINUS_STRAND, seq_idx)
 
         f_pos = np.flatnonzero(s_fwd >= score_threshold)
         if f_pos.size > 0:
             seq_indices_parts.append(np.full(f_pos.size, seq_idx, dtype=np.int64))
             start_parts.append(f_pos.astype(np.int64, copy=False))
-            strand_parts.append(np.zeros(f_pos.size, dtype=np.int8))
+            strand_parts.append(np.full(f_pos.size, PLUS_STRAND, dtype=np.int8))
             score_parts.append(s_fwd[f_pos].astype(np.float32, copy=False))
 
         r_pos = np.flatnonzero(s_rev >= score_threshold)
         if r_pos.size > 0:
             seq_indices_parts.append(np.full(r_pos.size, seq_idx, dtype=np.int64))
             start_parts.append(r_pos.astype(np.int64, copy=False))
-            strand_parts.append(np.ones(r_pos.size, dtype=np.int8))
+            strand_parts.append(np.full(r_pos.size, MINUS_STRAND, dtype=np.int8))
             score_parts.append(s_rev[r_pos].astype(np.float32, copy=False))
 
     if not seq_indices_parts:
@@ -234,10 +245,10 @@ def _collect_threshold_hits(s_fwd_batch, s_rev_batch, score_threshold: float) ->
 
 def _collect_hits(model: GenericModel, sequences, mode: str, score_threshold: Optional[float]) -> dict[str, np.ndarray]:
     """Collect motif hits as numeric arrays."""
-    s_fwd_batch, s_rev_batch = _scan_both_strands(model, sequences)
+    score_bundle = _scan_both_strands(model, sequences)
     if mode == "best":
-        return _collect_best_hits(sequences, s_fwd_batch, s_rev_batch)
-    return _collect_threshold_hits(s_fwd_batch, s_rev_batch, float(score_threshold))
+        return _collect_best_hits(sequences, score_bundle)
+    return _collect_threshold_hits(score_bundle, float(score_threshold))
 
 
 def _scores_to_log_tail_array(scores: np.ndarray, threshold_table: np.ndarray) -> np.ndarray:

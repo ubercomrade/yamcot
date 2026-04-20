@@ -10,10 +10,10 @@ from pathlib import Path
 
 import numpy as np
 
-from mimosa.batches import SCORE_PADDING, pack_batch
+from mimosa.batches import SCORE_PADDING, pack_profile_bundle
 from mimosa.models import GenericModel
 
-CACHE_VERSION = "v3"
+CACHE_VERSION = "v4"
 
 
 def _hash_array(array: np.ndarray) -> bytes:
@@ -37,6 +37,17 @@ def fingerprint_batch(batch) -> str | None:
     hasher.update(_hash_array(np.asarray(batch["values"])))
     hasher.update(_hash_array(np.asarray(batch["mask"], dtype=np.uint8)))
     hasher.update(_hash_array(np.asarray(batch["lengths"], dtype=np.int64)))
+    return hasher.hexdigest()
+
+
+def fingerprint_profile_bundle(bundle) -> str | None:
+    """Return a stable content fingerprint for one 3D profile bundle."""
+    if bundle is None:
+        return None
+
+    hasher = hashlib.blake2b(digest_size=16)
+    hasher.update(_hash_array(np.asarray(bundle["values"])))
+    hasher.update(_hash_array(np.asarray(bundle["lengths"], dtype=np.int64)))
     return hasher.hexdigest()
 
 
@@ -66,11 +77,11 @@ def _profile_cache_path(spec: dict) -> Path:
     promoter_fp = fingerprint_batch(spec.get("promoters"))
     if promoter_fp is not None:
         base = base / promoter_fp
-    return base / f"{model_fp}.{spec['strand']}.npz"
+    return base / f"{model_fp}.npz"
 
 
 def load_profile_cache(spec: dict):
-    """Load one cached profile if it is present and readable."""
+    """Load one cached normalized profile bundle if it is present and readable."""
     path = _profile_cache_path(spec)
     if not path.exists():
         return None
@@ -81,17 +92,16 @@ def load_profile_cache(spec: dict):
             if version != CACHE_VERSION:
                 return None
             values = payload["values"].astype(np.float32, copy=False)
-            mask = payload["mask"].astype(bool, copy=False)
             lengths = payload["lengths"].astype(np.int64, copy=False)
     except (OSError, ValueError, KeyError):
         path.unlink(missing_ok=True)
         return None
 
-    return pack_batch(values, mask, lengths, SCORE_PADDING)
+    return pack_profile_bundle(values, lengths, SCORE_PADDING)
 
 
 def store_profile_cache(spec: dict, profile) -> Path:
-    """Store one derived profile atomically on disk."""
+    """Store one derived profile bundle atomically on disk."""
     path = _profile_cache_path(spec)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -103,7 +113,6 @@ def store_profile_cache(spec: dict, profile) -> Path:
                 handle,
                 version=np.array(CACHE_VERSION),
                 values=np.asarray(profile["values"], dtype=np.float32),
-                mask=np.asarray(profile["mask"], dtype=bool),
                 lengths=np.asarray(profile["lengths"], dtype=np.int64),
             )
         os.replace(tmp_path, path)

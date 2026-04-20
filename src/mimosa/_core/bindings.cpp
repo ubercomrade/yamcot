@@ -7,13 +7,13 @@ namespace nb = nanobind;
 
 NB_MODULE(_core, m) {
     m.doc() = "C++ backend for mimosa";
-    
+
     m.def("run_motali_cpp", &run_motali_cpp,
           nb::arg("file_fasta"),
-          nb::arg("type_model_1"), 
+          nb::arg("type_model_1"),
           nb::arg("type_model_2"),
           nb::arg("file_model_1"),
-          nb::arg("file_model_2"), 
+          nb::arg("file_model_2"),
           nb::arg("file_table_1"),
           nb::arg("file_table_2"),
           nb::arg("shift"),

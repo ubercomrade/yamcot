@@ -15,11 +15,30 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pytest
+from numba import get_num_threads
 
-from mimosa.api import compare_motifs, create_config, run_comparison
-from mimosa.batches import flatten_valid, make_score_batch, make_sequence_batch, row_values
+from mimosa.api import (
+    compare_motifs,
+    compare_one_to_many,
+    create_config,
+    create_many_config,
+    run_comparison,
+    run_one_to_many,
+)
+from mimosa.batches import (
+    MINUS_STRAND,
+    PLUS_STRAND,
+    flatten_profile_bundle,
+    flatten_valid,
+    make_score_batch,
+    make_sequence_batch,
+    make_strand_bundle,
+    profile_row_values,
+    row_values,
+)
 from mimosa.cache import clear_cache
 from mimosa.comparison import (
+    compare,
     create_comparator_config,
     strategy_motali,
     strategy_motif,
@@ -55,6 +74,7 @@ from mimosa.models import (
     get_sites,
     read_model,
     scan_model,
+    scan_model_strands,
     write_model,
 )
 from mimosa.models import registry as model_registry
@@ -453,6 +473,17 @@ def test_build_score_log_tail_table_returns_float32():
     assert table.dtype == np.float32
 
 
+def test_apply_score_log_tail_table_preserves_padding_for_empty_rows():
+    """Lookup normalization should keep padding intact when no valid scores are present."""
+    score_batch = make_score_batch([np.array([], dtype=np.float32)])
+    table = build_score_log_tail_table(np.array([0.1, 0.3, 0.2], dtype=np.float32))
+
+    transformed = apply_score_log_tail_table(score_batch, table)
+
+    np.testing.assert_array_equal(transformed["mask"], score_batch["mask"])
+    np.testing.assert_array_equal(transformed["values"], score_batch["values"])
+
+
 def test_read_scores_basic(tmp_path):
     """Numerical score profiles should be parsed from FASTA-like input."""
     path = tmp_path / "scores.fasta"
@@ -639,6 +670,7 @@ def test_create_comparator_config():
     assert config["seed"] is None
     assert config["pfm_top_fraction"] == pytest.approx(0.05)
     assert config["profile_normalization"] == "empirical_log_tail"
+    assert config["numba_threads"] is None
 
     # Test factory function with custom parameters
     config = create_comparator_config(metric="co", n_permutations=100, seed=42, pfm_top_fraction=0.2)
@@ -646,6 +678,42 @@ def test_create_comparator_config():
     assert config["n_permutations"] == 100
     assert config["seed"] == 42
     assert config["pfm_top_fraction"] == pytest.approx(0.2)
+
+
+def test_create_comparator_config_resolves_numba_threads():
+    """Explicit numba_threads should drive the effective parallel setting."""
+    config = create_comparator_config(numba_threads=4)
+    assert config["numba_threads"] == 4
+
+
+@pytest.mark.parametrize("kwargs", [{"numba_threads": 0}, {"numba_threads": -2}])
+def test_create_comparator_config_validates_thread_counts(kwargs):
+    """Thread-count settings should accept only positive values or -1."""
+    with pytest.raises(ValueError, match="positive or -1"):
+        create_comparator_config(**kwargs)
+
+
+def test_compare_applies_numba_threads_temporarily(monkeypatch):
+    """Execution boundary should apply and restore numba thread settings."""
+    observed = []
+    original_threads = get_num_threads()
+
+    def fake_strategy(model1, model2, sequences, cfg):
+        observed.append((cfg["numba_threads"], get_num_threads()))
+        return {"score": 1.0}
+
+    monkeypatch.setitem(comparison_registry, "thread_test", fake_strategy)
+
+    result = compare(
+        model1=None,
+        model2=None,
+        strategy="thread_test",
+        config=create_comparator_config(numba_threads=1),
+    )
+
+    assert result == {"score": 1.0}
+    assert observed == [(1, 1)]
+    assert get_num_threads() == original_threads
 
 
 def test_create_comparator_config_validates_kernel_range():
@@ -735,6 +803,36 @@ def test_scan_model_with_pwm():
     # Test scanning
     scores = scan_model(model, sequences, "+")
     assert flatten_valid(scores).size > 0
+
+
+def test_scan_model_strands_returns_strand_bundle():
+    """Two-strand scanning should return one bundle with shape strands x rows x cols."""
+    representation = np.array(
+        [
+            [0.2, 0.3, 0.1],
+            [0.3, 0.2, 0.4],
+            [0.2, 0.4, 0.3],
+            [0.3, 0.1, 0.2],
+            [0.1, 0.1, 0.1],
+        ],
+        dtype=np.float32,
+    )
+    model = GenericModel(type_key="pwm", name="test_pwm", representation=representation, length=3, config={"kmer": 1})
+    sequences = make_sequence_batch(
+        [
+            np.array([0, 1, 2, 3, 2, 1, 0], dtype=np.int8),
+            np.array([1, 2, 3, 0], dtype=np.int8),
+        ]
+    )
+
+    strand_bundle = scan_model_strands(model, sequences)
+    plus_scores = scan_model(model, sequences, "+")
+    minus_scores = scan_model(model, sequences, "-")
+
+    assert strand_bundle["values"].shape[0] == 2
+    np.testing.assert_array_equal(strand_bundle["lengths"], plus_scores["lengths"])
+    np.testing.assert_allclose(strand_bundle["values"][PLUS_STRAND], plus_scores["values"])
+    np.testing.assert_allclose(strand_bundle["values"][MINUS_STRAND], minus_scores["values"])
 
 
 def test_get_frequencies():
@@ -1192,6 +1290,14 @@ def test_fast_profile_score_orientations_matches_pairwise(metric):
     target_plus = _score_batch_from_flat(rng.uniform(0.0, 3.0, size=int(offsets[-1])).astype(np.float32), offsets)
     target_minus = _score_batch_from_flat(rng.uniform(0.0, 3.0, size=int(offsets[-1])).astype(np.float32), offsets)
     options = build_profile_score_options(search_range=2, min_value=0.5, metric=metric)
+    query_bundle = make_strand_bundle(query_plus, query_minus)
+    target_bundle = make_strand_bundle(target_plus, target_minus)
+    strand_pairs = [
+        (PLUS_STRAND, PLUS_STRAND),
+        (MINUS_STRAND, MINUS_STRAND),
+        (PLUS_STRAND, MINUS_STRAND),
+        (MINUS_STRAND, PLUS_STRAND),
+    ]
 
     orientation_pairs = [
         (query_plus, target_plus),
@@ -1199,7 +1305,7 @@ def test_fast_profile_score_orientations_matches_pairwise(metric):
         (query_plus, target_minus),
         (query_minus, target_plus),
     ]
-    scores, orientation_offsets = fast_profile_score_orientations(orientation_pairs, options)
+    scores, orientation_offsets = fast_profile_score_orientations(query_bundle, target_bundle, strand_pairs, options)
 
     assert scores.shape == (4,)
     assert orientation_offsets.shape == (4,)
@@ -1208,6 +1314,183 @@ def test_fast_profile_score_orientations_matches_pairwise(metric):
         expected_score, expected_offset = fast_profile_score(query_profile, target_profile, options)
         assert scores[pair_index] == pytest.approx(expected_score)
         assert int(orientation_offsets[pair_index]) == expected_offset
+
+
+def test_profile_orientation_search_requires_minus_plus_candidate():
+    """Restricting profile search to ++ and +- should miss valid -+ optima."""
+    query_plus = _score_batch_from_flat(np.array([1.0, 0.0, 0.0], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    query_minus = _score_batch_from_flat(np.array([0.0, 1.0, 0.0], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    target_plus = _score_batch_from_flat(np.array([0.0, 1.0, 0.0], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    target_minus = _score_batch_from_flat(np.array([0.0, 0.0, 1.0], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    options = build_profile_score_options(search_range=0, min_value=0.0, metric="co")
+    orientation_labels = ("++", "--", "+-", "-+")
+    query_bundle = make_strand_bundle(query_plus, query_minus)
+    target_bundle = make_strand_bundle(target_plus, target_minus)
+    scores, orientation_offsets = fast_profile_score_orientations(
+        query_bundle,
+        target_bundle,
+        [
+            (PLUS_STRAND, PLUS_STRAND),
+            (MINUS_STRAND, MINUS_STRAND),
+            (PLUS_STRAND, MINUS_STRAND),
+            (MINUS_STRAND, PLUS_STRAND),
+        ],
+        options,
+    )
+
+    assert int(np.argmax(scores)) == 3
+    assert orientation_labels[int(np.argmax(scores))] == "-+"
+    assert scores[3] == pytest.approx(1.0)
+    assert scores[3] > max(float(scores[0]), float(scores[2]))
+    np.testing.assert_array_equal(orientation_offsets, np.zeros(4, dtype=np.int32))
+
+
+def test_profile_orientation_search_requires_all_four_candidates_for_pwm_models():
+    """PFM-derived PWM profile comparison can prefer -+ over the reduced ++ / +- search space."""
+
+    def make_pwm_from_pfm(name: str, pfm: np.ndarray) -> GenericModel:
+        pwm = pfm_to_pwm(pfm).astype(np.float32)
+        representation = np.concatenate((pwm, np.min(pwm, axis=0, keepdims=True)), axis=0)
+        return GenericModel(
+            type_key="pwm",
+            name=name,
+            representation=representation,
+            length=pfm.shape[1],
+            config={"kmer": 1, "_source_pfm": pfm.astype(np.float32)},
+        )
+
+    pfm_1 = np.array(
+        [
+            [0.03364587, 0.00353458, 0.345236, 0.09329311, 0.15702443, 0.01077098, 0.00142371, 0.13933925, 0.00131438,
+             0.0057433],
+            [0.78910834, 0.37919682, 0.2486873, 0.00466091, 0.1745861, 0.08962669, 0.83672076, 0.62271661, 0.11432868,
+             0.14217305],
+            [0.12944466, 0.03434311, 0.01618065, 0.89675272, 0.03784276, 0.55884331, 0.05381118, 0.2102953, 0.00582364,
+             0.66432488],
+            [0.04780111, 0.5829255, 0.38989606, 0.00529327, 0.63054669, 0.34075904, 0.10804431, 0.02764886, 0.8785333,
+             0.18775877],
+        ],
+        dtype=np.float32,
+    )
+    pfm_2 = np.array(
+        [
+            [0.00277317, 0.05549242, 0.42488962, 0.90949905, 0.06935914, 0.00925176, 0.85040897, 0.04507855, 0.9808197,
+             0.03197747],
+            [0.21828328, 0.02460412, 0.00311564, 0.05960011, 0.65439123, 0.98875666, 0.00032324, 0.19157799, 0.01060591,
+             0.95191884],
+            [0.05031024, 0.87492639, 0.01184713, 0.00106371, 0.27624866, 0.00150903, 0.14537251, 0.76326233, 0.00749461,
+             0.01601587],
+            [0.72863328, 0.04497707, 0.56014758, 0.02983714, 0.00000094, 0.00048257, 0.00389528, 0.00008116, 0.00107979,
+             0.00008784],
+        ],
+        dtype=np.float32,
+    )
+    pwm_1 = make_pwm_from_pfm(
+        "pwm_1",
+        pfm_1,
+    )
+    pwm_2 = make_pwm_from_pfm(
+        "pwm_2",
+        pfm_2,
+    )
+    sequence_strings = [
+        "CAGATCTGAGGCCACAATCGGGTTCCTCCCAA",
+        "CACATGCCCAATCTCCACACCGCAAGTTCTG",
+        "ACGTACGGTTTGTTCATAGACATCGCTG",
+        "TGATTTGTATAGGGGGCGAAATCG",
+        "AACGTCACACTTCTCAGAACTTCGATAGCCCTTG",
+        "AACGGTGCACCAAGTGTGCGCACTAT",
+        "GGGGGACAGCATTCGCGGATTATGG",
+        "ACACAGGATTCATTATTAGTATCT",
+        "ATCTTCTGTAACGTTCTTAAAGAGTAT",
+        "TGTCAATGGACCATATGGCCTCA",
+        "CTACACTGTCTGTATGAACACTATTGACTCACC",
+        "CGTGAGGACCAACTATGAGGCCC",
+        "AAGGTATCAACTTCCCGCGTCATTCTTC",
+        "TGATGTTCGTCCAAAGCGTTCGGCC",
+        "CCCTATCCTGTGGCCGTCATGCGCACCGTTGACC",
+        "TCATGGGCAGATGTTTACGAGGC",
+        "ATATACGACCTCTCAGTGTGGAGA",
+        "GCGACAGGTCCAATCTGACGAGTG",
+        "AGCTGTCTCCCGACCGTGATGAAACGCGGAGATC",
+        "CGAACGCGGCCTAAGTGTCGTCTCAGTTGAGTTA",
+        "CGCATAGAGAATAGGTTATCGTT",
+        "TCAGATCTTCTCACATGTAGAAGCTTGCTCCGGCA",
+        "CGGTGCGTTACTTCCCCCAGG",
+        "ACCCCGTGGCTCCGCATAATCA",
+        "GGATAATATGCGGTCCTTCATAC",
+        "GGGTTGTATATGTGCTGCAG",
+        "AGAGGGGGCAAATTGATACACCGAGTC",
+        "CAAGGCGTATGCAGCTGATGGGTTAGCAAGACTGT",
+        "GCCGAACTCACTCTCTTACCACCAACGCGG",
+        "ACACATGCGCTCCAGGTATG",
+        "ATGTGAACCGACTGTAAAGTG",
+        "CTGGGCTACCTATGTTGAGA",
+        "AGCGCTCATATGCAACGGCTAGTC",
+        "CGGGCAATAGCACGGCGTAGGT",
+        "TATTACTCGCGCCATACTCTTCCCCAGGGTA",
+        "CGTCGTCTAGCCGATTCTTTTGCGGCGCCAACTGG",
+        "CATTGCTCCATCATCTACGGACTTCTACGTACAA",
+        "ATACCGCAATCGTGTGAGCTTGGTCCACAA",
+        "GGGTCCATACCGAGCGGCACCTGTAACCTCCAGGG",
+        "TACTCGCTATTAGGAATCACGGGG",
+        "GGAAGACAACTAAGGCACCCTATCCAGTG",
+        "TTCGCATCATCTGACGAAGTGCCAGGTCT",
+        "ACAGAGATAATGCCCGGGCCCAGCAGGTTG",
+        "TTACCTAGTTGTTTACCCGTGTTGG",
+        "TTCGTCCATTTTACTACTCCTAAGGGCGGGCT",
+        "CCAACAAATAGGCAGATCTCTCTTC",
+        "CTCAGCTCGGACACTTCACATGGCG",
+        "TAGCAGACGCCTTTCTACCTCCGA",
+    ]
+    sequences = make_sequence_batch(
+        [_encode_sequence(sequence) for sequence in sequence_strings]
+    )
+    cfg = create_comparator_config(metric="co", n_permutations=0, search_range=16)
+    calibration_sequences = strategy_profile.__globals__["_get_profile_calibration_sequences"](sequences, cfg)
+    resolve_profile_bundle = strategy_profile.__globals__["_resolve_profile_bundle"]
+    prepare_profile_bundle = strategy_profile.__globals__["_prepare_profile_bundle_for_scoring"]
+
+    bundle_1 = resolve_profile_bundle(pwm_1, sequences, calibration_sequences, cfg)
+    bundle_2 = resolve_profile_bundle(pwm_2, sequences, calibration_sequences, cfg)
+    prepared_1 = prepare_profile_bundle(bundle_1, 0.0)
+    prepared_2 = prepare_profile_bundle(bundle_2, 0.0)
+    orientation_pairs = [
+        ("++", PLUS_STRAND, PLUS_STRAND),
+        ("--", MINUS_STRAND, MINUS_STRAND),
+        ("+-", PLUS_STRAND, MINUS_STRAND),
+        ("-+", MINUS_STRAND, PLUS_STRAND),
+    ]
+    min_length = min(pwm_1.length, pwm_2.length)
+    expected_offset = min_length // 2
+
+    scores, offsets = fast_profile_score_orientations(
+        prepared_1,
+        prepared_2,
+        [(query_strand, target_strand) for _, query_strand, target_strand in orientation_pairs],
+        build_profile_score_options(search_range=cfg["search_range"], min_value=0.0, metric="co"),
+    )
+    score_by_orientation = {
+        orientation: float(score)
+        for (orientation, _query_strand, _target_strand), score in zip(orientation_pairs, scores, strict=True)
+    }
+    offset_by_orientation = {
+        orientation: int(offset)
+        for (orientation, _query_strand, _target_strand), offset in zip(orientation_pairs, offsets, strict=True)
+    }
+    reduced_best = max(("++", "+-"), key=score_by_orientation.get)
+    full_best = max(score_by_orientation, key=score_by_orientation.get)
+    result = strategy_profile(pwm_1, pwm_2, sequences, cfg)
+    overlap = min_length - abs(result["offset"])
+
+    assert reduced_best == "+-"
+    assert full_best == "-+"
+    assert score_by_orientation["-+"] > score_by_orientation["+-"]
+    assert offset_by_orientation["-+"] == expected_offset
+    assert overlap == min_length // 2
+    assert result["orientation"] == "-+"
+    assert result["score"] == pytest.approx(score_by_orientation["-+"])
+    assert result["offset"] == -expected_offset
 
 
 def test_strategy_functions_exist():
@@ -1271,15 +1554,22 @@ def test_strategy_profile_empirical_uses_combined_strand_table():
     expected_plus = apply_score_log_tail_table(plus_scores, combined_table)
     expected_minus = apply_score_log_tail_table(minus_scores, combined_table)
 
-    resolve_profile_signal = strategy_profile.__globals__["_resolve_profile_signal"]
-    resolved_plus = resolve_profile_signal(dimont, ragged_sequences, ragged_sequences, cfg, "+")
-    resolved_minus = resolve_profile_signal(dimont, ragged_sequences, ragged_sequences, cfg, "-")
+    resolve_profile_bundle = strategy_profile.__globals__["_resolve_profile_bundle"]
+    resolved = resolve_profile_bundle(dimont, ragged_sequences, ragged_sequences, cfg)
 
-    np.testing.assert_allclose(flatten_valid(resolved_plus), flatten_valid(expected_plus), atol=1e-6)
-    np.testing.assert_allclose(flatten_valid(resolved_minus), flatten_valid(expected_minus), atol=1e-6)
+    np.testing.assert_allclose(
+        flatten_profile_bundle(resolved, PLUS_STRAND),
+        flatten_valid(expected_plus),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        flatten_profile_bundle(resolved, MINUS_STRAND),
+        flatten_valid(expected_minus),
+        atol=1e-6,
+    )
 
-    plus_slice = row_values(resolved_plus, 0)
-    minus_slice = row_values(resolved_minus, 0)
+    plus_slice = profile_row_values(resolved, PLUS_STRAND, 0)
+    minus_slice = profile_row_values(resolved, MINUS_STRAND, 0)
     assert plus_slice[30] > minus_slice[29]
 
 
@@ -1306,14 +1596,18 @@ def test_strategy_profile_uses_promoters_for_empirical_calibration():
     table = build_score_log_tail_table(np.concatenate((flatten_valid(promoter_plus), flatten_valid(promoter_minus))))
     expected_plus = apply_score_log_tail_table(plus_scores, table)
 
-    resolve_profile_signal = strategy_profile.__globals__["_resolve_profile_signal"]
-    resolved_plus = resolve_profile_signal(model, sequences, promoters, cfg, "+")
+    resolve_profile_bundle = strategy_profile.__globals__["_resolve_profile_bundle"]
+    resolved = resolve_profile_bundle(model, sequences, promoters, cfg)
 
-    np.testing.assert_allclose(flatten_valid(resolved_plus), flatten_valid(expected_plus), atol=1e-6)
+    np.testing.assert_allclose(
+        flatten_profile_bundle(resolved, PLUS_STRAND),
+        flatten_valid(expected_plus),
+        atol=1e-6,
+    )
 
 
-def test_resolve_profile_bundle_joint_empirical_fast_path_matches_direct_normalization():
-    """Joint empirical fast-path should match direct two-strand normalization exactly."""
+def test_resolve_profile_bundle_matches_direct_two_strand_normalization():
+    """Resolved profile bundle should match direct two-strand normalization exactly."""
     representation = np.array(
         [
             [1.2, -0.3],
@@ -1341,8 +1635,16 @@ def test_resolve_profile_bundle_joint_empirical_fast_path_matches_direct_normali
     minus_scores = scan_model(model, sequences, "-")
     expected_plus, expected_minus = normalize_empirical_log_tail_pair(plus_scores, minus_scores)
 
-    np.testing.assert_allclose(flatten_valid(resolved["plus"]), flatten_valid(expected_plus), atol=1e-6)
-    np.testing.assert_allclose(flatten_valid(resolved["minus"]), flatten_valid(expected_minus), atol=1e-6)
+    np.testing.assert_allclose(
+        flatten_profile_bundle(resolved, PLUS_STRAND),
+        flatten_valid(expected_plus),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        flatten_profile_bundle(resolved, MINUS_STRAND),
+        flatten_valid(expected_minus),
+        atol=1e-6,
+    )
 
 
 def test_strategy_motif_handles_reverse_complement_for_higher_order_tensors():
@@ -1422,6 +1724,52 @@ def test_strategy_profile_co_uses_sparse_signal_on_foxa1_dimont_pwm_sites():
     assert result["score"] > 0.55
 
 
+def test_profile_orientation_search_requires_minus_minus_candidate_on_real_profiles():
+    """Real profile bundles can prefer -- over the reduced ++ / +- search space."""
+    site = "CCAGAGTAAACAG"
+    rng = np.random.default_rng(0)
+    sequences = []
+    encoded_site = _encode_sequence(site)
+
+    for _ in range(500):
+        seq = rng.integers(0, 4, size=80, dtype=np.int8)
+        seq[30 : 30 + encoded_site.size] = encoded_site
+        sequences.append(seq)
+
+    ragged_sequences = make_sequence_batch(sequences)
+    pwm = read_model(str(FIXTURES_ROOT / "pwm" / "PEAKS036274_FOXA1_P35582_MACS2.meme"), "pwm")
+    dimont = read_model(str(FIXTURES_ROOT / "dimont" / "PEAKS036274_FOXA1_P35582_MACS2-model-1.xml"), "dimont")
+    cfg = create_comparator_config(metric="co", n_permutations=0)
+    calibration_sequences = strategy_profile.__globals__["_get_profile_calibration_sequences"](ragged_sequences, cfg)
+    resolve_profile_bundle = strategy_profile.__globals__["_resolve_profile_bundle"]
+    prepare_profile_bundle = strategy_profile.__globals__["_prepare_profile_bundle_for_scoring"]
+
+    pwm_bundle = resolve_profile_bundle(pwm, ragged_sequences, calibration_sequences, cfg)
+    dimont_bundle = resolve_profile_bundle(dimont, ragged_sequences, calibration_sequences, cfg)
+    prepared_pwm = prepare_profile_bundle(pwm_bundle, 0.0)
+    prepared_dimont = prepare_profile_bundle(dimont_bundle, 0.0)
+    orientation_pairs = [
+        ("++", PLUS_STRAND, PLUS_STRAND),
+        ("--", MINUS_STRAND, MINUS_STRAND),
+        ("+-", PLUS_STRAND, MINUS_STRAND),
+        ("-+", MINUS_STRAND, PLUS_STRAND),
+    ]
+
+    scores, _ = fast_profile_score_orientations(
+        prepared_pwm,
+        prepared_dimont,
+        [(query_strand, target_strand) for _, query_strand, target_strand in orientation_pairs],
+        build_profile_score_options(search_range=cfg["search_range"], min_value=0.0, metric=cfg["metric"]),
+    )
+    score_by_orientation = {
+        orientation: float(score)
+        for (orientation, _query_strand, _target_strand), score in zip(orientation_pairs, scores, strict=True)
+    }
+
+    assert max(score_by_orientation, key=score_by_orientation.get) == "--"
+    assert score_by_orientation["--"] > max(score_by_orientation["++"], score_by_orientation["+-"])
+
+
 def test_strategy_profile_is_symmetric_when_models_peak_on_different_strands():
     """Profile comparison should consider both query and target strands before choosing orientation."""
     site = "CAGTAAACAG"
@@ -1477,7 +1825,7 @@ def test_strategy_profile_uses_disk_cache_for_target_and_query(tmp_path, monkeyp
 
     first = strategy_profile(query, target, sequences, cfg)
     assert first["target"] == "target"
-    assert len(list(tmp_path.rglob("*.npz"))) == 4
+    assert len(list(tmp_path.rglob("*.npz"))) == 2
 
     fresh_query = make_model("query")
     fresh_target = make_model("target")
@@ -1522,23 +1870,23 @@ def test_strategy_profile_permutations_use_batched_surrogate_scoring(monkeypatch
         length=0,
         config={"scores_data": scores_2},
     )
-    cfg = create_comparator_config(metric="co", n_permutations=1, n_jobs=1, search_range=2)
+    cfg = create_comparator_config(metric="co", n_permutations=1, numba_threads=1, search_range=2)
 
     call_sizes = []
-    original_orientations = strategy_profile.__globals__["fast_profile_score_orientations"]
+    original_orientations = strategy_profile.__globals__["_score_prepared_profile_orientations"]
 
-    def recording_orientations(profile_pairs, options):
-        call_sizes.append(len(profile_pairs))
-        return original_orientations(profile_pairs, options)
+    def recording_orientations(left_bundle, right_bundle, strand_pairs, options):
+        call_sizes.append(len(strand_pairs))
+        return original_orientations(left_bundle, right_bundle, strand_pairs, options)
 
-    def fake_run_montecarlo(obs_score_func, surrogate_generator_func, n_permutations, n_jobs, seed, *args):
+    def fake_run_montecarlo(obs_score_func, surrogate_generator_func, n_permutations, seed, *args):
         value = surrogate_generator_func(np.random.default_rng(0), *args)
         null_scores = np.array([value], dtype=np.float32)
         return null_scores, float(null_scores.mean()), float(null_scores.std())
 
     monkeypatch.setitem(
         strategy_profile.__globals__,
-        "fast_profile_score_orientations",
+        "_score_prepared_profile_orientations",
         recording_orientations,
     )
     monkeypatch.setitem(strategy_profile.__globals__, "run_montecarlo", fake_run_montecarlo)
@@ -1594,6 +1942,26 @@ def test_create_config_builds_unified_config():
     assert config["seed"] == 99
 
 
+def test_create_many_config_builds_unified_config():
+    """Unified one-vs-many config builder should create comparator config from kwargs."""
+    config = create_many_config(
+        query="query.meme",
+        targets=["target_a.pfm", "target_b.pfm"],
+        query_type="pwm",
+        target_type="pwm",
+        strategy="profile",
+        metric="co",
+        n_permutations=5,
+        seed=11,
+    )
+
+    assert config["strategy"] == "profile"
+    assert config["comparator"]["metric"] == "co"
+    assert config["comparator"]["n_permutations"] == 5
+    assert config["targets"] == ["target_a.pfm", "target_b.pfm"]
+    assert config["seed"] == 11
+
+
 def test_run_comparison_with_unified_config_and_models():
     """run_comparison should work with preloaded GenericModel objects."""
     representation = np.array(
@@ -1629,6 +1997,64 @@ def test_run_comparison_with_unified_config_and_models():
     assert "score" in result
     assert "offset" in result
     assert "orientation" in result
+
+
+def test_run_one_to_many_matches_pairwise_profile_results():
+    """One-vs-many profile API should match repeated pairwise comparisons."""
+    query_scores = _score_batch_from_flat(np.array([0.2, 0.5, 0.8], dtype=np.float32), np.array([0, 3], dtype=np.int64))
+    target_a_scores = _score_batch_from_flat(
+        np.array([0.2, 0.4, 0.9], dtype=np.float32),
+        np.array([0, 3], dtype=np.int64),
+    )
+    target_b_scores = _score_batch_from_flat(
+        np.array([0.8, 0.5, 0.2], dtype=np.float32),
+        np.array([0, 3], dtype=np.int64),
+    )
+    query = GenericModel(
+        type_key="scores",
+        name="query",
+        representation=None,
+        length=0,
+        config={"scores_data": query_scores},
+    )
+    target_a = GenericModel(
+        type_key="scores",
+        name="target_a",
+        representation=None,
+        length=0,
+        config={"scores_data": target_a_scores},
+    )
+    target_b = GenericModel(
+        type_key="scores",
+        name="target_b",
+        representation=None,
+        length=0,
+        config={"scores_data": target_b_scores},
+    )
+
+    config = create_many_config(
+        query=query,
+        targets=[target_a, target_b],
+        strategy="profile",
+        metric="co",
+        n_permutations=0,
+    )
+    results = run_one_to_many(config)
+
+    expected_a = run_comparison(
+        create_config(model1=query, model2=target_a, strategy="profile", metric="co", n_permutations=0)
+    )
+    expected_b = run_comparison(
+        create_config(model1=query, model2=target_b, strategy="profile", metric="co", n_permutations=0)
+    )
+
+    assert [result["target"] for result in results] == ["target_a", "target_b"]
+    for result, expected in zip(results, [expected_a, expected_b], strict=False):
+        assert result["query"] == expected["query"]
+        assert result["target"] == expected["target"]
+        assert result["orientation"] == expected["orientation"]
+        assert result["offset"] == expected["offset"]
+        np.testing.assert_allclose(result["score"], expected["score"])
 
 
 @pytest.mark.parametrize("metric", ["corr", "cj", "l1sim"])
@@ -1747,6 +2173,99 @@ def test_compare_motifs_shortcut_works_with_single_import_api():
 
     assert result["query"] == "m1"
     assert result["target"] == "m2"
+
+
+def test_compare_one_to_many_matches_pairwise_motif_results():
+    """One-vs-many motif API should match repeated pairwise comparisons."""
+    query_representation = np.array(
+        [
+            [0.6, 0.1, 0.3],
+            [0.2, 0.7, 0.1],
+            [0.1, 0.1, 0.6],
+            [0.1, 0.1, 0.0],
+            [0.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    target_a_representation = np.array(
+        [
+            [0.55, 0.15, 0.3],
+            [0.25, 0.65, 0.1],
+            [0.1, 0.1, 0.55],
+            [0.1, 0.1, 0.05],
+            [0.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    target_b_representation = np.array(
+        [
+            [0.1, 0.6, 0.1],
+            [0.6, 0.1, 0.1],
+            [0.1, 0.1, 0.6],
+            [0.2, 0.2, 0.2],
+            [0.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    query = GenericModel(
+        type_key="pwm",
+        name="query",
+        representation=query_representation,
+        length=3,
+        config={"kmer": 1},
+    )
+    target_a = GenericModel(
+        type_key="pwm",
+        name="target_a",
+        representation=target_a_representation,
+        length=3,
+        config={"kmer": 1},
+    )
+    target_b = GenericModel(
+        type_key="pwm",
+        name="target_b",
+        representation=target_b_representation,
+        length=3,
+        config={"kmer": 1},
+    )
+
+    results = compare_one_to_many(
+        query=query,
+        targets=[target_a, target_b],
+        strategy="motif",
+        metric="pcc",
+        n_permutations=0,
+    )
+
+    expected_a = compare_motifs(query, target_a, strategy="motif", metric="pcc", n_permutations=0)
+    expected_b = compare_motifs(query, target_b, strategy="motif", metric="pcc", n_permutations=0)
+
+    assert [result["target"] for result in results] == ["target_a", "target_b"]
+    for result, expected in zip(results, [expected_a, expected_b], strict=False):
+        assert result["orientation"] == expected["orientation"]
+        assert result["offset"] == expected["offset"]
+        np.testing.assert_allclose(result["score"], expected["score"])
+
+
+def test_run_one_to_many_rejects_motali():
+    """One-vs-many API should reject unsupported motali execution."""
+    representation = np.array(
+        [
+            [0.2, 0.3, 0.1],
+            [0.3, 0.2, 0.4],
+            [0.2, 0.4, 0.3],
+            [0.3, 0.1, 0.2],
+            [0.1, 0.1, 0.1],
+        ],
+        dtype=np.float32,
+    )
+    query = GenericModel(type_key="pwm", name="m1", representation=representation, length=3, config={"kmer": 1})
+    target = GenericModel(type_key="pwm", name="m2", representation=representation, length=3, config={"kmer": 1})
+
+    config = create_many_config(query=query, targets=[target], strategy="motali")
+
+    with pytest.raises(NotImplementedError, match="motali"):
+        run_one_to_many(config)
 
 
 if __name__ == "__main__":

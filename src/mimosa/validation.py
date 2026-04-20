@@ -25,6 +25,19 @@ def validate_positive_int(name: str, value: int) -> int:
     return number
 
 
+def validate_optional_thread_count(name: str, value: Optional[int]) -> Optional[int]:
+    """Validate one optional thread-count parameter with -1 meaning auto."""
+    if value is None:
+        return None
+
+    number = int(value)
+    if number == -1:
+        return None
+    if number <= 0:
+        raise ValueError(f"{name} must be positive or -1 for automatic selection, got {value}")
+    return number
+
+
 def validate_non_negative(name: str, value: Optional[float]) -> Optional[float]:
     """Validate one optional non-negative numeric parameter."""
     if value is None:

@@ -5,7 +5,14 @@ from __future__ import annotations
 import numpy as np
 from numba import njit, prange
 
-from mimosa.batches import SCORE_PADDING, batch_with_values, flatten_valid, pack_batch
+from mimosa.batches import (
+    SCORE_PADDING,
+    batch_with_values,
+    flatten_profile_bundle,
+    flatten_valid,
+    pack_batch,
+    pack_profile_bundle,
+)
 
 RC_TABLE = np.array([3, 2, 1, 0, 4], dtype=np.int8)
 PROFILE_EPS = np.float32(1e-6)
@@ -51,51 +58,117 @@ def build_score_log_tail_table(scores: np.ndarray) -> np.ndarray:
     return np.column_stack([unique_scores, log_tail]).astype(np.float32, copy=False)
 
 
+@njit(cache=True)
+def _lower_bound_desc(values, target):
+    """Find the first descending-table index whose score is not greater than target."""
+    size = values.shape[0]
+    if size <= 1 or target >= values[0]:
+        return 0
+    if target <= values[size - 1]:
+        return size - 1
+
+    lo = 0
+    hi = size
+    while lo < hi:
+        mid = lo + (hi - lo) // 2
+        if values[mid] > target:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+@njit(cache=True, parallel=True)
+def _apply_score_log_tail_table_numba(values, mask, scores_col, log_tail_col, padding_value: float):
+    """Map one dense masked score matrix to empirical log-tail values."""
+    rows, cols = values.shape
+    mapped = np.empty((rows, cols), dtype=np.float32)
+
+    for row_index in prange(rows):
+        for col_index in range(cols):
+            if mask[row_index, col_index]:
+                idx = _lower_bound_desc(scores_col, values[row_index, col_index])
+                mapped[row_index, col_index] = log_tail_col[idx]
+            else:
+                mapped[row_index, col_index] = padding_value
+
+    return mapped
+
+
 def apply_score_log_tail_table(score_batch, table: np.ndarray):
     """Map one score batch to empirical log-tail values using a lookup table."""
-    flat = flatten_valid(score_batch)
-    if flat.size == 0:
+    table_arr = np.asarray(table, dtype=np.float32)
+    if table_arr.size == 0:
         empty_values = np.full_like(score_batch["values"], SCORE_PADDING)
         return batch_with_values(score_batch, empty_values, padding_value=SCORE_PADDING)
 
-    scores_col = np.asarray(table[:, 0], dtype=np.float32)
-    log_tail_col = np.asarray(table[:, 1], dtype=np.float32)
-    idx = np.searchsorted(-scores_col, -flat, side="left")
-    idx = np.clip(idx, 0, len(log_tail_col) - 1)
-
-    mapped = np.full(score_batch["values"].shape, SCORE_PADDING, dtype=np.float32)
-    mapped[score_batch["mask"]] = log_tail_col[idx]
+    mapped = _apply_score_log_tail_table_numba(
+        np.ascontiguousarray(score_batch["values"], dtype=np.float32),
+        np.ascontiguousarray(score_batch["mask"], dtype=np.bool_),
+        np.ascontiguousarray(table_arr[:, 0], dtype=np.float32),
+        np.ascontiguousarray(table_arr[:, 1], dtype=np.float32),
+        np.float32(SCORE_PADDING),
+    )
     return batch_with_values(score_batch, mapped, padding_value=SCORE_PADDING)
+
+
+def _build_length_mask(lengths: np.ndarray, width: int) -> np.ndarray:
+    """Build one dense prefix mask from row lengths."""
+    return np.arange(width, dtype=np.int64)[None, :] < np.asarray(lengths, dtype=np.int64)[:, None]
+
+
+def apply_score_log_tail_table_to_profile_bundle(profile_bundle, table: np.ndarray):
+    """Map one 3D profile bundle to empirical log-tail values using one lookup table."""
+    table_arr = np.asarray(table, dtype=np.float32)
+    values = np.ascontiguousarray(profile_bundle["values"], dtype=np.float32)
+    lengths = np.asarray(profile_bundle["lengths"], dtype=np.int64)
+
+    if table_arr.size == 0:
+        empty_values = np.full_like(values, SCORE_PADDING)
+        return pack_profile_bundle(empty_values, lengths, SCORE_PADDING)
+
+    mask = np.ascontiguousarray(_build_length_mask(lengths, values.shape[2]), dtype=np.bool_)
+    mapped = np.empty_like(values)
+    scores_col = np.ascontiguousarray(table_arr[:, 0], dtype=np.float32)
+    log_tail_col = np.ascontiguousarray(table_arr[:, 1], dtype=np.float32)
+
+    for profile_index in range(values.shape[0]):
+        mapped[profile_index] = _apply_score_log_tail_table_numba(
+            values[profile_index],
+            mask,
+            scores_col,
+            log_tail_col,
+            np.float32(SCORE_PADDING),
+        )
+
+    return pack_profile_bundle(mapped, lengths, SCORE_PADDING)
+
+
+def scores_to_empirical_log_tail_bundle(profile_bundle):
+    """Convert one 3D profile bundle to empirical log-tail values within the current sample."""
+    table = build_score_log_tail_table(flatten_profile_bundle(profile_bundle))
+    return apply_score_log_tail_table_to_profile_bundle(profile_bundle, table)
 
 
 def normalize_empirical_log_tail_pair(score_batch_plus, score_batch_minus):
     """Normalize two strand score batches using one shared empirical log-tail mapping."""
-    flat_plus = flatten_valid(score_batch_plus).astype(np.float32, copy=False)
-    flat_minus = flatten_valid(score_batch_minus).astype(np.float32, copy=False)
-    total_size = int(flat_plus.size + flat_minus.size)
-
-    if total_size == 0:
-        empty_plus = np.full(score_batch_plus["values"].shape, SCORE_PADDING, dtype=np.float32)
-        empty_minus = np.full(score_batch_minus["values"].shape, SCORE_PADDING, dtype=np.float32)
-        return (
-            batch_with_values(score_batch_plus, empty_plus, padding_value=SCORE_PADDING),
-            batch_with_values(score_batch_minus, empty_minus, padding_value=SCORE_PADDING),
-        )
-
-    combined = np.concatenate((flat_plus, flat_minus)).astype(np.float32, copy=False)
-    _, inverse_idx, counts = np.unique(combined, return_inverse=True, return_counts=True)
-    tail_counts = np.cumsum(counts[::-1], dtype=np.int64)[::-1]
-    log_tail = (-np.log10(tail_counts / float(total_size))).astype(np.float32, copy=False)
-    mapped = log_tail[inverse_idx]
-
-    values_plus = np.full(score_batch_plus["values"].shape, SCORE_PADDING, dtype=np.float32)
-    values_minus = np.full(score_batch_minus["values"].shape, SCORE_PADDING, dtype=np.float32)
-    values_plus[score_batch_plus["mask"]] = mapped[: flat_plus.size]
-    values_minus[score_batch_minus["mask"]] = mapped[flat_plus.size :]
-
+    profile_bundle = pack_profile_bundle(
+        np.stack(
+            (
+                np.asarray(score_batch_plus["values"], dtype=np.float32),
+                np.asarray(score_batch_minus["values"], dtype=np.float32),
+            ),
+            axis=0,
+        ),
+        np.asarray(score_batch_plus["lengths"], dtype=np.int64),
+        SCORE_PADDING,
+    )
+    normalized = scores_to_empirical_log_tail_bundle(profile_bundle)
+    values_plus = normalized["values"][0]
+    values_minus = normalized["values"][1]
     return (
-        batch_with_values(score_batch_plus, values_plus, padding_value=SCORE_PADDING),
-        batch_with_values(score_batch_minus, values_minus, padding_value=SCORE_PADDING),
+        pack_batch(values_plus, score_batch_plus["mask"], score_batch_plus["lengths"], SCORE_PADDING),
+        pack_batch(values_minus, score_batch_minus["mask"], score_batch_minus["lengths"], SCORE_PADDING),
     )
 
 
@@ -173,7 +246,7 @@ def _prepare_scan_inputs(sequences, matrix: np.ndarray):
     return values, lengths, model_rows, motif_len, max_scores, out_lengths
 
 
-@njit(cache=True)
+@njit(cache=True, fastmath=True)
 def _score_window_forward(seq_row, length: int, model_rows, pos: int, kmer: int, context_len: int, n_terms: int):
     """Score one forward-aligned window."""
     total = np.float32(0.0)
@@ -190,7 +263,7 @@ def _score_window_forward(seq_row, length: int, model_rows, pos: int, kmer: int,
     return total
 
 
-@njit(cache=True)
+@njit(cache=True, fastmath=True)
 def _score_window_reverse(seq_row, length: int, model_rows, pos: int, kmer: int, window_size: int, n_terms: int):
     """Score one reverse-complement-aligned window."""
     total = np.float32(0.0)
@@ -206,7 +279,7 @@ def _score_window_reverse(seq_row, length: int, model_rows, pos: int, kmer: int,
     return total
 
 
-@njit(cache=True, parallel=True)
+@njit(cache=True, parallel=True, fastmath=True)
 def _scan_dense_kernel_numba(values, lengths, model_rows, kmer: int, context_len: int, n_terms: int):
     """Score one dense encoded sequence batch for one strand."""
     n_rows, _ = values.shape
@@ -237,7 +310,7 @@ def _scan_dense_kernel_numba(values, lengths, model_rows, kmer: int, context_len
     return scores, mask
 
 
-@njit(cache=True, parallel=True)
+@njit(cache=True, parallel=True, fastmath=True)
 def _scan_dense_reverse_kernel_numba(values, lengths, model_rows, kmer: int, window_size: int, n_terms: int):
     """Score one dense encoded sequence batch on the reverse-complement strand."""
     n_rows, _ = values.shape
@@ -260,7 +333,7 @@ def _scan_dense_reverse_kernel_numba(values, lengths, model_rows, kmer: int, win
     return scores, mask
 
 
-@njit(cache=True, parallel=True)
+@njit(cache=True, parallel=True, fastmath=True)
 def _scan_dense_strands_kernel_numba(
     values, lengths, model_rows, kmer: int, context_len: int, window_size: int, n_terms: int
 ):
@@ -535,32 +608,35 @@ def scores_to_empirical_log_tail(score_batch):
     return apply_score_log_tail_table(score_batch, table)
 
 
-def _build_profile_threshold_mask(values, mask, min_value: float):
-    """Build the effective mask used by thresholded profile scoring."""
-    if min_value <= 0.0:
-        return mask
-    return mask & (values >= min_value)
+def _profile_threshold(min_value: float) -> np.float32:
+    """Return the minimum retained profile value for scoring."""
+    return np.float32(max(float(min_value), 0.0))
 
 
 def _prepare_profile_for_scoring(profile, min_value: float):
-    """Normalize one raw profile batch for compiled scoring kernels."""
-    if "active_mask" in profile and "mask" not in profile:
-        return profile
+    """Prepare one 2D profile matrix for compiled scoring kernels."""
+    values = np.ascontiguousarray(profile["values"], dtype=np.float32).copy()
+    if "mask" in profile:
+        mask = np.ascontiguousarray(profile["mask"], dtype=bool)
+        values[~mask] = SCORE_PADDING
 
-    values = np.ascontiguousarray(profile["values"], dtype=np.float32)
-    mask = np.ascontiguousarray(profile["mask"], dtype=bool)
+    threshold = _profile_threshold(min_value)
+    if threshold > 0.0:
+        values[values < threshold] = SCORE_PADDING
+
     return {
-        "values": values,
-        "active_mask": np.ascontiguousarray(_build_profile_threshold_mask(values, mask, float(min_value)), dtype=bool),
+        "values": np.ascontiguousarray(values, dtype=np.float32),
+        "lengths": np.asarray(profile["lengths"], dtype=np.int64),
     }
 
 
 def _prepare_profile_bundle_for_scoring(bundle: dict, min_value: float) -> dict:
-    """Prepare one strand bundle for repeated profile comparisons."""
-    return {
-        "plus": _prepare_profile_for_scoring(bundle["plus"], min_value),
-        "minus": _prepare_profile_for_scoring(bundle["minus"], min_value),
-    }
+    """Prepare one 3D profile bundle for repeated profile comparisons."""
+    values = np.ascontiguousarray(bundle["values"], dtype=np.float32).copy()
+    threshold = _profile_threshold(min_value)
+    if threshold > 0.0:
+        values[values < threshold] = SCORE_PADDING
+    return pack_profile_bundle(values, bundle["lengths"], SCORE_PADDING)
 
 
 def _resolve_profile_metric_code(metric: str) -> int:
@@ -572,8 +648,19 @@ def _resolve_profile_metric_code(metric: str) -> int:
     raise ValueError("metric must be one of: 'co', 'dice'")
 
 
-@njit(cache=True)
-def _profile_score_numba(values1, active1, values2, active2, search_range: int, metric_code: int):
+@njit(cache=True, fastmath=True)
+def _finalize_profile_score(inter: float, sum1: float, sum2: float, metric_code: int) -> float:
+    """Convert accumulated overlap statistics to one similarity score."""
+    if metric_code == _PROFILE_METRIC_CO:
+        denom = sum1 if sum1 < sum2 else sum2
+        return inter / denom if denom > PROFILE_EPS else -1.0
+
+    denom = sum1 + sum2
+    return (2.0 * inter) / denom if denom > PROFILE_EPS else -1.0
+
+
+@njit(cache=True, fastmath=True)
+def _profile_score_numba(values1, values2, search_range: int, metric_code: int):
     """Compute the best profile similarity score for all offsets."""
     n_rows = values1.shape[0]
     width1 = values1.shape[1]
@@ -586,7 +673,6 @@ def _profile_score_numba(values1, active1, values2, active2, search_range: int, 
         start2 = -offset if offset < 0 else 0
         remaining = width2 - start2
         overlap = min(width1 - start1, remaining)
-
         inter = 0.0
         sum1 = 0.0
         sum2 = 0.0
@@ -596,20 +682,14 @@ def _profile_score_numba(values1, active1, values2, active2, search_range: int, 
                 for delta in range(overlap):
                     col1 = start1 + delta
                     col2 = start2 + delta
-                    if active1[row_index, col1] and active2[row_index, col2]:
-                        value1 = float(values1[row_index, col1])
-                        value2 = float(values2[row_index, col2])
+                    value1 = float(values1[row_index, col1])
+                    value2 = float(values2[row_index, col2])
+                    if value1 > 0.0 and value2 > 0.0:
                         inter += value1 if value1 < value2 else value2
                         sum1 += value1
                         sum2 += value2
 
-        if metric_code == _PROFILE_METRIC_CO:
-            denom = sum1 if sum1 < sum2 else sum2
-            score = inter / denom if denom > PROFILE_EPS else -1.0
-        else:
-            denom = sum1 + sum2
-            score = (2.0 * inter) / denom if denom > PROFILE_EPS else -1.0
-
+        score = _finalize_profile_score(inter, sum1, sum2, metric_code)
         if score > best_score:
             best_score = score
             best_offset = offset
@@ -619,13 +699,11 @@ def _profile_score_numba(values1, active1, values2, active2, search_range: int, 
     return np.float32(best_score), np.int32(best_offset)
 
 
-@njit(cache=True, parallel=True)
+@njit(cache=True, parallel=True, fastmath=True)
 def _profile_score_orientations_numba(
     values1_unique,
-    active1_unique,
     left_indices,
     values2_unique,
-    active2_unique,
     right_indices,
     search_range: int,
     metric_code: int,
@@ -640,9 +718,7 @@ def _profile_score_orientations_numba(
         right_index = right_indices[pair_index]
         score, offset = _profile_score_numba(
             values1_unique[left_index],
-            active1_unique[left_index],
             values2_unique[right_index],
-            active2_unique[right_index],
             search_range,
             metric_code,
         )
@@ -668,120 +744,48 @@ def fast_profile_score(profile1, profile2, options: dict):
 
     score, offset = _profile_score_numba(
         values1,
-        prepared1["active_mask"],
         values2,
-        prepared2["active_mask"],
         int(options["search_range"]),
         _resolve_profile_metric_code(str(options.get("metric", "co"))),
     )
     return float(score), int(offset)
 
 
-def _prepare_profile_pairs(profile_pairs: list[tuple[dict, dict]], min_value: float) -> list[tuple[dict, dict]]:
-    """Prepare all profile pairs while reusing repeated inputs."""
-    prepared_cache = {}
-
-    def prepare_cached(profile):
-        key = id(profile)
-        cached = prepared_cache.get(key)
-        if cached is None:
-            cached = _prepare_profile_for_scoring(profile, min_value)
-            prepared_cache[key] = cached
-        return cached
-
-    return [
-        (prepare_cached(left_profile), prepare_cached(right_profile))
-        for left_profile, right_profile in profile_pairs
-    ]
-
-
-def _validate_profile_pair_shapes(prepared_pairs: list[tuple[dict, dict]]) -> tuple[int, int, int]:
-    """Validate that all prepared profile pairs share the same geometry."""
-    first_left, first_right = prepared_pairs[0]
-    expected_rows = int(first_left["values"].shape[0])
-    expected_left_width = int(first_left["values"].shape[1])
-    expected_right_width = int(first_right["values"].shape[1])
-
-    for left_profile, right_profile in prepared_pairs:
-        if left_profile["values"].shape[0] != expected_rows or right_profile["values"].shape[0] != expected_rows:
-            raise ValueError("all profile pairs must have the same number of rows")
-        if left_profile["values"].shape[1] != expected_left_width:
-            raise ValueError("left profile widths must match across orientation pairs")
-        if right_profile["values"].shape[1] != expected_right_width:
-            raise ValueError("right profile widths must match across orientation pairs")
-
-    return expected_rows, expected_left_width, expected_right_width
-
-
-def _index_unique_profiles(prepared_pairs: list[tuple[dict, dict]]):
-    """Deduplicate prepared profiles and keep pair indices for the kernel call."""
-    left_unique = []
-    left_index = {}
-    right_unique = []
-    right_index = {}
-    left_indices = []
-    right_indices = []
-
-    for left_profile, right_profile in prepared_pairs:
-        left_key = id(left_profile)
-        if left_key not in left_index:
-            left_index[left_key] = len(left_unique)
-            left_unique.append(left_profile)
-        left_indices.append(left_index[left_key])
-
-        right_key = id(right_profile)
-        if right_key not in right_index:
-            right_index[right_key] = len(right_unique)
-            right_unique.append(right_profile)
-        right_indices.append(right_index[right_key])
-
-    return left_unique, left_indices, right_unique, right_indices
-
-
-def fast_profile_score_orientations(profile_pairs: list[tuple[dict, dict]], options: dict):
-    """Compute profile similarity for all orientation pairs in one call."""
-    if not profile_pairs:
+def _score_prepared_profile_orientations(left_bundle: dict, right_bundle: dict, strand_pairs, options: dict):
+    """Compute profile similarity for strand-indexed pairs of prepared profile bundles."""
+    if not strand_pairs:
         return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.int32)
 
-    min_value = float(options.get("min_value", 0.0))
-    prepared_pairs = _prepare_profile_pairs(profile_pairs, min_value)
-    _, expected_left_width, expected_right_width = _validate_profile_pair_shapes(prepared_pairs)
+    left_values = np.ascontiguousarray(left_bundle["values"], dtype=np.float32)
+    right_values = np.ascontiguousarray(right_bundle["values"], dtype=np.float32)
 
-    if expected_left_width == 0 or expected_right_width == 0:
-        n_pairs = len(profile_pairs)
+    if left_values.shape[1] != right_values.shape[1]:
+        raise ValueError("profile bundles must have the same number of rows")
+
+    if left_values.shape[2] == 0 or right_values.shape[2] == 0:
+        n_pairs = len(strand_pairs)
         return np.zeros(n_pairs, dtype=np.float32), np.zeros(n_pairs, dtype=np.int32)
 
-    left_unique, left_indices, right_unique, right_indices = _index_unique_profiles(prepared_pairs)
-
-    values1_unique = np.ascontiguousarray(
-        np.stack([profile["values"] for profile in left_unique], axis=0),
-        dtype=np.float32,
-    )
-    active1_unique = np.ascontiguousarray(
-        np.stack([profile["active_mask"] for profile in left_unique], axis=0),
-        dtype=bool,
-    )
-    values2_unique = np.ascontiguousarray(
-        np.stack([profile["values"] for profile in right_unique], axis=0),
-        dtype=np.float32,
-    )
-    active2_unique = np.ascontiguousarray(
-        np.stack([profile["active_mask"] for profile in right_unique], axis=0),
-        dtype=bool,
-    )
-
+    left_indices = np.asarray([left_index for left_index, _ in strand_pairs], dtype=np.int32)
+    right_indices = np.asarray([right_index for _, right_index in strand_pairs], dtype=np.int32)
     scores, offsets = _profile_score_orientations_numba(
-        values1_unique,
-        active1_unique,
-        np.asarray(left_indices, dtype=np.int32),
-        values2_unique,
-        active2_unique,
-        np.asarray(right_indices, dtype=np.int32),
+        left_values,
+        left_indices,
+        right_values,
+        right_indices,
         int(options["search_range"]),
         _resolve_profile_metric_code(str(options.get("metric", "co"))),
     )
 
     return np.asarray(scores, dtype=np.float32), np.asarray(offsets, dtype=np.int32)
+
+
+def fast_profile_score_orientations(left_bundle: dict, right_bundle: dict, strand_pairs, options: dict):
+    """Compute profile similarity for all strand-indexed orientation pairs in one call."""
+    min_value = float(options.get("min_value", 0.0))
+    prepared_left = _prepare_profile_bundle_for_scoring(left_bundle, min_value)
+    prepared_right = _prepare_profile_bundle_for_scoring(right_bundle, min_value)
+    return _score_prepared_profile_orientations(prepared_left, prepared_right, strand_pairs, options)
 
 
 def format_params(params: dict) -> str:
