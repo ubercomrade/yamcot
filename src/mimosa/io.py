@@ -84,7 +84,7 @@ def write_fasta(sequences: Union[dict, Iterable[np.ndarray]], path: str) -> None
     decoder = np.array(["A", "C", "G", "T", "N"], dtype="U1")
 
     with open(path, "w") as out:
-        if isinstance(sequences, dict) and {"values", "mask", "lengths"} <= set(sequences.keys()):
+        if isinstance(sequences, dict) and {"values", "lengths"} <= set(sequences.keys()):
             for i in range(len(sequences["lengths"])):
                 seq_int = row_values(sequences, i)
                 safe_seq = np.clip(seq_int, 0, 4)

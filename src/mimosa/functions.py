@@ -16,6 +16,7 @@ from mimosa.batches import (
 
 RC_TABLE = np.array([3, 2, 1, 0, 4], dtype=np.int8)
 PROFILE_EPS = np.float32(1e-6)
+SCAN_BUCKET_STEP = 32
 
 
 def build_profile_score_options(search_range: int, min_value: float = 0.0, metric: str = "co") -> dict:
@@ -239,9 +240,27 @@ def _prepare_scan_inputs(sequences, matrix: np.ndarray):
     lengths = np.ascontiguousarray(sequences["lengths"], dtype=np.int64)
     model_rows = _prepare_model_rows(matrix)
     motif_len = int(model_rows.shape[-1])
-    max_scores = max(int(values.shape[1]) - motif_len + 1, 0)
     out_lengths = np.maximum(lengths - motif_len + 1, 0)
+    max_scores = int(out_lengths.max(initial=0))
     return values, lengths, model_rows, motif_len, max_scores, out_lengths
+
+
+def _iter_scan_buckets(lengths: np.ndarray, motif_len: int, bucket_step: int = SCAN_BUCKET_STEP):
+    """Yield row-index buckets with similar output lengths."""
+    out_lengths = np.maximum(lengths - motif_len + 1, 0)
+    positive_indices = np.flatnonzero(out_lengths > 0)
+    if positive_indices.size == 0:
+        return
+
+    bucket_ids = (out_lengths[positive_indices] - 1) // max(int(bucket_step), 1)
+    order = np.argsort(bucket_ids, kind="mergesort")
+    sorted_indices = positive_indices[order]
+    sorted_bucket_ids = bucket_ids[order]
+
+    starts = np.r_[0, np.flatnonzero(np.diff(sorted_bucket_ids)) + 1]
+    stops = np.r_[starts[1:], sorted_indices.size]
+    for start, stop in zip(starts, stops, strict=False):
+        yield sorted_indices[start:stop]
 
 
 @njit(cache=True, fastmath=True)
@@ -392,24 +411,53 @@ def batch_all_scores(
         return _empty_score_scan_batch(n_rows, max_scores, out_lengths)
 
     context_len, window_size, n_terms = _resolve_scan_layout(int(kmer), motif_len, bool(with_context))
-    if is_revcomp:
-        scored_values, scored_mask = _scan_dense_reverse_kernel_numba(
-            values,
-            lengths,
-            model_rows,
-            int(kmer),
-            window_size,
-            n_terms,
-        )
+    if int(lengths.max(initial=0)) == int(lengths.min(initial=0)):
+        if is_revcomp:
+            scored_values, scored_mask = _scan_dense_reverse_kernel_numba(
+                values,
+                lengths,
+                model_rows,
+                int(kmer),
+                window_size,
+                n_terms,
+            )
+        else:
+            scored_values, scored_mask = _scan_dense_kernel_numba(
+                values,
+                lengths,
+                model_rows,
+                int(kmer),
+                context_len,
+                n_terms,
+            )
     else:
-        scored_values, scored_mask = _scan_dense_kernel_numba(
-            values,
-            lengths,
-            model_rows,
-            int(kmer),
-            context_len,
-            n_terms,
-        )
+        scored_values = np.full((n_rows, max_scores), SCORE_PADDING, dtype=np.float32)
+        scored_mask = np.zeros((n_rows, max_scores), dtype=np.bool_)
+        for bucket_indices in _iter_scan_buckets(lengths, motif_len):
+            bucket_lengths = np.ascontiguousarray(lengths[bucket_indices], dtype=np.int64)
+            bucket_width = int(bucket_lengths.max(initial=0))
+            bucket_values = np.ascontiguousarray(values[bucket_indices, :bucket_width], dtype=np.int8)
+            if is_revcomp:
+                bucket_scores, bucket_mask = _scan_dense_reverse_kernel_numba(
+                    bucket_values,
+                    bucket_lengths,
+                    model_rows,
+                    int(kmer),
+                    window_size,
+                    n_terms,
+                )
+            else:
+                bucket_scores, bucket_mask = _scan_dense_kernel_numba(
+                    bucket_values,
+                    bucket_lengths,
+                    model_rows,
+                    int(kmer),
+                    context_len,
+                    n_terms,
+                )
+            bucket_score_width = bucket_scores.shape[1]
+            scored_values[bucket_indices, :bucket_score_width] = bucket_scores
+            scored_mask[bucket_indices, :bucket_score_width] = bucket_mask
 
     return pack_batch(scored_values, scored_mask, out_lengths, SCORE_PADDING)
 
@@ -424,15 +472,35 @@ def batch_all_scores_strands(sequences, matrix: np.ndarray, kmer: int = 1, with_
         return empty_batch, _empty_score_scan_batch(n_rows, max_scores, out_lengths)
 
     context_len, window_size, n_terms = _resolve_scan_layout(int(kmer), motif_len, bool(with_context))
-    scored_values, scored_mask = _scan_dense_strands_kernel_numba(
-        values,
-        lengths,
-        model_rows,
-        int(kmer),
-        context_len,
-        window_size,
-        n_terms,
-    )
+    if int(lengths.max(initial=0)) == int(lengths.min(initial=0)):
+        scored_values, scored_mask = _scan_dense_strands_kernel_numba(
+            values,
+            lengths,
+            model_rows,
+            int(kmer),
+            context_len,
+            window_size,
+            n_terms,
+        )
+    else:
+        scored_values = np.full((n_rows, 2, max_scores), SCORE_PADDING, dtype=np.float32)
+        scored_mask = np.zeros((n_rows, 2, max_scores), dtype=np.bool_)
+        for bucket_indices in _iter_scan_buckets(lengths, motif_len):
+            bucket_lengths = np.ascontiguousarray(lengths[bucket_indices], dtype=np.int64)
+            bucket_width = int(bucket_lengths.max(initial=0))
+            bucket_values = np.ascontiguousarray(values[bucket_indices, :bucket_width], dtype=np.int8)
+            bucket_scores, bucket_mask = _scan_dense_strands_kernel_numba(
+                bucket_values,
+                bucket_lengths,
+                model_rows,
+                int(kmer),
+                context_len,
+                window_size,
+                n_terms,
+            )
+            bucket_score_width = bucket_scores.shape[2]
+            scored_values[bucket_indices, :, :bucket_score_width] = bucket_scores
+            scored_mask[bucket_indices, :, :bucket_score_width] = bucket_mask
 
     plus_batch = pack_batch(scored_values[:, 0, :], scored_mask[:, 0, :], out_lengths, SCORE_PADDING)
     minus_batch = pack_batch(scored_values[:, 1, :], scored_mask[:, 1, :], out_lengths, SCORE_PADDING)

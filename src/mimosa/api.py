@@ -7,7 +7,7 @@ from typing import Any, Dict, Iterable, List, Optional, TypedDict, Union
 
 import numpy as np
 
-from mimosa.batches import DenseBatch, make_sequence_batch
+from mimosa.batches import SequenceBatch, make_sequence_batch
 from mimosa.comparison import (
     ComparatorConfig,
     compare,
@@ -21,7 +21,7 @@ from mimosa.models import GenericModel, read_model
 from mimosa.validation import validate_file_exists, validate_positive_int
 
 ModelRef = Union[GenericModel, str, Path]
-SequenceRef = Union[DenseBatch, str, Path]
+SequenceRef = Union[SequenceBatch, str, Path]
 
 _STRATEGY_ALIASES = {
     "profile": "profile",
@@ -376,8 +376,8 @@ def _validate_comparator_for_strategy(strategy: str, comparator: ComparatorConfi
         raise ValueError(f"Strategy '{strategy}' requires one of the following metrics: {options}")
 
 
-def _resolve_sequences(source: Optional[SequenceRef], config: ComparisonConfig | OneToManyConfig) -> DenseBatch:
-    """Resolve one sequence source to a dense masked batch."""
+def _resolve_sequences(source: Optional[SequenceRef], config: ComparisonConfig | OneToManyConfig) -> SequenceBatch:
+    """Resolve one sequence source to a padded sequence batch."""
     if source is None:
         return _generate_random_sequences(config["num_sequences"], config["seq_length"], config["seed"])
     if isinstance(source, dict):

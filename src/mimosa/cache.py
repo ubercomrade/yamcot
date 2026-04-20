@@ -14,7 +14,7 @@ import numpy as np
 from mimosa.batches import SCORE_PADDING, ProfileBundle, pack_profile_bundle
 from mimosa.models import GenericModel
 
-CACHE_VERSION = "v7"
+CACHE_VERSION = "v8"
 
 
 class ProfileCacheSpec(TypedDict):
@@ -38,13 +38,15 @@ def _hash_array(array: np.ndarray) -> bytes:
 
 
 def fingerprint_batch(batch) -> str | None:
-    """Return a stable content fingerprint for one dense masked batch."""
+    """Return a stable content fingerprint for one padded or masked batch."""
     if batch is None:
         return None
 
     hasher = hashlib.blake2b(digest_size=16)
     hasher.update(_hash_array(np.asarray(batch["values"])))
-    hasher.update(_hash_array(np.asarray(batch["mask"], dtype=np.uint8)))
+    mask = batch.get("mask")
+    if mask is not None:
+        hasher.update(_hash_array(np.asarray(mask, dtype=np.uint8)))
     hasher.update(_hash_array(np.asarray(batch["lengths"], dtype=np.int64)))
     return hasher.hexdigest()
 

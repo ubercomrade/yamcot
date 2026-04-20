@@ -14,7 +14,7 @@ from mimosa.batches import (
     MINUS_STRAND,
     PLUS_STRAND,
     SCORE_PADDING,
-    DenseBatch,
+    SequenceBatch,
     flatten_profile_bundle,
     pack_profile_bundle,
     profile_view,
@@ -63,7 +63,7 @@ class ComparatorConfig(TypedDict):
     profile_normalization: str
     cache_mode: str
     cache_dir: str
-    promoters: Optional[DenseBatch]
+    promoters: Optional[SequenceBatch]
 
 
 class ComparisonResult(TypedDict, total=False):
