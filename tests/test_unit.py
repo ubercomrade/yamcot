@@ -1227,6 +1227,22 @@ def test_fast_profile_score_rejects_unknown_metric():
         )
 
 
+def test_fast_profile_score_orientations_rejects_unknown_metric():
+    """Orientation scorer should reject unsupported metric names before dispatch."""
+    data = np.array([1.0, 0.5], dtype=np.float32)
+    offsets = np.array([0, 2], dtype=np.int64)
+    batch = _score_batch_from_flat(data, offsets)
+    bundle = make_strand_bundle(batch, batch)
+
+    with pytest.raises(ValueError, match="'co', 'dice'"):
+        fast_profile_score_orientations(
+            bundle,
+            bundle,
+            [(PLUS_STRAND, PLUS_STRAND)],
+            build_profile_score_options(search_range=0, metric="corr"),
+        )
+
+
 @pytest.mark.parametrize("metric", ["co", "dice"])
 @pytest.mark.parametrize("min_value", [0.0, 1.0])
 def test_fast_profile_score_matches_reference_for_ragged_inputs(metric, min_value):
@@ -1877,7 +1893,7 @@ def test_strategy_profile_uses_disk_cache_for_target_and_query(tmp_path, monkeyp
 
     first = strategy_profile(query, target, sequences, cfg)
     assert first["target"] == "target"
-    assert len(list(tmp_path.rglob("*.npz.zst"))) == 2
+    assert len(list(tmp_path.rglob("*.npz"))) == 2
 
     fresh_query = make_model("query")
     fresh_target = make_model("target")

@@ -16,8 +16,6 @@ from mimosa.batches import (
 
 RC_TABLE = np.array([3, 2, 1, 0, 4], dtype=np.int8)
 PROFILE_EPS = np.float32(1e-6)
-_PROFILE_METRIC_CO = 0
-_PROFILE_METRIC_DICE = 1
 
 
 def build_profile_score_options(search_range: int, min_value: float = 0.0, metric: str = "co") -> dict:
@@ -613,6 +611,11 @@ def _profile_threshold(min_value: float) -> np.float32:
     return np.float32(max(float(min_value), 0.0))
 
 
+def _as_int32_scalar(value) -> np.int32:
+    """Convert one scalar index-like value to int32."""
+    return np.int32(int(value))
+
+
 def _prepare_profile_for_scoring(profile, min_value: float):
     """Prepare one 2D profile matrix for compiled scoring kernels."""
     values = np.ascontiguousarray(profile["values"], dtype=np.float32).copy()
@@ -626,7 +629,7 @@ def _prepare_profile_for_scoring(profile, min_value: float):
 
     return {
         "values": np.ascontiguousarray(values, dtype=np.float32),
-        "lengths": np.asarray(profile["lengths"], dtype=np.int64),
+        "lengths": np.asarray(profile["lengths"], dtype=np.int32),
     }
 
 
@@ -636,79 +639,124 @@ def _prepare_profile_bundle_for_scoring(bundle: dict, min_value: float) -> dict:
     threshold = _profile_threshold(min_value)
     if threshold > 0.0:
         values[values < threshold] = SCORE_PADDING
-    return pack_profile_bundle(values, bundle["lengths"], SCORE_PADDING)
+    return pack_profile_bundle(values, np.asarray(bundle["lengths"], dtype=np.int32), SCORE_PADDING)
 
 
-def _resolve_profile_metric_code(metric: str) -> int:
-    """Resolve one public profile metric name to the internal kernel code."""
-    if metric == "co":
-        return _PROFILE_METRIC_CO
-    if metric == "dice":
-        return _PROFILE_METRIC_DICE
-    raise ValueError("metric must be one of: 'co', 'dice'")
+@njit(cache=True, fastmath=True, inline="always")
+def _profile_score_co_from_totals(inter: float, sum1: float, sum2: float) -> float:
+    """Convert overlap totals to the CO similarity score."""
+    denom = sum1 if sum1 < sum2 else sum2
+    return inter / denom if denom > PROFILE_EPS else -1.0
 
 
-@njit(cache=True, fastmath=True)
-def _finalize_profile_score(inter: float, sum1: float, sum2: float, metric_code: int) -> float:
-    """Convert accumulated overlap statistics to one similarity score."""
-    if metric_code == _PROFILE_METRIC_CO:
-        denom = sum1 if sum1 < sum2 else sum2
-        return inter / denom if denom > PROFILE_EPS else -1.0
-
+@njit(cache=True, fastmath=True, inline="always")
+def _profile_score_dice_from_totals(inter: float, sum1: float, sum2: float) -> float:
+    """Convert overlap totals to the Dice similarity score."""
     denom = sum1 + sum2
     return (2.0 * inter) / denom if denom > PROFILE_EPS else -1.0
 
 
-@njit(cache=True, fastmath=True)
-def _profile_score_numba(values1, values2, search_range: int, metric_code: int):
-    """Compute the best profile similarity score for all offsets."""
+@njit(cache=True, fastmath=True, inline="always")
+def _accumulate_profile_overlap(values1, values2, start1: int, start2: int, overlap: int):
+    """Accumulate overlap totals for one aligned profile pair."""
+    inter = 0.0
+    sum1 = 0.0
+    sum2 = 0.0
     n_rows = values1.shape[0]
+    stop1 = start1 + overlap
+
+    for row_index in range(n_rows):
+        row1 = values1[row_index]
+        row2 = values2[row_index]
+        col1 = start1
+        col2 = start2
+
+        while col1 < stop1:
+            value1 = float(row1[col1])
+            if value1 > 0.0:
+                value2 = float(row2[col2])
+                if value2 > 0.0:
+                    inter += value1 if value1 < value2 else value2
+                    sum1 += value1
+                    sum2 += value2
+            col1 += 1
+            col2 += 1
+
+    return inter, sum1, sum2
+
+
+@njit(cache=True, fastmath=True)
+def _profile_score_co_numba(values1, values2, search_range: int):
+    """Compute the best CO profile similarity score for all offsets."""
     width1 = values1.shape[1]
     width2 = values2.shape[1]
     best_score = -1.0
-    best_offset = 0
+    best_offset = np.int32(0)
 
     for offset in range(-search_range, search_range + 1):
         start1 = offset if offset > 0 else 0
         start2 = -offset if offset < 0 else 0
         remaining = width2 - start2
         overlap = min(width1 - start1, remaining)
-        inter = 0.0
-        sum1 = 0.0
-        sum2 = 0.0
+        if overlap <= 0:
+            continue
 
-        if overlap > 0:
-            for row_index in range(n_rows):
-                for delta in range(overlap):
-                    col1 = start1 + delta
-                    col2 = start2 + delta
-                    value1 = float(values1[row_index, col1])
-                    value2 = float(values2[row_index, col2])
-                    if value1 > 0.0 and value2 > 0.0:
-                        inter += value1 if value1 < value2 else value2
-                        sum1 += value1
-                        sum2 += value2
-
-        score = _finalize_profile_score(inter, sum1, sum2, metric_code)
+        inter, sum1, sum2 = _accumulate_profile_overlap(values1, values2, start1, start2, overlap)
+        score = _profile_score_co_from_totals(inter, sum1, sum2)
         if score > best_score:
             best_score = score
-            best_offset = offset
+            best_offset = np.int32(offset)
 
     if best_score < 0.0:
         return np.float32(0.0), np.int32(0)
-    return np.float32(best_score), np.int32(best_offset)
+    return np.float32(best_score), best_offset
+
+
+@njit(cache=True, fastmath=True)
+def _profile_score_dice_numba(values1, values2, search_range: int):
+    """Compute the best Dice profile similarity score for all offsets."""
+    width1 = values1.shape[1]
+    width2 = values2.shape[1]
+    best_score = -1.0
+    best_offset = np.int32(0)
+
+    for offset in range(-search_range, search_range + 1):
+        start1 = offset if offset > 0 else 0
+        start2 = -offset if offset < 0 else 0
+        remaining = width2 - start2
+        overlap = min(width1 - start1, remaining)
+        if overlap <= 0:
+            continue
+
+        inter, sum1, sum2 = _accumulate_profile_overlap(values1, values2, start1, start2, overlap)
+        score = _profile_score_dice_from_totals(inter, sum1, sum2)
+        if score > best_score:
+            best_score = score
+            best_offset = np.int32(offset)
+
+    if best_score < 0.0:
+        return np.float32(0.0), np.int32(0)
+    return np.float32(best_score), best_offset
+
+
+def _dispatch_profile_kernel(metric: str):
+    """Resolve one public metric name to the dedicated compiled profile kernel."""
+    if metric == "co":
+        return _profile_score_co_numba
+    if metric == "dice":
+        return _profile_score_dice_numba
+    raise ValueError("metric must be one of: 'co', 'dice'")
 
 
 @njit(cache=True, parallel=True, fastmath=True)
-def _profile_score_orientations_numba(
+def _profile_score_orientations_co_numba(
     values1_unique,
     left_indices,
     values2_unique,
     right_indices,
     search_range: int,
-    metric_code: int,
 ):
-    """Compute profile similarity for multiple orientation pairs in one call."""
+    """Compute CO profile similarity for multiple orientation pairs in one call."""
     n_pairs = left_indices.shape[0]
     scores = np.zeros(n_pairs, dtype=np.float32)
     offsets = np.zeros(n_pairs, dtype=np.int32)
@@ -716,16 +764,43 @@ def _profile_score_orientations_numba(
     for pair_index in prange(n_pairs):
         left_index = left_indices[pair_index]
         right_index = right_indices[pair_index]
-        score, offset = _profile_score_numba(
-            values1_unique[left_index],
-            values2_unique[right_index],
-            search_range,
-            metric_code,
-        )
+        score, offset = _profile_score_co_numba(values1_unique[left_index], values2_unique[right_index], search_range)
         scores[pair_index] = score
         offsets[pair_index] = offset
 
     return scores, offsets
+
+
+@njit(cache=True, parallel=True, fastmath=True)
+def _profile_score_orientations_dice_numba(
+    values1_unique,
+    left_indices,
+    values2_unique,
+    right_indices,
+    search_range: int,
+):
+    """Compute Dice profile similarity for multiple orientation pairs in one call."""
+    n_pairs = left_indices.shape[0]
+    scores = np.zeros(n_pairs, dtype=np.float32)
+    offsets = np.zeros(n_pairs, dtype=np.int32)
+
+    for pair_index in prange(n_pairs):
+        left_index = left_indices[pair_index]
+        right_index = right_indices[pair_index]
+        score, offset = _profile_score_dice_numba(values1_unique[left_index], values2_unique[right_index], search_range)
+        scores[pair_index] = score
+        offsets[pair_index] = offset
+
+    return scores, offsets
+
+
+def _dispatch_profile_orientation_kernel(metric: str):
+    """Resolve one public metric name to the dedicated compiled orientation kernel."""
+    if metric == "co":
+        return _profile_score_orientations_co_numba
+    if metric == "dice":
+        return _profile_score_orientations_dice_numba
+    raise ValueError("metric must be one of: 'co', 'dice'")
 
 
 def fast_profile_score(profile1, profile2, options: dict):
@@ -742,12 +817,9 @@ def fast_profile_score(profile1, profile2, options: dict):
     if values1.shape[1] == 0 or values2.shape[1] == 0:
         return 0.0, 0
 
-    score, offset = _profile_score_numba(
-        values1,
-        values2,
-        int(options["search_range"]),
-        _resolve_profile_metric_code(str(options.get("metric", "co"))),
-    )
+    metric = str(options.get("metric", "co"))
+    score_kernel = _dispatch_profile_kernel(metric)
+    score, offset = score_kernel(values1, values2, _as_int32_scalar(options["search_range"]))
     return float(score), int(offset)
 
 
@@ -768,13 +840,14 @@ def _score_prepared_profile_orientations(left_bundle: dict, right_bundle: dict, 
 
     left_indices = np.asarray([left_index for left_index, _ in strand_pairs], dtype=np.int32)
     right_indices = np.asarray([right_index for _, right_index in strand_pairs], dtype=np.int32)
-    scores, offsets = _profile_score_orientations_numba(
+    metric = str(options.get("metric", "co"))
+    orientation_kernel = _dispatch_profile_orientation_kernel(metric)
+    scores, offsets = orientation_kernel(
         left_values,
         left_indices,
         right_values,
         right_indices,
-        int(options["search_range"]),
-        _resolve_profile_metric_code(str(options.get("metric", "co"))),
+        _as_int32_scalar(options["search_range"]),
     )
 
     return np.asarray(scores, dtype=np.float32), np.asarray(offsets, dtype=np.int32)

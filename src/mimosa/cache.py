@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import os
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import TypedDict
@@ -16,12 +14,7 @@ import numpy as np
 from mimosa.batches import SCORE_PADDING, ProfileBundle, pack_profile_bundle
 from mimosa.models import GenericModel
 
-CACHE_VERSION = "v6"
-
-try:
-    import zstandard as _zstd
-except ImportError:  # pragma: no cover - exercised through CLI fallback in environments without python-zstandard
-    _zstd = None
+CACHE_VERSION = "v7"
 
 
 class ProfileCacheSpec(TypedDict):
@@ -93,36 +86,7 @@ def _profile_cache_path(spec: ProfileCacheSpec) -> Path:
     promoter_fp = fingerprint_batch(spec.get("promoters"))
     if promoter_fp is not None:
         base = base / promoter_fp
-    return base / f"{model_fp}.npz.zst"
-
-
-def _zstd_cli(args: list[str], payload: bytes) -> bytes:
-    """Run one zstd CLI command against in-memory bytes."""
-    completed = subprocess.run(
-        ["zstd", *args, "-"],
-        input=payload,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if completed.returncode != 0:
-        stderr = completed.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"zstd command failed: {stderr or completed.returncode}")
-    return completed.stdout
-
-
-def _compress_cache_payload(payload: bytes) -> bytes:
-    """Compress one cache payload with Zstandard."""
-    if _zstd is not None:
-        return _zstd.ZstdCompressor(level=3).compress(payload)
-    return _zstd_cli(["-q", "-f", "-3", "-c"], payload)
-
-
-def _decompress_cache_payload(payload: bytes) -> bytes:
-    """Decompress one cache payload with Zstandard."""
-    if _zstd is not None:
-        return _zstd.ZstdDecompressor().decompress(payload)
-    return _zstd_cli(["-d", "-q", "-f", "-c"], payload)
+    return base / f"{model_fp}.npz"
 
 
 def load_profile_cache(spec: ProfileCacheSpec) -> ProfileBundle | None:
@@ -132,14 +96,13 @@ def load_profile_cache(spec: ProfileCacheSpec) -> ProfileBundle | None:
         return None
 
     try:
-        compressed_payload = path.read_bytes()
-        with np.load(io.BytesIO(_decompress_cache_payload(compressed_payload)), allow_pickle=False) as payload:
+        with np.load(path, allow_pickle=False) as payload:
             version = str(payload["version"])
             if version != CACHE_VERSION:
                 return None
             values = payload["values"].astype(np.float32, copy=False)
             lengths = payload["lengths"].astype(np.int64, copy=False)
-    except (OSError, ValueError, KeyError, RuntimeError):
+    except (OSError, ValueError, KeyError):
         path.unlink(missing_ok=True)
         return None
 
@@ -154,16 +117,12 @@ def store_profile_cache(spec: ProfileCacheSpec, profile: ProfileBundle) -> Path:
     fd, tmp_path = tempfile.mkstemp(prefix="profile-", suffix=".npz", dir=path.parent)
     os.close(fd)
     try:
-        raw_payload = io.BytesIO()
         np.savez(
-            raw_payload,
+            tmp_path,
             version=np.array(CACHE_VERSION),
             values=np.asarray(profile["values"], dtype=np.float32),
             lengths=np.asarray(profile["lengths"], dtype=np.int64),
         )
-        compressed_payload = _compress_cache_payload(raw_payload.getvalue())
-        with open(tmp_path, "wb") as handle:
-            handle.write(compressed_payload)
         os.replace(tmp_path, path)
     finally:
         if os.path.exists(tmp_path):
