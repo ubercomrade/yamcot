@@ -87,7 +87,3 @@ mimosa motif ./gata2.ihbcp ./gata4.ihbcp \
 mimosa profile ./scores_1.fasta ./scores_2.fasta \
 --model1-type scores \
 --model2-type scores
-
-mimosa motali ./gata2.meme ./sitega_gata2.mat \
---model1-type pwm \
---model2-type sitega

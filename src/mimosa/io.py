@@ -1,6 +1,7 @@
+"""Input/output helpers for motif files, FASTA batches, and XML model formats."""
+
 from __future__ import annotations
 
-import copy
 import itertools
 import logging
 import os
@@ -100,6 +101,25 @@ def write_fasta(sequences: Union[dict, Iterable[np.ndarray]], path: str) -> None
                 out.write(f"{seq_str}\n")
 
 
+def _meme_length_from_header(header_line: str) -> int:
+    header = header_line.strip().split()
+    try:
+        length_idx = header.index("w=") + 1
+        return int(header[length_idx])
+    except (ValueError, IndexError):
+        return 0
+
+
+def _read_meme_matrix_rows(handle, length: int) -> list[list[float]]:
+    matrix = []
+    for _ in range(length):
+        row_line = handle.readline()
+        row = row_line.strip().split()
+        if row:
+            matrix.append(list(map(float, row)))
+    return matrix
+
+
 def read_meme(path: str, index: int = 0) -> Tuple[np.ndarray, Tuple[str, int], int]:
     """Read a specific motif from a MEME formatted file and return total count."""
     target_motif: np.ndarray | None = None
@@ -115,26 +135,10 @@ def read_meme(path: str, index: int = 0) -> Tuple[np.ndarray, Tuple[str, int], i
 
                 parts = line.strip().split()
                 name = parts[1]
-
-                header_line = handle.readline()
-                header = header_line.strip().split()
-
-                try:
-                    length_idx = header.index("w=") + 1
-                    length = int(header[length_idx])
-                except (ValueError, IndexError):
-                    length = 0
+                length = _meme_length_from_header(handle.readline())
 
                 if is_target:
-                    matrix = []
-                    for _ in range(length):
-                        row_line = handle.readline()
-                        row = row_line.strip().split()
-                        if not row:
-                            continue
-                        matrix.append(list(map(float, row)))
-
-                    target_motif = np.array(matrix, dtype=np.float32).T
+                    target_motif = np.array(_read_meme_matrix_rows(handle, length), dtype=np.float32).T
                     target_info = (name, length)
                 else:
                     for _ in range(length):
@@ -147,7 +151,8 @@ def read_meme(path: str, index: int = 0) -> Tuple[np.ndarray, Tuple[str, int], i
             raise ValueError(f"No motifs found in {path}")
         raise IndexError(f"Motif index {index} out of range. File contains {motif_count} motifs.")
 
-    assert target_info is not None
+    if target_info is None:
+        raise ValueError(f"Malformed MEME file {path}: motif metadata is missing.")
 
     return target_motif, target_info, motif_count
 
@@ -602,7 +607,7 @@ def read_dimont(path: str) -> tuple[np.ndarray, int, int]:
 
 
 def write_sitega(model, path: str) -> None:
-    """Write SiteGA motif to a file in the .mat format understood by mco_prc.exe."""
+    """Write SiteGA motif to a .mat file."""
     from .models import get_score_bounds
 
     sitega_matrix = model.representation
@@ -670,7 +675,10 @@ def read_pfm(path: str) -> tuple[np.ndarray, int]:
 
 def write_dist(threshold_table: np.ndarray, max_score, min_score, path: str) -> None:
     """Write the threshold table of motif to a DIST formatted file."""
-    table = copy.deepcopy(threshold_table)
-    table[:, 0] = (table[:, 0] - min_score) / (max_score - min_score)
+    score_range = float(max_score) - float(min_score)
+    if score_range <= 0.0:
+        raise ValueError("max_score must be greater than min_score when writing DIST tables.")
+    table = np.array(threshold_table, dtype=np.float64, copy=True)
+    table[:, 0] = (table[:, 0] - float(min_score)) / score_range
     with open(path, "w") as fname:
         np.savetxt(fname, table, fmt="%.18f", delimiter="\t", newline="\n", footer="", comments="", encoding=None)

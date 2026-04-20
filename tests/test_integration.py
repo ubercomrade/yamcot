@@ -25,24 +25,6 @@ def temp_dir(tmp_path):
     return tmp_path
 
 
-def test_motali_comparison_pwm_vs_sitega(examples_dir, temp_dir):
-    """Test motali comparison: pwm vs sitega"""
-    cmd = [
-        "mimosa",
-        "motali",
-        str(examples_dir / "gata2.meme"),
-        str(examples_dir / "sitega_gata2.mat"),
-        "--model1-type",
-        "pwm",
-        "--model2-type",
-        "sitega",
-        "-v",
-    ]
-
-    result = run_cli(cmd)
-    assert result.returncode == 0, f"Command failed with stderr: {result.stderr}"
-
-
 def test_profile_comparison_bamm_vs_pwm(examples_dir, temp_dir):
     """Profile mode should compare bamm vs pwm via scanned profiles."""
     cmd = [

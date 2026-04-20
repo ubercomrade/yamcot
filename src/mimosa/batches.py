@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Iterable, TypedDict
 
 import numpy as np
 
@@ -15,7 +15,20 @@ MINUS_STRAND = 1
 STRAND_COUNT = 2
 
 
-def empty_batch(dtype, padding_value):
+class DenseBatch(TypedDict):
+    values: np.ndarray
+    mask: np.ndarray
+    lengths: np.ndarray
+    padding_value: int | float
+
+
+class ProfileBundle(TypedDict):
+    values: np.ndarray
+    lengths: np.ndarray
+    padding_value: float
+
+
+def empty_batch(dtype, padding_value) -> DenseBatch:
     """Return an empty dense batch."""
     values = np.full((0, 0), padding_value, dtype=dtype)
     mask = np.zeros((0, 0), dtype=bool)
@@ -28,7 +41,7 @@ def empty_batch(dtype, padding_value):
     }
 
 
-def empty_profile_bundle(dtype, padding_value, n_profiles: int = STRAND_COUNT):
+def empty_profile_bundle(dtype, padding_value, n_profiles: int = STRAND_COUNT) -> ProfileBundle:
     """Return an empty 3D profile bundle."""
     values = np.full((n_profiles, 0, 0), padding_value, dtype=dtype)
     lengths = np.zeros(0, dtype=np.int64)
@@ -39,7 +52,7 @@ def empty_profile_bundle(dtype, padding_value, n_profiles: int = STRAND_COUNT):
     }
 
 
-def pack_batch(values, mask, lengths, padding_value):
+def pack_batch(values, mask, lengths, padding_value) -> DenseBatch:
     """Normalize one dense batch payload."""
     values_array = np.asarray(values)
     mask_array = np.asarray(mask, dtype=bool)
@@ -63,7 +76,7 @@ def pack_batch(values, mask, lengths, padding_value):
     }
 
 
-def pack_profile_bundle(values, lengths, padding_value):
+def pack_profile_bundle(values, lengths, padding_value) -> ProfileBundle:
     """Normalize one 3D profile bundle payload."""
     values_array = np.asarray(values)
     lengths_array = np.asarray(lengths, dtype=np.int64)
@@ -90,7 +103,7 @@ def pack_profile_bundle(values, lengths, padding_value):
     }
 
 
-def make_batch(rows: Iterable[np.ndarray], dtype=None, padding_value=0):
+def make_batch(rows: Iterable[np.ndarray], dtype=None, padding_value=0) -> DenseBatch:
     """Build a dense masked batch from one iterable of 1D arrays."""
     row_list = [np.asarray(row, dtype=dtype).ravel() if dtype is not None else np.asarray(row).ravel() for row in rows]
     if not row_list:
@@ -114,17 +127,17 @@ def make_batch(rows: Iterable[np.ndarray], dtype=None, padding_value=0):
     return pack_batch(values, mask, lengths, padding_value)
 
 
-def make_sequence_batch(rows: Iterable[np.ndarray]):
+def make_sequence_batch(rows: Iterable[np.ndarray]) -> DenseBatch:
     """Build a dense masked batch for integer-encoded sequences."""
     return make_batch(rows, dtype=np.int8, padding_value=NUCLEOTIDE_PADDING)
 
 
-def make_score_batch(rows: Iterable[np.ndarray]):
+def make_score_batch(rows: Iterable[np.ndarray]) -> DenseBatch:
     """Build a dense masked batch for score profiles."""
     return make_batch(rows, dtype=np.float32, padding_value=SCORE_PADDING)
 
 
-def make_strand_bundle(plus_batch, minus_batch):
+def make_strand_bundle(plus_batch: DenseBatch, minus_batch: DenseBatch) -> ProfileBundle:
     """Build one two-strand profile bundle from plus/minus dense batches."""
     plus_values = np.asarray(plus_batch["values"])
     minus_values = np.asarray(minus_batch["values"])
@@ -164,7 +177,7 @@ def profile_values(bundle, profile_index: int) -> np.ndarray:
     return bundle["values"][profile_index]
 
 
-def profile_view(bundle, profile_index: int) -> dict:
+def profile_view(bundle: ProfileBundle, profile_index: int) -> DenseBatch:
     """Return one lightweight 2D profile view from a 3D bundle."""
     return {
         "values": bundle["values"][profile_index],
@@ -186,7 +199,7 @@ def flatten_valid(batch) -> np.ndarray:
     return batch["values"][batch["mask"]]
 
 
-def flatten_profile_bundle(bundle, profile_index: int | None = None) -> np.ndarray:
+def flatten_profile_bundle(bundle: ProfileBundle, profile_index: int | None = None) -> np.ndarray:
     """Return valid bundle elements as one flat 1D array."""
     values = np.asarray(bundle["values"])
     lengths = np.asarray(bundle["lengths"], dtype=np.int64)
@@ -194,26 +207,17 @@ def flatten_profile_bundle(bundle, profile_index: int | None = None) -> np.ndarr
     if values.size == 0:
         return np.empty(0, dtype=values.dtype)
 
-    if profile_index is not None:
-        parts = [
-            values[profile_index, row_index, : int(length)]
-            for row_index, length in enumerate(lengths)
-            if length > 0
-        ]
-    else:
-        parts = [
-            values[current_profile, row_index, : int(length)]
-            for current_profile in range(values.shape[0])
-            for row_index, length in enumerate(lengths)
-            if length > 0
-        ]
-
-    if not parts:
+    width = values.shape[2]
+    row_mask = np.arange(width, dtype=np.int64)[None, :] < lengths[:, None]
+    if not np.any(row_mask):
         return np.empty(0, dtype=values.dtype)
-    return np.concatenate(parts)
+
+    if profile_index is not None:
+        return values[profile_index][row_mask]
+    return values[:, row_mask].reshape(-1)
 
 
-def batch_with_values(batch, values, padding_value=None):
+def batch_with_values(batch: DenseBatch, values, padding_value=None) -> DenseBatch:
     """Return a copy of one batch with the same mask/lengths and different values."""
     resolved_padding = batch["padding_value"] if padding_value is None else padding_value
     return pack_batch(values, batch["mask"], batch["lengths"], resolved_padding)

@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 from numba import get_num_threads
 
+import mimosa.api as api_module
 from mimosa.api import (
     compare_motifs,
     compare_one_to_many,
@@ -40,7 +41,6 @@ from mimosa.cache import clear_cache
 from mimosa.comparison import (
     compare,
     create_comparator_config,
-    strategy_motali,
     strategy_motif,
     strategy_profile,
 )
@@ -65,7 +65,7 @@ from mimosa.functions import (
     scores_to_empirical_log_tail,
     standardized_pauc,
 )
-from mimosa.io import parse_file_content, read_pfm, read_scores
+from mimosa.io import parse_file_content, read_pfm, read_scores, write_dist
 from mimosa.models import (
     GenericModel,
     calculate_threshold_table,
@@ -760,6 +760,12 @@ def test_create_comparator_config_validates_profile_normalization():
     assert config["profile_normalization"] == "empirical_log_tail"
 
 
+def test_create_comparator_config_rejects_unknown_metric():
+    """Comparator config should fail fast for unsupported metric names."""
+    with pytest.raises(ValueError, match="metric must be one of"):
+        create_comparator_config(metric="wrong")
+
+
 def test_comparison_registry():
     """Test comparison registry functionality"""
     # Test that we can get registered strategies
@@ -768,9 +774,6 @@ def test_comparison_registry():
 
     profile_strategy = comparison_registry.get("profile")
     assert profile_strategy is not None
-
-    motali_strategy = comparison_registry.get("motali")
-    assert motali_strategy is not None
 
     # Test invalid strategy returns None
     invalid_strategy = comparison_registry.get("invalid_strategy")
@@ -954,6 +957,25 @@ def test_read_model_rejects_pwm_pickle_without_source_pfm(tmp_path):
 
     with pytest.raises(ValueError, match="_source_pfm"):
         read_model(str(path), "pwm")
+
+
+@pytest.mark.parametrize("model_type", ["sitega", "dimont", "slim"])
+def test_read_model_rejects_non_model_pickle_payload(tmp_path, model_type):
+    """Pickled payloads must always deserialize to GenericModel instances."""
+    path = tmp_path / f"{model_type}.pkl"
+    joblib.dump({"invalid": True}, path)
+
+    with pytest.raises(TypeError, match="expected GenericModel"):
+        read_model(str(path), model_type)
+
+
+def test_write_dist_rejects_zero_score_range(tmp_path):
+    """DIST output must reject degenerate score bounds to avoid inf values."""
+    table = np.array([[0.5, 1.0], [0.4, 2.0]], dtype=np.float64)
+    path = tmp_path / "invalid.dist"
+
+    with pytest.raises(ValueError, match="max_score must be greater than min_score"):
+        write_dist(table, max_score=1.0, min_score=1.0, path=str(path))
 
 
 def test_get_sites_threshold_uses_current_sequences_by_default():
@@ -1498,7 +1520,6 @@ def test_strategy_functions_exist():
     # Test that strategy functions exist and are callable
     assert callable(strategy_motif)
     assert callable(strategy_profile)
-    assert callable(strategy_motali)
 
 
 def test_strategy_profile_uses_target_relative_offset_convention():
@@ -1797,6 +1818,37 @@ def test_strategy_profile_is_symmetric_when_models_peak_on_different_strands():
     assert pwm_vs_dimont["score"] > 0.6
 
 
+def test_strategy_runtime_cache_keys_use_model_content_not_name():
+    """Runtime cache should not mix distinct models sharing the same name."""
+
+    def build_model(seed: int, name: str) -> GenericModel:
+        rng = np.random.default_rng(seed)
+        pfm = rng.random((4, 6), dtype=np.float32)
+        pfm /= pfm.sum(axis=0, keepdims=True)
+        pwm = pfm_to_pwm(pfm)
+        representation = np.concatenate((pwm, np.min(pwm, axis=0, keepdims=True)), axis=0).astype(np.float32)
+        return GenericModel("pwm", name, representation, 6, {"kmer": 1, "_source_pfm": pfm})
+
+    sequences = make_sequence_batch(
+        [np.random.default_rng(3).integers(0, 4, size=200, dtype=np.int8) for _ in range(20)]
+    )
+    cfg_profile = create_comparator_config(metric="co", n_permutations=0)
+    cfg_motif = create_comparator_config(metric="cosine", n_permutations=0, pfm_mode=False)
+
+    model_a = build_model(1, "a")
+    model_b = build_model(2, "b")
+    model_same_1 = build_model(1, "same")
+    model_same_2 = build_model(2, "same")
+
+    profile_named = strategy_profile(model_a, model_b, sequences, cfg_profile)
+    profile_same_name = strategy_profile(model_same_1, model_same_2, sequences, cfg_profile)
+    motif_named = strategy_motif(model_a, model_b, sequences, cfg_motif)
+    motif_same_name = strategy_motif(model_same_1, model_same_2, sequences, cfg_motif)
+
+    assert profile_same_name["score"] == pytest.approx(profile_named["score"])
+    assert motif_same_name["score"] == pytest.approx(motif_named["score"])
+
+
 def test_strategy_profile_uses_disk_cache_for_target_and_query(tmp_path, monkeypatch):
     """Cached query and target profiles should be reused across repeated comparisons."""
 
@@ -1825,7 +1877,7 @@ def test_strategy_profile_uses_disk_cache_for_target_and_query(tmp_path, monkeyp
 
     first = strategy_profile(query, target, sequences, cfg)
     assert first["target"] == "target"
-    assert len(list(tmp_path.rglob("*.npz"))) == 2
+    assert len(list(tmp_path.rglob("*.npz.zst"))) == 2
 
     fresh_query = make_model("query")
     fresh_target = make_model("target")
@@ -2057,6 +2109,85 @@ def test_run_one_to_many_matches_pairwise_profile_results():
         np.testing.assert_allclose(result["score"], expected["score"])
 
 
+def test_run_one_to_many_passes_targets_lazily(monkeypatch):
+    """One-vs-many executor should receive a lazy target iterable instead of a materialized list."""
+    query_scores = _score_batch_from_flat(
+        np.array([0.2, 0.5, 0.8], dtype=np.float32),
+        np.array([0, 3], dtype=np.int64),
+    )
+    target_scores = _score_batch_from_flat(
+        np.array([0.2, 0.4, 0.9], dtype=np.float32),
+        np.array([0, 3], dtype=np.int64),
+    )
+    query = GenericModel(
+        type_key="scores",
+        name="query",
+        representation=None,
+        length=0,
+        config={"scores_data": query_scores},
+    )
+    target = GenericModel(
+        type_key="scores",
+        name="target",
+        representation=None,
+        length=0,
+        config={"scores_data": target_scores},
+    )
+    config = create_many_config(query=query, targets=[target], strategy="profile", metric="co", n_permutations=0)
+    observed = {}
+
+    def fake_compare_one_to_many_models(query_model, target_models, strategy, config, sequences=None, promoters=None):
+        observed["is_list"] = isinstance(target_models, list)
+        materialized = list(target_models)
+        observed["count"] = len(materialized)
+        return [{"query": query_model.name, "target": materialized[0].name, "score": 1.0}]
+
+    monkeypatch.setattr(api_module, "compare_one_to_many_models", fake_compare_one_to_many_models)
+
+    results = run_one_to_many(config)
+
+    assert observed == {"is_list": False, "count": 1}
+    assert results == [{"query": "query", "target": "target", "score": 1.0}]
+
+
+def test_run_one_to_many_preserves_generator_targets():
+    """One-vs-many API should not lose targets when config["targets"] is a generator."""
+    query_scores = _score_batch_from_flat(
+        np.array([0.2, 0.5, 0.8], dtype=np.float32),
+        np.array([0, 3], dtype=np.int64),
+    )
+    target_a_scores = _score_batch_from_flat(
+        np.array([0.1, 0.3, 0.9], dtype=np.float32),
+        np.array([0, 3], dtype=np.int64),
+    )
+    target_b_scores = _score_batch_from_flat(
+        np.array([0.6, 0.2, 0.4], dtype=np.float32),
+        np.array([0, 3], dtype=np.int64),
+    )
+    query = GenericModel("scores", "query", None, 0, {"scores_data": query_scores})
+    target_a = GenericModel("scores", "target_a", None, 0, {"scores_data": target_a_scores})
+    target_b = GenericModel("scores", "target_b", None, 0, {"scores_data": target_b_scores})
+
+    config = {
+        "query": query,
+        "targets": (target for target in (target_a, target_b)),
+        "query_type": None,
+        "target_type": None,
+        "strategy": "profile",
+        "sequences": None,
+        "promoters": None,
+        "num_sequences": 1000,
+        "seq_length": 200,
+        "seed": 127,
+        "comparator": create_comparator_config(metric="co", n_permutations=0),
+        "query_kwargs": {},
+        "target_kwargs": {},
+    }
+    results = run_one_to_many(config)  # type: ignore[arg-type]
+
+    assert [item["target"] for item in results] == ["target_a", "target_b"]
+
+
 @pytest.mark.parametrize("metric", ["corr", "cj", "l1sim"])
 def test_run_comparison_rejects_removed_profile_metrics(metric):
     """Profile mode should reject unsupported legacy metrics."""
@@ -2074,17 +2205,16 @@ def test_run_comparison_rejects_removed_profile_metrics(metric):
     model2 = GenericModel(type_key="pwm", name="m2", representation=representation, length=3, config={"kmer": 1})
     sequences = make_sequence_batch([np.array([0, 1, 2, 3, 2, 1, 0], dtype=np.int8)])
 
-    config = create_config(
-        model1=model1,
-        model2=model2,
-        strategy="profile",
-        sequences=sequences,
-        metric=metric,
-        n_permutations=0,
-        seed=7,
-    )
-
-    with pytest.raises(ValueError, match="co, dice"):
+    with pytest.raises(ValueError, match="metric"):
+        config = create_config(
+            model1=model1,
+            model2=model2,
+            strategy="profile",
+            sequences=sequences,
+            metric=metric,
+            n_permutations=0,
+            seed=7,
+        )
         run_comparison(config)
 
 
@@ -2245,27 +2375,6 @@ def test_compare_one_to_many_matches_pairwise_motif_results():
         assert result["orientation"] == expected["orientation"]
         assert result["offset"] == expected["offset"]
         np.testing.assert_allclose(result["score"], expected["score"])
-
-
-def test_run_one_to_many_rejects_motali():
-    """One-vs-many API should reject unsupported motali execution."""
-    representation = np.array(
-        [
-            [0.2, 0.3, 0.1],
-            [0.3, 0.2, 0.4],
-            [0.2, 0.4, 0.3],
-            [0.3, 0.1, 0.2],
-            [0.1, 0.1, 0.1],
-        ],
-        dtype=np.float32,
-    )
-    query = GenericModel(type_key="pwm", name="m1", representation=representation, length=3, config={"kmer": 1})
-    target = GenericModel(type_key="pwm", name="m2", representation=representation, length=3, config={"kmer": 1})
-
-    config = create_many_config(query=query, targets=[target], strategy="motali")
-
-    with pytest.raises(NotImplementedError, match="motali"):
-        run_one_to_many(config)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,6 @@ from mimosa.validation import validate_file_exists
 
 PROFILE_MODEL_TYPES = ["scores", "pwm", "bamm", "sitega", "dimont", "slim"]
 MOTIF_MODEL_TYPES = ["pwm", "bamm", "sitega", "dimont", "slim"]
-MOTALI_MODEL_TYPES = ["pwm", "sitega"]
 
 
 def setup_logging(verbose: bool) -> None:
@@ -23,7 +22,7 @@ def setup_logging(verbose: bool) -> None:
 def create_arg_parser() -> argparse.ArgumentParser:
     """Create and configure argument parser with subcommands."""
     parser = argparse.ArgumentParser(
-        description="MIMOSA: Compare motifs in `profile`, `motif`, and `motali` modes.",
+        description="MIMOSA: Compare motifs in `profile` and `motif` modes.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -41,10 +40,6 @@ Examples:
     --model1-type pwm --model2-type pwm \
     --metric pcc --permutations 1000 --permute-rows
 
-  # Motali comparison
-  mimosa motali model1.mat model2.meme \
-    --model1-type sitega --model2-type pwm \
-    --fasta sequences.fa --promoters promoters.fa
         """,
     )
 
@@ -52,7 +47,6 @@ Examples:
 
     _add_profile_parser(subparsers)
     _add_motif_parser(subparsers)
-    _add_motali_parser(subparsers)
     _add_cache_parser(subparsers)
 
     return parser
@@ -280,77 +274,6 @@ def _add_motif_parser(subparsers: argparse._SubParsersAction) -> None:
     _add_common_technical_arguments(parser)
 
 
-def _add_motali_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Add the motali mode parser."""
-    parser = subparsers.add_parser(
-        "motali",
-        help="Compare motifs with the Motali scoring workflow.",
-    )
-    parser.add_argument("model1", help="Path to the first motif model file.")
-    parser.add_argument("model2", help="Path to the second motif model file.")
-
-    motali_group = parser.add_argument_group("Motali Options")
-    motali_group.add_argument(
-        "--err",
-        type=float,
-        default=0.002,
-        help="Expected recognition rate cutoff used by Motali. (default: %(default)s)",
-    )
-    motali_group.add_argument(
-        "--shift",
-        type=int,
-        default=50,
-        help="Maximum motif-center shift considered by Motali. (default: %(default)s)",
-    )
-
-    io_group = parser.add_argument_group("Input Options")
-    io_group.add_argument(
-        "--model1-type",
-        choices=MOTALI_MODEL_TYPES,
-        required=True,
-        help="Format of the first motif. Choices: pwm, sitega.",
-    )
-    io_group.add_argument(
-        "--model2-type",
-        choices=MOTALI_MODEL_TYPES,
-        required=True,
-        help="Format of the second motif. Choices: pwm, sitega.",
-    )
-    io_group.add_argument(
-        "--fasta",
-        help="Path to FASTA sequences used in the Motali comparison. Random sequences are generated if omitted.",
-    )
-    io_group.add_argument(
-        "--promoters",
-        help="Path to FASTA promoter sequences used for threshold-table calculation.",
-    )
-    io_group.add_argument(
-        "--num-sequences",
-        type=int,
-        default=10000,
-        help="Number of random sequences to generate when --fasta is omitted. (default: %(default)s)",
-    )
-    io_group.add_argument(
-        "--seq-length",
-        type=int,
-        default=200,
-        help="Length of random sequences generated when --fasta is omitted. (default: %(default)s)",
-    )
-    io_group.add_argument(
-        "--tmp-dir",
-        default=".",
-        help="Directory for temporary Motali intermediate files. (default: %(default)s)",
-    )
-
-    technical_group = parser.add_argument_group("Technical Options")
-    technical_group.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable verbose logging.",
-    )
-
-
 def _add_cache_parser(subparsers: argparse._SubParsersAction) -> None:
     """Add the cache management parser."""
     parser = subparsers.add_parser("cache", help="Manage lazy profile cache artifacts.")
@@ -424,14 +347,6 @@ def map_args_to_comparator_kwargs(args) -> Dict[str, Any]:
             "pfm_top_fraction": args.pfm_top_fraction,
         }
 
-    if args.mode == "motali":
-        return {
-            "fasta_path": args.fasta,
-            "tmp_directory": args.tmp_dir,
-            "motali_err": args.err,
-            "motali_shift": args.shift,
-        }
-
     return {}
 
 
@@ -442,9 +357,6 @@ def build_comparison_config_from_args(args):
 
     sequences = getattr(args, "fasta", None)
     promoters = getattr(args, "promoters", None)
-
-    if args.mode == "motali":
-        sequences = promoters or sequences
 
     return create_config(
         model1=args.model1,

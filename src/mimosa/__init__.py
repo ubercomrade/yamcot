@@ -1,6 +1,8 @@
 """Public package API."""
 
 from mimosa.api import (
+    ComparisonConfig,
+    OneToManyConfig,
     compare_motifs,
     compare_one_to_many,
     create_config,
@@ -9,7 +11,7 @@ from mimosa.api import (
     run_one_to_many,
 )
 from mimosa.cache import clear_cache
-from mimosa.comparison import compare, create_comparator_config
+from mimosa.comparison import ComparatorConfig, compare, create_comparator_config
 from mimosa.models import (
     GenericModel,
     get_frequencies,
@@ -21,12 +23,10 @@ from mimosa.models import (
     scan_model,
 )
 
-ComparisonConfig = dict
-ComparatorConfig = dict
-
 __all__ = [
     "ComparatorConfig",
     "ComparisonConfig",
+    "OneToManyConfig",
     "GenericModel",
     "clear_cache",
     "compare",

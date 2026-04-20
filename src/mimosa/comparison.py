@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import logging
-import os
-import tempfile
 from contextlib import contextmanager
-from typing import Callable
+from typing import Callable, Literal, Optional, TypedDict
 
 import numpy as np
 from numba import get_num_threads, set_num_threads
@@ -16,12 +14,12 @@ from mimosa.batches import (
     MINUS_STRAND,
     PLUS_STRAND,
     SCORE_PADDING,
+    DenseBatch,
     flatten_profile_bundle,
     pack_profile_bundle,
     profile_view,
 )
-from mimosa.cache import fingerprint_batch, load_profile_cache, store_profile_cache
-from mimosa.execute import run_motali
+from mimosa.cache import ProfileCacheSpec, fingerprint_batch, fingerprint_model, load_profile_cache, store_profile_cache
 from mimosa.functions import (
     _prepare_profile_bundle_for_scoring,
     _score_prepared_profile_orientations,
@@ -30,14 +28,10 @@ from mimosa.functions import (
     build_score_log_tail_table,
     scores_to_empirical_log_tail_bundle,
 )
-from mimosa.io import write_dist, write_fasta
 from mimosa.models import (
     GenericModel,
-    calculate_threshold_table,
     get_pfm,
-    get_score_bounds,
     scan_model_strands,
-    write_model,
 )
 from mimosa.validation import (
     validate_cache_mode,
@@ -49,6 +43,38 @@ from mimosa.validation import (
 )
 
 logger = logging.getLogger(__name__)
+MetricName = Literal["co", "dice", "pcc", "ed", "cosine"]
+_ALL_METRICS = {"co", "dice", "pcc", "ed", "cosine"}
+
+
+class ComparatorConfig(TypedDict):
+    metric: MetricName
+    n_permutations: int
+    seed: Optional[int]
+    numba_threads: Optional[int]
+    permute_rows: bool
+    pfm_mode: bool
+    pfm_top_fraction: float
+    distortion_level: float
+    search_range: int
+    min_kernel_size: int
+    max_kernel_size: int
+    min_logfpr: Optional[float]
+    profile_normalization: str
+    cache_mode: str
+    cache_dir: str
+    promoters: Optional[DenseBatch]
+
+
+class ComparisonResult(TypedDict, total=False):
+    query: str
+    target: str
+    score: float
+    offset: int
+    orientation: str
+    metric: str
+
+
 ORIENTATION_TIEBREAK = {"++": 0, "+-": 1, "-+": 2, "--": 3}
 NUCLEOTIDE_CARDINALITY = 4
 AMBIGUOUS_STATE_CARDINALITY = 5
@@ -84,9 +110,17 @@ def _register_comparison_strategy(name: str):
     return decorator
 
 
-def create_comparator_config(**kwargs) -> dict:
+def _validate_metric(metric: str) -> MetricName:
+    normalized = str(metric).lower()
+    if normalized not in _ALL_METRICS:
+        options = ", ".join(sorted(_ALL_METRICS))
+        raise ValueError(f"metric must be one of: {options}")
+    return normalized  # type: ignore[return-value]
+
+
+def create_comparator_config(**kwargs) -> ComparatorConfig:
     """Build one validated comparison options dictionary."""
-    defaults = {
+    defaults: ComparatorConfig = {
         "metric": "pcc",
         "n_permutations": 0,
         "seed": None,
@@ -100,15 +134,12 @@ def create_comparator_config(**kwargs) -> dict:
         "max_kernel_size": 11,
         "min_logfpr": None,
         "profile_normalization": "empirical_log_tail",
-        "motali_err": 0.002,
-        "motali_shift": 50,
-        "tmp_directory": ".",
-        "fasta_path": None,
         "cache_mode": "off",
         "cache_dir": ".mimosa-cache",
         "promoters": None,
     }
     config = {**defaults, **kwargs}
+    config["metric"] = _validate_metric(config["metric"])
     min_kernel_size, max_kernel_size = validate_kernel_size_range(config["min_kernel_size"], config["max_kernel_size"])
     config["min_kernel_size"] = min_kernel_size
     config["max_kernel_size"] = max_kernel_size
@@ -118,7 +149,9 @@ def create_comparator_config(**kwargs) -> dict:
         PROFILE_NORMALIZATION_REGISTRY,
     )
     config["numba_threads"] = validate_optional_thread_count("numba_threads", config.get("numba_threads"))
-    config["pfm_top_fraction"] = validate_pfm_top_fraction(config.get("pfm_top_fraction"))
+    config["pfm_top_fraction"] = (
+        validate_pfm_top_fraction(config.get("pfm_top_fraction")) or defaults["pfm_top_fraction"]
+    )
     config["cache_mode"] = validate_cache_mode(config.get("cache_mode", "off"))
     return config
 
@@ -145,7 +178,7 @@ def _select_best_orientation(candidates):
     )
 
 
-def _get_profile_calibration_sequences(sequences, cfg: dict):
+def _get_profile_calibration_sequences(sequences, cfg: ComparatorConfig):
     """Return the sequence collection used to fit profile normalization."""
     return cfg.get("promoters") if cfg.get("promoters") is not None else sequences
 
@@ -159,11 +192,21 @@ def _get_profile_normalization_strategy(name: str) -> dict:
         raise ValueError(f"Unsupported profile normalization: {name}. Available: {available}") from exc
 
 
+def _cached_batch_fingerprint(runtime_cache: dict, batch, label: str) -> str:
+    runtime_key = ("batch_fp", label, id(batch))
+    cached = runtime_cache.get(runtime_key)
+    if cached is not None:
+        return cached
+    value = fingerprint_batch(batch) or f"no-{label}"
+    runtime_cache[runtime_key] = value
+    return value
+
+
 def _resolve_raw_profile_bundle(model: GenericModel, sequences, runtime_cache: dict | None = None):
     """Resolve one raw strand-aware profile bundle before normalization."""
     runtime_cache = {} if runtime_cache is None else runtime_cache
-    sequence_fp = fingerprint_batch(sequences) or "no-sequences"
-    runtime_key = ("raw_profile_bundle", model.name, sequence_fp)
+    sequence_fp = _cached_batch_fingerprint(runtime_cache, sequences, "sequences")
+    runtime_key = ("raw_profile_bundle", fingerprint_model(model), sequence_fp)
     cached = runtime_cache.get(runtime_key)
     if cached is not None:
         return cached
@@ -176,11 +219,13 @@ def _resolve_raw_profile_bundle(model: GenericModel, sequences, runtime_cache: d
     return profile_bundle
 
 
-def _fit_profile_normalizer(model: GenericModel, calibration_sequences, cfg: dict, runtime_cache: dict | None = None):
+def _fit_profile_normalizer(
+    model: GenericModel, calibration_sequences, cfg: ComparatorConfig, runtime_cache: dict | None = None
+):
     """Fit normalization parameters from the calibration score sample."""
     runtime_cache = {} if runtime_cache is None else runtime_cache
-    calibration_fp = fingerprint_batch(calibration_sequences) or "no-calibration"
-    runtime_key = ("profile_normalizer", model.name, cfg["profile_normalization"], calibration_fp)
+    calibration_fp = _cached_batch_fingerprint(runtime_cache, calibration_sequences, "calibration")
+    runtime_key = ("profile_normalizer", fingerprint_model(model), cfg["profile_normalization"], calibration_fp)
     if runtime_key in runtime_cache:
         return runtime_cache[runtime_key]
 
@@ -199,7 +244,7 @@ def _apply_profile_normalizer(profile_bundle, normalizer):
     return strategy["apply_bundle"](profile_bundle, params)
 
 
-def _build_profile_score_options(cfg: dict) -> dict:
+def _build_profile_score_options(cfg: ComparatorConfig) -> dict:
     """Build one profile-scoring options dictionary from comparator config."""
     return build_profile_score_options(
         search_range=cfg["search_range"],
@@ -209,8 +254,8 @@ def _build_profile_score_options(cfg: dict) -> dict:
 
 
 def _build_profile_cache_spec(
-    model: GenericModel, sequences, calibration_sequences, cfg: dict, profile_kind: str
-) -> dict:
+    model: GenericModel, sequences, calibration_sequences, cfg: ComparatorConfig, profile_kind: str
+) -> ProfileCacheSpec:
     """Build one cache descriptor for a normalized profile bundle."""
     return {
         "model": model,
@@ -222,14 +267,14 @@ def _build_profile_cache_spec(
 
 
 def _resolve_profile_bundle(
-    model: GenericModel, sequences, calibration_sequences, cfg: dict, runtime_cache: dict | None = None
+    model: GenericModel, sequences, calibration_sequences, cfg: ComparatorConfig, runtime_cache: dict | None = None
 ):
     """Resolve one model to the normalized strand-aware profile bundle used in profile comparisons."""
     runtime_cache = {} if runtime_cache is None else runtime_cache
     profile_kind = cfg["profile_normalization"]
-    sequence_fp = fingerprint_batch(sequences) or "no-sequences"
-    calibration_fp = fingerprint_batch(calibration_sequences) or "no-calibration"
-    runtime_key = (model.name, profile_kind, sequence_fp, calibration_fp)
+    sequence_fp = _cached_batch_fingerprint(runtime_cache, sequences, "sequences")
+    calibration_fp = _cached_batch_fingerprint(runtime_cache, calibration_sequences, "calibration")
+    runtime_key = (fingerprint_model(model), profile_kind, sequence_fp, calibration_fp)
 
     cached = runtime_cache.get(runtime_key)
     if cached is not None:
@@ -260,7 +305,7 @@ def _prepare_profile_model(
     model: GenericModel,
     sequences,
     calibration_sequences,
-    cfg: dict,
+    cfg: ComparatorConfig,
     score_options: dict,
     runtime_cache: dict | None = None,
 ):
@@ -297,7 +342,7 @@ def _score_prepared_profile_pair(
     return _select_best_orientation(candidates)
 
 
-def _build_profile_result(query_name: str, target_name: str, best: dict, metric: str) -> dict:
+def _build_profile_result(query_name: str, target_name: str, best: dict, metric: str) -> ComparisonResult:
     """Build one profile comparison result payload from the best candidate."""
     return {
         "query": query_name,
@@ -315,7 +360,7 @@ def _attach_profile_null_statistics(
     target_bundle: dict,
     best_target_strand: int,
     score_options: dict,
-    cfg: dict,
+    cfg: ComparatorConfig,
 ) -> None:
     """Attach Monte Carlo statistics for one profile comparison result."""
     if cfg["n_permutations"] <= 0:
@@ -344,7 +389,7 @@ def _attach_profile_null_statistics(
     _update_result_with_null_statistics(result, obs_score, (nulls, null_mean, null_std), cfg["n_permutations"])
 
 
-def _create_surrogate_bundle(profile, rng: np.random.Generator, cfg: dict):
+def _create_surrogate_bundle(profile, rng: np.random.Generator, cfg: ComparatorConfig):
     """Generate one surrogate single-profile bundle by row-wise convolution and renormalization."""
     min_kernel_size = int(cfg["min_kernel_size"])
     max_kernel_size = int(cfg["max_kernel_size"])
@@ -503,6 +548,8 @@ def _score_motif_columns(metric: str, query_columns: np.ndarray, target_columns:
         return float(np.sum(_vectorized_pcc(query_columns, target_columns)) / overlap)
     if metric == "cosine":
         return float(np.sum(_vectorized_cosine(query_columns, target_columns)) / overlap)
+    if metric != "ed":
+        raise ValueError("metric must be one of: 'pcc', 'ed', 'cosine'")
     distances = np.sqrt(np.sum((query_columns - target_columns) ** 2, axis=0))
     return float(-np.sum(distances) / overlap)
 
@@ -559,7 +606,7 @@ def _best_motif_score(query: dict, target: dict, metric: str) -> float:
 def _resolve_motif_matrix(
     model: GenericModel,
     sequences,
-    cfg: dict,
+    cfg: ComparatorConfig,
     use_pfm_mode: bool,
     runtime_cache: dict | None = None,
 ):
@@ -570,8 +617,8 @@ def _resolve_motif_matrix(
         raise ValueError("sequences are required for pfm_mode")
 
     runtime_cache = {} if runtime_cache is None else runtime_cache
-    sequence_fp = fingerprint_batch(sequences) or "no-sequences"
-    runtime_key = ("motif_matrix", model.name, sequence_fp, cfg["pfm_top_fraction"])
+    sequence_fp = _cached_batch_fingerprint(runtime_cache, sequences, "sequences")
+    runtime_key = ("motif_matrix", fingerprint_model(model), sequence_fp, cfg["pfm_top_fraction"])
     cached = runtime_cache.get(runtime_key)
     if cached is not None:
         return cached
@@ -584,14 +631,14 @@ def _resolve_motif_matrix(
 def _prepare_motif_model(
     model: GenericModel,
     sequences,
-    cfg: dict,
+    cfg: ComparatorConfig,
     use_pfm_mode: bool,
     runtime_cache: dict | None = None,
 ):
     """Resolve one motif matrix and its prepared forward/reverse views."""
     runtime_cache = {} if runtime_cache is None else runtime_cache
-    sequence_fp = fingerprint_batch(sequences) or "no-sequences"
-    runtime_key = ("prepared_motif", model.name, use_pfm_mode, sequence_fp, cfg["pfm_top_fraction"])
+    sequence_fp = _cached_batch_fingerprint(runtime_cache, sequences, "sequences")
+    runtime_key = ("prepared_motif", fingerprint_model(model), use_pfm_mode, sequence_fp, cfg["pfm_top_fraction"])
     cached = runtime_cache.get(runtime_key)
     if cached is not None:
         return cached
@@ -623,7 +670,7 @@ def _score_prepared_motif_pair(query: dict, target: dict, metric: str) -> dict:
     return _select_best_orientation(_score_motif_candidates(query, target, metric))
 
 
-def _build_motif_result(query_name: str, target_name: str, best: dict, metric: str) -> dict:
+def _build_motif_result(query_name: str, target_name: str, best: dict, metric: str) -> ComparisonResult:
     """Build one motif comparison result payload from the best candidate."""
     return {
         "query": query_name,
@@ -635,7 +682,9 @@ def _build_motif_result(query_name: str, target_name: str, best: dict, metric: s
     }
 
 
-def _attach_motif_null_statistics(result: dict, prepared_query: dict, target_matrix: np.ndarray, cfg: dict) -> None:
+def _attach_motif_null_statistics(
+    result: dict, prepared_query: dict, target_matrix: np.ndarray, cfg: ComparatorConfig
+) -> None:
     """Attach Monte Carlo statistics for one motif comparison result."""
     if cfg["n_permutations"] <= 0:
         return
@@ -656,7 +705,7 @@ def _attach_motif_null_statistics(result: dict, prepared_query: dict, target_mat
 
 
 @_register_comparison_strategy("motif")
-def strategy_motif(model1: GenericModel, model2: GenericModel, sequences, cfg: dict) -> dict:
+def strategy_motif(model1: GenericModel, model2: GenericModel, sequences, cfg: ComparatorConfig) -> ComparisonResult:
     """Matrix-based comparison strategy (PCC/ED/Cosine)."""
     runtime_cache = {}
     use_pfm_mode = cfg["pfm_mode"] or (model1.type_key != model2.type_key)
@@ -669,7 +718,9 @@ def strategy_motif(model1: GenericModel, model2: GenericModel, sequences, cfg: d
 
 
 @_register_comparison_strategy("profile")
-def strategy_profile(model1: GenericModel, model2: GenericModel, sequences, cfg: dict) -> dict:
+def strategy_profile(
+    model1: GenericModel, model2: GenericModel, sequences, cfg: ComparatorConfig
+) -> ComparisonResult:
     """Dense masked profile comparison strategy (CO/Dice similarity)."""
     runtime_cache = {}
     calibration_sequences = _get_profile_calibration_sequences(sequences, cfg)
@@ -695,17 +746,18 @@ def strategy_profile(model1: GenericModel, model2: GenericModel, sequences, cfg:
 
 def _compare_motif_one_to_many(
     query_model: GenericModel,
-    target_models: list[GenericModel],
+    target_models,
     sequences,
-    cfg: dict,
+    cfg: ComparatorConfig,
 ) -> list[dict]:
     """Compare one motif query against many targets while reusing prepared query state."""
-    runtime_cache = {}
+    query_cache = {}
     results = []
     for target_model in target_models:
+        target_cache = {}
         use_pfm_mode = cfg["pfm_mode"] or (query_model.type_key != target_model.type_key)
-        _query_matrix, prepared_query = _prepare_motif_model(query_model, sequences, cfg, use_pfm_mode, runtime_cache)
-        target_matrix, prepared_target = _prepare_motif_model(target_model, sequences, cfg, use_pfm_mode, runtime_cache)
+        _query_matrix, prepared_query = _prepare_motif_model(query_model, sequences, cfg, use_pfm_mode, query_cache)
+        target_matrix, prepared_target = _prepare_motif_model(target_model, sequences, cfg, use_pfm_mode, target_cache)
         best = _score_prepared_motif_pair(prepared_query, prepared_target, cfg["metric"])
         result = _build_motif_result(query_model.name, target_model.name, best, cfg["metric"])
         _attach_motif_null_statistics(result, prepared_query, target_matrix, cfg)
@@ -714,10 +766,10 @@ def _compare_motif_one_to_many(
 
 
 def _compare_profile_one_to_many(
-    query_model: GenericModel, target_models: list[GenericModel], sequences, cfg: dict
+    query_model: GenericModel, target_models, sequences, cfg: ComparatorConfig
 ) -> list[dict]:
     """Compare one profile query against many targets while reusing prepared query state."""
-    runtime_cache = {}
+    query_cache = {}
     calibration_sequences = _get_profile_calibration_sequences(sequences, cfg)
     score_options = _build_profile_score_options(cfg)
     _query_bundle, prepared_query = _prepare_profile_model(
@@ -726,17 +778,18 @@ def _compare_profile_one_to_many(
         calibration_sequences,
         cfg,
         score_options,
-        runtime_cache,
+        query_cache,
     )
     results = []
     for target_model in target_models:
+        target_cache = {}
         target_bundle, prepared_target = _prepare_profile_model(
             target_model,
             sequences,
             calibration_sequences,
             cfg,
             score_options,
-            runtime_cache,
+            target_cache,
         )
         best = _score_prepared_profile_pair(prepared_query, prepared_target, score_options)
         result = _build_profile_result(query_model.name, target_model.name, best, cfg["metric"])
@@ -752,74 +805,13 @@ def _compare_profile_one_to_many(
     return results
 
 
-@_register_comparison_strategy("motali")
-def strategy_motali(model1: GenericModel, model2: GenericModel, sequences, cfg: dict) -> dict:
-    """External Motali tool wrapper."""
-    threshold_sequences = cfg.get("promoters") if cfg.get("promoters") is not None else sequences
-    if threshold_sequences is None:
-        raise ValueError("Motali strategy requires 'promoters' or 'sequences' for threshold table calculation.")
-
-    with tempfile.TemporaryDirectory(dir=cfg["tmp_directory"], ignore_cleanup_errors=True) as tmp:
-        ext_1 = ".pfm" if model1.type_key == "pwm" else ".mat"
-        ext_2 = ".pfm" if model2.type_key == "pwm" else ".mat"
-
-        if model1.type_key == "sitega":
-            ext_1 = ".mat"
-        if model2.type_key == "sitega":
-            ext_2 = ".mat"
-
-        m1_path = os.path.join(tmp, f"motif_1{ext_1}")
-        m2_path = os.path.join(tmp, f"motif_2{ext_2}")
-        d1_path = os.path.join(tmp, "thresholds_1.dist")
-        d2_path = os.path.join(tmp, "thresholds_2.dist")
-
-        write_model(model1, m1_path)
-        write_model(model2, m2_path)
-
-        dist1 = calculate_threshold_table(model1, threshold_sequences)
-        dist2 = calculate_threshold_table(model2, threshold_sequences)
-        min_1, max_1 = get_score_bounds(model1)
-        min_2, max_2 = get_score_bounds(model2)
-
-        write_dist(dist1, max_1, min_1, d1_path)
-        write_dist(dist2, max_2, min_2, d2_path)
-
-        fasta_path = cfg.get("fasta_path")
-        if fasta_path is None and sequences is not None:
-            fasta_path = os.path.join(tmp, "sequences.fa")
-            write_fasta(sequences, fasta_path)
-
-        if fasta_path is None:
-            raise ValueError("Motali strategy requires 'sequences' or comparator.fasta_path for FASTA input.")
-
-        score, offset, orientation = run_motali(
-            fasta_path,
-            m1_path,
-            m2_path,
-            model1.type_key,
-            model2.type_key,
-            d1_path,
-            d2_path,
-            os.path.join(tmp, "overlap.txt"),
-            os.path.join(tmp, "all.txt"),
-            os.path.join(tmp, "prc_pass.txt"),
-            os.path.join(tmp, "hist_pass.txt"),
-            os.path.join(tmp, "sta.txt"),
-            shift=cfg["motali_shift"],
-            err=cfg["motali_err"],
-        )
-
-        return {
-            "query": model1.name,
-            "target": model2.name,
-            "score": score,
-            "offset": int(offset),
-            "orientation": orientation,
-        }
-
-
 def compare(
-    model1: GenericModel, model2: GenericModel, strategy: str, config: dict, sequences=None, promoters=None
+    model1: GenericModel,
+    model2: GenericModel,
+    strategy: str,
+    config: ComparatorConfig,
+    sequences=None,
+    promoters=None,
 ) -> dict:
     """Main entry point for motif comparison."""
     try:
@@ -837,9 +829,9 @@ def compare(
 
 def compare_one_to_many(
     query_model: GenericModel,
-    target_models: list[GenericModel],
+    target_models,
     strategy: str,
-    config: dict,
+    config: ComparatorConfig,
     sequences=None,
     promoters=None,
 ) -> list[dict]:
@@ -853,7 +845,5 @@ def compare_one_to_many(
             return _compare_profile_one_to_many(query_model, target_models, sequences, effective_config)
         if strategy == "motif":
             return _compare_motif_one_to_many(query_model, target_models, sequences, effective_config)
-        if strategy == "motali":
-            raise NotImplementedError("One-vs-many API does not support the 'motali' strategy.")
         available = ", ".join(sorted(registry))
         raise ValueError(f"Strategy '{strategy}' not found. Available: {available}")

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, TypedDict, Union
 
 import numpy as np
 
-from mimosa.batches import make_sequence_batch
+from mimosa.batches import DenseBatch, make_sequence_batch
 from mimosa.comparison import (
+    ComparatorConfig,
     compare,
     create_comparator_config,
 )
@@ -20,12 +21,11 @@ from mimosa.models import GenericModel, read_model
 from mimosa.validation import validate_file_exists, validate_positive_int
 
 ModelRef = Union[GenericModel, str, Path]
-SequenceRef = Union[dict, str, Path]
+SequenceRef = Union[DenseBatch, str, Path]
 
 _STRATEGY_ALIASES = {
     "profile": "profile",
     "motif": "motif",
-    "motali": "motali",
 }
 
 _DEFAULT_METRICS = {
@@ -39,6 +39,38 @@ _ALLOWED_METRICS = {
 }
 
 
+class ComparisonConfig(TypedDict):
+    model1: ModelRef
+    model2: ModelRef
+    model1_type: Optional[str]
+    model2_type: Optional[str]
+    strategy: str
+    sequences: Optional[SequenceRef]
+    promoters: Optional[SequenceRef]
+    num_sequences: int
+    seq_length: int
+    seed: int
+    comparator: ComparatorConfig
+    model1_kwargs: Dict[str, Any]
+    model2_kwargs: Dict[str, Any]
+
+
+class OneToManyConfig(TypedDict):
+    query: ModelRef
+    targets: List[ModelRef]
+    query_type: Optional[str]
+    target_type: Optional[str]
+    strategy: str
+    sequences: Optional[SequenceRef]
+    promoters: Optional[SequenceRef]
+    num_sequences: int
+    seq_length: int
+    seed: int
+    comparator: ComparatorConfig
+    query_kwargs: Dict[str, Any]
+    target_kwargs: Dict[str, Any]
+
+
 def create_config(
     model1: ModelRef,
     model2: ModelRef,
@@ -50,11 +82,11 @@ def create_config(
     num_sequences: int = 1000,
     seq_length: int = 200,
     seed: int = 127,
-    comparator: Optional[dict] = None,
+    comparator: Optional[ComparatorConfig] = None,
     model1_kwargs: Optional[Dict[str, Any]] = None,
     model2_kwargs: Optional[Dict[str, Any]] = None,
     **comparator_kwargs,
-) -> dict:
+) -> ComparisonConfig:
     """Build a unified comparison configuration."""
     normalized_strategy = _normalize_strategy(strategy)
     if comparator is not None and comparator_kwargs:
@@ -94,7 +126,7 @@ def compare_motifs(
     num_sequences: int = 1000,
     seq_length: int = 200,
     seed: int = 127,
-    comparator: Optional[dict] = None,
+    comparator: Optional[ComparatorConfig] = None,
     model1_kwargs: Optional[Dict[str, Any]] = None,
     model2_kwargs: Optional[Dict[str, Any]] = None,
     **comparator_kwargs,
@@ -130,11 +162,11 @@ def create_many_config(
     num_sequences: int = 1000,
     seq_length: int = 200,
     seed: int = 127,
-    comparator: Optional[dict] = None,
+    comparator: Optional[ComparatorConfig] = None,
     query_kwargs: Optional[Dict[str, Any]] = None,
     target_kwargs: Optional[Dict[str, Any]] = None,
     **comparator_kwargs,
-) -> dict:
+) -> OneToManyConfig:
     """Build a unified one-vs-many comparison configuration."""
     normalized_strategy = _normalize_strategy(strategy)
     if comparator is not None and comparator_kwargs:
@@ -174,7 +206,7 @@ def compare_one_to_many(
     num_sequences: int = 1000,
     seq_length: int = 200,
     seed: int = 127,
-    comparator: Optional[dict] = None,
+    comparator: Optional[ComparatorConfig] = None,
     query_kwargs: Optional[Dict[str, Any]] = None,
     target_kwargs: Optional[Dict[str, Any]] = None,
     **comparator_kwargs,
@@ -199,7 +231,7 @@ def compare_one_to_many(
     return run_one_to_many(config)
 
 
-def run_comparison(config: dict) -> dict:
+def run_comparison(config: ComparisonConfig) -> dict:
     """Execute one comparison using the unified config."""
     strategy = _normalize_strategy(config["strategy"])
     model1 = _resolve_model(config["model1"], config.get("model1_type"), config.get("model1_kwargs", {}))
@@ -212,13 +244,7 @@ def run_comparison(config: dict) -> dict:
         promoters = _resolve_sequences(config["promoters"], config)
 
     needs_sequences = _needs_sequences(strategy, config["comparator"], model1, model2)
-    if strategy == "motali" and config.get("sequences") is None and promoters is not None:
-        sequences = None
-    else:
-        sequences = _resolve_sequences(config.get("sequences"), config) if needs_sequences else None
-
-    if strategy == "motali" and sequences is None:
-        sequences = promoters
+    sequences = _resolve_sequences(config.get("sequences"), config) if needs_sequences else None
 
     return compare(
         model1=model1,
@@ -230,35 +256,37 @@ def run_comparison(config: dict) -> dict:
     )
 
 
-def run_one_to_many(config: dict) -> List[dict]:
+def run_one_to_many(config: OneToManyConfig) -> List[dict]:
     """Execute one comparison of a single query against many targets."""
     strategy = _normalize_strategy(config["strategy"])
     query_model = _resolve_model(config["query"], config.get("query_type"), config.get("query_kwargs", {}))
-    target_models = _resolve_targets(
-        config.get("targets", []),
-        config.get("target_type"),
-        config.get("target_kwargs", {}),
-    )
     _validate_comparator_for_strategy(strategy, config["comparator"])
 
-    for target_model in target_models:
-        _validate_models_for_strategy(strategy, query_model, target_model)
-
-    if not target_models:
+    target_refs = list(config.get("targets", []))
+    if not target_refs:
         return []
 
     promoters = None
     if config.get("promoters") is not None:
         promoters = _resolve_sequences(config["promoters"], config)
 
-    needs_sequences = _needs_sequences_for_many(strategy, config["comparator"], query_model, target_models)
-    if strategy == "motali" and config.get("sequences") is None and promoters is not None:
-        sequences = None
-    else:
-        sequences = _resolve_sequences(config.get("sequences"), config) if needs_sequences else None
+    needs_sequences = _target_refs_need_sequences(
+        strategy,
+        config["comparator"],
+        query_model,
+        target_refs,
+        config.get("target_type"),
+        config.get("target_kwargs", {}),
+    )
+    sequences = _resolve_sequences(config.get("sequences"), config) if needs_sequences else None
 
-    if strategy == "motali" and sequences is None:
-        sequences = promoters
+    target_models = _iter_resolved_targets(
+        target_refs,
+        config.get("target_type"),
+        config.get("target_kwargs", {}),
+        strategy,
+        query_model,
+    )
 
     return compare_one_to_many_models(
         query_model=query_model,
@@ -297,25 +325,42 @@ def _normalize_targets(targets) -> List[ModelRef]:
     return list(targets)
 
 
-def _resolve_targets(targets: List[ModelRef], model_type: Optional[str], kwargs: Dict[str, Any]) -> List[GenericModel]:
-    """Resolve many model references using one shared type/kwargs contract."""
-    return [_resolve_model(model, model_type, kwargs) for model in targets]
+def _iter_resolved_targets(
+    targets: Iterable[ModelRef],
+    model_type: Optional[str],
+    kwargs: Dict[str, Any],
+    strategy: str,
+    query_model: GenericModel,
+):
+    """Resolve and validate target models lazily."""
+    for target in targets:
+        target_model = _resolve_model(target, model_type, kwargs)
+        _validate_models_for_strategy(strategy, query_model, target_model)
+        yield target_model
 
 
-def _needs_sequences(strategy: str, comparator: dict, model1: GenericModel, model2: GenericModel) -> bool:
+def _needs_sequences(strategy: str, comparator: ComparatorConfig, model1: GenericModel, model2: GenericModel) -> bool:
     """Return True if the selected strategy requires sequence input."""
     if strategy == "profile":
         return model1.type_key != "scores" or model2.type_key != "scores"
-    if strategy == "motali":
-        return True
     return strategy == "motif" and (comparator["pfm_mode"] or model1.type_key != model2.type_key)
 
 
-def _needs_sequences_for_many(
-    strategy: str, comparator: dict, query_model: GenericModel, target_models: List[GenericModel]
+def _target_refs_need_sequences(
+    strategy: str,
+    comparator: ComparatorConfig,
+    query_model: GenericModel,
+    target_refs: Iterable[ModelRef],
+    target_type: Optional[str],
+    target_kwargs: Dict[str, Any],
 ) -> bool:
     """Return True when any query-target pair requires sequence input."""
-    return any(_needs_sequences(strategy, comparator, query_model, target_model) for target_model in target_models)
+    for target in target_refs:
+        target_model = _resolve_model(target, target_type, target_kwargs)
+        _validate_models_for_strategy(strategy, query_model, target_model)
+        if _needs_sequences(strategy, comparator, query_model, target_model):
+            return True
+    return False
 
 
 def _validate_models_for_strategy(strategy: str, model1: GenericModel, model2: GenericModel) -> None:
@@ -323,14 +368,7 @@ def _validate_models_for_strategy(strategy: str, model1: GenericModel, model2: G
     if strategy == "motif" and ("scores" in {model1.type_key, model2.type_key}):
         raise ValueError("Motif strategy does not support score-profile inputs.")
 
-    if strategy == "motali":
-        invalid = {model1.type_key, model2.type_key} - {"pwm", "sitega"}
-        if invalid:
-            invalid_types = ", ".join(sorted(invalid))
-            raise ValueError(f"Motali strategy supports only pwm and sitega models, got: {invalid_types}")
-
-
-def _validate_comparator_for_strategy(strategy: str, comparator: dict) -> None:
+def _validate_comparator_for_strategy(strategy: str, comparator: ComparatorConfig) -> None:
     """Validate comparator options for the selected strategy."""
     allowed_metrics = _ALLOWED_METRICS.get(strategy)
     if allowed_metrics is not None and comparator["metric"] not in allowed_metrics:
@@ -338,7 +376,7 @@ def _validate_comparator_for_strategy(strategy: str, comparator: dict) -> None:
         raise ValueError(f"Strategy '{strategy}' requires one of the following metrics: {options}")
 
 
-def _resolve_sequences(source: Optional[SequenceRef], config: dict):
+def _resolve_sequences(source: Optional[SequenceRef], config: ComparisonConfig | OneToManyConfig) -> DenseBatch:
     """Resolve one sequence source to a dense masked batch."""
     if source is None:
         return _generate_random_sequences(config["num_sequences"], config["seq_length"], config["seed"])

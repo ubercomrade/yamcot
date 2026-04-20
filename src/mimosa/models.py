@@ -63,6 +63,13 @@ class GenericModel:
 registry: Dict[str, dict] = {}
 
 
+def _load_pickled_generic_model(path: str, model_type: str) -> GenericModel:
+    model = joblib.load(path)
+    if not isinstance(model, GenericModel):
+        raise TypeError(f"Unsupported {model_type} pickle payload: expected GenericModel, got {type(model)!r}")
+    return model
+
+
 def _register_model_handler(key: str, *, scan, load, write, score_bounds, scan_both=None) -> None:
     """Register one model handler bundle."""
     registry[key] = {
@@ -165,11 +172,6 @@ def _empty_hit_arrays() -> dict[str, np.ndarray]:
     }
 
 
-def _scan_both_strands(model: GenericModel, sequences):
-    """Scan sequences on both strands."""
-    return scan_model_strands(model, sequences)
-
-
 def _collect_best_hits(sequences, score_bundle) -> dict[str, np.ndarray]:
     """Collect the single best hit per sequence as numeric arrays."""
     seq_indices: list[int] = []
@@ -245,7 +247,7 @@ def _collect_threshold_hits(score_bundle, score_threshold: float) -> dict[str, n
 
 def _collect_hits(model: GenericModel, sequences, mode: str, score_threshold: Optional[float]) -> dict[str, np.ndarray]:
     """Collect motif hits as numeric arrays."""
-    score_bundle = _scan_both_strands(model, sequences)
+    score_bundle = scan_model_strands(model, sequences)
     if mode == "best":
         return _collect_best_hits(sequences, score_bundle)
     return _collect_threshold_hits(score_bundle, float(score_threshold))
@@ -456,11 +458,8 @@ def get_pfm(
     threshold_table: Optional[np.ndarray] = None,
     top_fraction: Optional[float] = None,
     pseudocount: float = 0.25,
-    force_recompute: bool = False,
 ) -> np.ndarray:
     """Construct a Position Frequency Matrix from binding sites."""
-    del force_recompute
-
     logger = logging.getLogger(__name__)
     logger.info("Computing PFM for model: %s", model.name)
     resolved = _resolve_hits(
@@ -528,9 +527,7 @@ def _load_pwm(path: str, kwargs: dict) -> GenericModel:
     _, ext = os.path.splitext(path.lower())
 
     if ext == ".pkl":
-        model = joblib.load(path)
-        if not isinstance(model, GenericModel):
-            raise TypeError(f"Unsupported PWM pickle payload: expected GenericModel, got {type(model)!r}")
+        model = _load_pickled_generic_model(path, "PWM")
         if model.config.get("_source_pfm") is None:
             raise ValueError("Unsupported PWM pickle format: source PFM is missing from model.config['_source_pfm'].")
         return model
@@ -564,7 +561,7 @@ def _write_sitega(model: GenericModel, path: str) -> None:
 def _load_sitega(path: str, _kwargs: dict) -> GenericModel:
     _, ext = os.path.splitext(path.lower())
     if ext == ".pkl":
-        return joblib.load(path)
+        return _load_pickled_generic_model(path, "SiteGA")
     if ext != ".mat":
         raise ValueError(f"Unsupported SiteGA format: {path}")
 
@@ -631,7 +628,7 @@ def _scan_dimont_both(model: GenericModel, sequences):
 def _load_dimont(path: str, _kwargs: dict) -> GenericModel:
     _, ext = os.path.splitext(path.lower())
     if ext == ".pkl":
-        return joblib.load(path)
+        return _load_pickled_generic_model(path, "Dimont")
     if ext != ".xml":
         raise ValueError(f"Unsupported Dimont format: {path}")
 
@@ -651,7 +648,7 @@ def _scan_slim_both(model: GenericModel, sequences):
 def _load_slim(path: str, _kwargs: dict) -> GenericModel:
     _, ext = os.path.splitext(path.lower())
     if ext == ".pkl":
-        return joblib.load(path)
+        return _load_pickled_generic_model(path, "Slim")
     if ext != ".xml":
         raise ValueError(f"Unsupported Slim format: {path}")
 

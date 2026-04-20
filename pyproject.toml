@@ -36,16 +36,11 @@ Documentation = "https://github.com/ubercomrade/mimosa#readme"
 mimosa = "mimosa.cli:main_cli"
 
 [build-system]
-requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
-build-backend = "scikit_build_core.build"
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
 
-[tool.scikit-build]
-wheel.expand-macos-universal-tags = true
-wheel.packages = ["src/mimosa"]
-sdist.include = ["src/mimosa/_core/*.cpp", "src/mimosa/_core/*.h", "CMakeLists.txt"]
-
-[tool.scikit-build.cmake.define]
-CMAKE_OSX_DEPLOYMENT_TARGET = "10.13"
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [dependency-groups]
 dev = [
@@ -53,8 +48,7 @@ dev = [
     "ruff>=0.3.0",
 ]
 test = [
-    "scikit-build-core>=0.10",
-    "nanobind>=2.0",
+    "pytest>=8.0",
 ]
 
 [tool.ruff]
@@ -66,10 +60,8 @@ select = ["E", "F", "I", "B", "C90", "PLR", "SIM", "RET", "ARG"]
 ignore = []
 
 [tool.ruff.lint.per-file-ignores]
-"src/mimosa/_core/__init__.py" = ["ARG001"]
 "src/mimosa/api.py" = ["PLR0913"]
 "src/mimosa/comparison.py" = ["PLR0913"]
-"src/mimosa/execute.py" = ["PLR0913", "PLR2004"]
 "src/mimosa/functions.py" = ["PLR0913"]
 "src/mimosa/models.py" = ["PLR0913"]
 "examples/*.py" = ["PLR0913"]

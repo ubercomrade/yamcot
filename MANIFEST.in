@@ -3,11 +3,8 @@ include LICENSE
 include CHANGELOG.md
 include CONTRIBUTING.md
 include pyproject.toml
-include CMakeLists.txt
 
 recursive-include src/mimosa *.py
-recursive-include src/mimosa/_core *.h
-recursive-include src/mimosa/_core *.cpp
 recursive-include examples *
 
 global-exclude __pycache__

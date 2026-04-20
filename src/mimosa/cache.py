@@ -3,17 +3,33 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
+from typing import TypedDict
 
 import numpy as np
 
-from mimosa.batches import SCORE_PADDING, pack_profile_bundle
+from mimosa.batches import SCORE_PADDING, ProfileBundle, pack_profile_bundle
 from mimosa.models import GenericModel
 
-CACHE_VERSION = "v4"
+CACHE_VERSION = "v6"
+
+try:
+    import zstandard as _zstd
+except ImportError:  # pragma: no cover - exercised through CLI fallback in environments without python-zstandard
+    _zstd = None
+
+
+class ProfileCacheSpec(TypedDict):
+    model: GenericModel
+    sequences: dict | None
+    promoters: dict | None
+    profile_kind: str
+    cache_dir: str
 
 
 def _hash_array(array: np.ndarray) -> bytes:
@@ -69,7 +85,7 @@ def fingerprint_model(model: GenericModel) -> str:
     return hasher.hexdigest()
 
 
-def _profile_cache_path(spec: dict) -> Path:
+def _profile_cache_path(spec: ProfileCacheSpec) -> Path:
     """Build the file path for one cached profile artifact."""
     model_fp = fingerprint_model(spec["model"])
     sequence_fp = fingerprint_batch(spec.get("sequences")) or "no-sequences"
@@ -77,30 +93,60 @@ def _profile_cache_path(spec: dict) -> Path:
     promoter_fp = fingerprint_batch(spec.get("promoters"))
     if promoter_fp is not None:
         base = base / promoter_fp
-    return base / f"{model_fp}.npz"
+    return base / f"{model_fp}.npz.zst"
 
 
-def load_profile_cache(spec: dict):
+def _zstd_cli(args: list[str], payload: bytes) -> bytes:
+    """Run one zstd CLI command against in-memory bytes."""
+    completed = subprocess.run(
+        ["zstd", *args, "-"],
+        input=payload,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"zstd command failed: {stderr or completed.returncode}")
+    return completed.stdout
+
+
+def _compress_cache_payload(payload: bytes) -> bytes:
+    """Compress one cache payload with Zstandard."""
+    if _zstd is not None:
+        return _zstd.ZstdCompressor(level=3).compress(payload)
+    return _zstd_cli(["-q", "-f", "-3", "-c"], payload)
+
+
+def _decompress_cache_payload(payload: bytes) -> bytes:
+    """Decompress one cache payload with Zstandard."""
+    if _zstd is not None:
+        return _zstd.ZstdDecompressor().decompress(payload)
+    return _zstd_cli(["-d", "-q", "-f", "-c"], payload)
+
+
+def load_profile_cache(spec: ProfileCacheSpec) -> ProfileBundle | None:
     """Load one cached normalized profile bundle if it is present and readable."""
     path = _profile_cache_path(spec)
     if not path.exists():
         return None
 
     try:
-        with np.load(path, allow_pickle=False) as payload:
+        compressed_payload = path.read_bytes()
+        with np.load(io.BytesIO(_decompress_cache_payload(compressed_payload)), allow_pickle=False) as payload:
             version = str(payload["version"])
             if version != CACHE_VERSION:
                 return None
             values = payload["values"].astype(np.float32, copy=False)
             lengths = payload["lengths"].astype(np.int64, copy=False)
-    except (OSError, ValueError, KeyError):
+    except (OSError, ValueError, KeyError, RuntimeError):
         path.unlink(missing_ok=True)
         return None
 
     return pack_profile_bundle(values, lengths, SCORE_PADDING)
 
 
-def store_profile_cache(spec: dict, profile) -> Path:
+def store_profile_cache(spec: ProfileCacheSpec, profile: ProfileBundle) -> Path:
     """Store one derived profile bundle atomically on disk."""
     path = _profile_cache_path(spec)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -108,13 +154,16 @@ def store_profile_cache(spec: dict, profile) -> Path:
     fd, tmp_path = tempfile.mkstemp(prefix="profile-", suffix=".npz", dir=path.parent)
     os.close(fd)
     try:
+        raw_payload = io.BytesIO()
+        np.savez(
+            raw_payload,
+            version=np.array(CACHE_VERSION),
+            values=np.asarray(profile["values"], dtype=np.float32),
+            lengths=np.asarray(profile["lengths"], dtype=np.int64),
+        )
+        compressed_payload = _compress_cache_payload(raw_payload.getvalue())
         with open(tmp_path, "wb") as handle:
-            np.savez(
-                handle,
-                version=np.array(CACHE_VERSION),
-                values=np.asarray(profile["values"], dtype=np.float32),
-                lengths=np.asarray(profile["lengths"], dtype=np.int64),
-            )
+            handle.write(compressed_payload)
         os.replace(tmp_path, path)
     finally:
         if os.path.exists(tmp_path):
