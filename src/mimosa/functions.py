@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
-from numba import njit, prange
+from numba import njit
 
 from mimosa.batches import (
     SCORE_PADDING,
@@ -17,15 +17,7 @@ from mimosa.batches import (
 RC_TABLE = np.array([3, 2, 1, 0, 4], dtype=np.int8)
 PROFILE_EPS = np.float32(1e-6)
 SCAN_BUCKET_STEP = 32
-
-
-def build_profile_score_options(search_range: int, min_value: float = 0.0, metric: str = "co") -> dict:
-    """Build one validated options dictionary for profile scoring."""
-    return {
-        "search_range": int(search_range),
-        "min_value": float(min_value),
-        "metric": str(metric),
-    }
+WINDOW_MATRIX_NDIM = 2
 
 
 def pfm_to_pwm(pfm):
@@ -77,13 +69,13 @@ def _lower_bound_desc(values, target):
     return lo
 
 
-@njit(cache=True, parallel=True)
+@njit(cache=True)
 def _apply_score_log_tail_table_numba(values, mask, scores_col, log_tail_col, padding_value: float):
     """Map one dense masked score matrix to empirical log-tail values."""
     rows, cols = values.shape
     mapped = np.empty((rows, cols), dtype=np.float32)
 
-    for row_index in prange(rows):
+    for row_index in range(rows):
         for col_index in range(cols):
             if mask[row_index, col_index]:
                 idx = _lower_bound_desc(scores_col, values[row_index, col_index])
@@ -169,22 +161,6 @@ def normalize_empirical_log_tail_pair(score_batch_plus, score_batch_minus):
         pack_batch(values_plus, score_batch_plus["mask"], score_batch_plus["lengths"], SCORE_PADDING),
         pack_batch(values_minus, score_batch_minus["mask"], score_batch_minus["lengths"], SCORE_PADDING),
     )
-
-
-def lookup_log_tail(table: np.ndarray, score: float) -> float:
-    """Convert a score to the corresponding log-tail value."""
-    scores_col = table[:, 0]
-    log_tail_col = table[:, 1]
-
-    if score >= scores_col[0]:
-        return float(log_tail_col[0])
-    if score <= scores_col[-1]:
-        return float(log_tail_col[-1])
-
-    idx = np.searchsorted(-scores_col, -score, side="left")
-    if idx >= len(log_tail_col):
-        return float(log_tail_col[-1])
-    return float(log_tail_col[idx])
 
 
 def lookup_score_for_tail_probability(table: np.ndarray, tail_probability: float) -> float:
@@ -296,7 +272,7 @@ def _score_window_reverse(seq_row, length: int, model_rows, pos: int, kmer: int,
     return total
 
 
-@njit(cache=True, parallel=True, fastmath=True)
+@njit(cache=True, fastmath=True)
 def _scan_dense_kernel_numba(values, lengths, model_rows, kmer: int, context_len: int, n_terms: int):
     """Score one dense encoded sequence batch for one strand."""
     n_rows, _ = values.shape
@@ -305,7 +281,7 @@ def _scan_dense_kernel_numba(values, lengths, model_rows, kmer: int, context_len
     scores = np.zeros((n_rows, max_scores), dtype=np.float32)
     mask = np.zeros((n_rows, max_scores), dtype=np.bool_)
 
-    for row_index in prange(n_rows):
+    for row_index in range(n_rows):
         length = int(lengths[row_index])
         n_scores = max(length - motif_len + 1, 0)
         if n_scores == 0:
@@ -327,7 +303,7 @@ def _scan_dense_kernel_numba(values, lengths, model_rows, kmer: int, context_len
     return scores, mask
 
 
-@njit(cache=True, parallel=True, fastmath=True)
+@njit(cache=True, fastmath=True)
 def _scan_dense_reverse_kernel_numba(values, lengths, model_rows, kmer: int, window_size: int, n_terms: int):
     """Score one dense encoded sequence batch on the reverse-complement strand."""
     n_rows, _ = values.shape
@@ -336,7 +312,7 @@ def _scan_dense_reverse_kernel_numba(values, lengths, model_rows, kmer: int, win
     scores = np.zeros((n_rows, max_scores), dtype=np.float32)
     mask = np.zeros((n_rows, max_scores), dtype=np.bool_)
 
-    for row_index in prange(n_rows):
+    for row_index in range(n_rows):
         length = int(lengths[row_index])
         n_scores = max(length - motif_len + 1, 0)
         if n_scores == 0:
@@ -350,7 +326,7 @@ def _scan_dense_reverse_kernel_numba(values, lengths, model_rows, kmer: int, win
     return scores, mask
 
 
-@njit(cache=True, parallel=True, fastmath=True)
+@njit(cache=True, fastmath=True)
 def _scan_dense_strands_kernel_numba(
     values, lengths, model_rows, kmer: int, context_len: int, window_size: int, n_terms: int
 ):
@@ -361,7 +337,7 @@ def _scan_dense_strands_kernel_numba(
     scores = np.zeros((n_rows, 2, max_scores), dtype=np.float32)
     mask = np.zeros((n_rows, 2, max_scores), dtype=np.bool_)
 
-    for row_index in prange(n_rows):
+    for row_index in range(n_rows):
         length = int(lengths[row_index])
         n_scores = max(length - motif_len + 1, 0)
         if n_scores == 0:
@@ -674,259 +650,48 @@ def scores_to_empirical_log_tail(score_batch):
     return apply_score_log_tail_table(score_batch, table)
 
 
-def _profile_threshold(min_value: float) -> np.float32:
-    """Return the minimum retained profile value for scoring."""
-    return np.float32(max(float(min_value), 0.0))
+def prepare_profile_bundle(bundle: dict) -> dict:
+    """Return one contiguous profile bundle with explicit float32 values."""
+    values = np.ascontiguousarray(bundle["values"], dtype=np.float32)
+    lengths = np.ascontiguousarray(bundle["lengths"], dtype=np.int64)
+    return pack_profile_bundle(values, lengths, SCORE_PADDING)
 
 
-def _as_int32_scalar(value) -> np.int32:
-    """Convert one scalar index-like value to int32."""
-    return np.int32(int(value))
+def calc_co(scores1: np.ndarray, scores2: np.ndarray, eps: float = float(PROFILE_EPS)) -> float:
+    """Compute the CO score over one selected window collection."""
+    values1 = np.asarray(scores1, dtype=np.float32).ravel()
+    values2 = np.asarray(scores2, dtype=np.float32).ravel()
+    denom = float(min(values1.sum(), values2.sum()))
+    if denom <= eps:
+        return 0.0
+    return float(np.minimum(values1, values2).sum() / denom)
 
 
-def _prepare_profile_for_scoring(profile, min_value: float):
-    """Prepare one 2D profile matrix for compiled scoring kernels."""
-    values = np.ascontiguousarray(profile["values"], dtype=np.float32).copy()
-    if "mask" in profile:
-        mask = np.ascontiguousarray(profile["mask"], dtype=bool)
-        values[~mask] = SCORE_PADDING
-
-    threshold = _profile_threshold(min_value)
-    if threshold > 0.0:
-        values[values < threshold] = SCORE_PADDING
-
-    return {
-        "values": np.ascontiguousarray(values, dtype=np.float32),
-        "lengths": np.asarray(profile["lengths"], dtype=np.int32),
-    }
+def calc_dice(scores1: np.ndarray, scores2: np.ndarray, eps: float = float(PROFILE_EPS)) -> float:
+    """Compute the Dice score over one selected window collection."""
+    values1 = np.asarray(scores1, dtype=np.float32).ravel()
+    values2 = np.asarray(scores2, dtype=np.float32).ravel()
+    denom = float(values1.sum() + values2.sum())
+    if denom <= eps:
+        return 0.0
+    return float((2.0 * np.minimum(values1, values2).sum()) / denom)
 
 
-def _prepare_profile_bundle_for_scoring(bundle: dict, min_value: float) -> dict:
-    """Prepare one 3D profile bundle for repeated profile comparisons."""
-    values = np.ascontiguousarray(bundle["values"], dtype=np.float32).copy()
-    threshold = _profile_threshold(min_value)
-    if threshold > 0.0:
-        values[values < threshold] = SCORE_PADDING
-    return pack_profile_bundle(values, np.asarray(bundle["lengths"], dtype=np.int32), SCORE_PADDING)
+def rowwise_cosine(x: np.ndarray, y: np.ndarray, eps: float = float(PROFILE_EPS)) -> np.ndarray:
+    """Compute one cosine value per selected window."""
+    values_x = np.asarray(x, dtype=np.float32)
+    values_y = np.asarray(y, dtype=np.float32)
+    if values_x.shape != values_y.shape:
+        raise ValueError("x and y must have the same shape.")
+    if values_x.ndim != WINDOW_MATRIX_NDIM:
+        raise ValueError("x and y must be 2D arrays.")
 
-
-@njit(cache=True, fastmath=True, inline="always")
-def _profile_score_co_from_totals(inter: float, sum1: float, sum2: float) -> float:
-    """Convert overlap totals to the CO similarity score."""
-    denom = sum1 if sum1 < sum2 else sum2
-    return inter / denom if denom > PROFILE_EPS else -1.0
-
-
-@njit(cache=True, fastmath=True, inline="always")
-def _profile_score_dice_from_totals(inter: float, sum1: float, sum2: float) -> float:
-    """Convert overlap totals to the Dice similarity score."""
-    denom = sum1 + sum2
-    return (2.0 * inter) / denom if denom > PROFILE_EPS else -1.0
-
-
-@njit(cache=True, fastmath=True, inline="always")
-def _accumulate_profile_overlap(values1, values2, start1: int, start2: int, overlap: int):
-    """Accumulate overlap totals for one aligned profile pair."""
-    inter = 0.0
-    sum1 = 0.0
-    sum2 = 0.0
-    n_rows = values1.shape[0]
-    stop1 = start1 + overlap
-
-    for row_index in range(n_rows):
-        row1 = values1[row_index]
-        row2 = values2[row_index]
-        col1 = start1
-        col2 = start2
-
-        while col1 < stop1:
-            value1 = float(row1[col1])
-            if value1 > 0.0:
-                value2 = float(row2[col2])
-                if value2 > 0.0:
-                    inter += value1 if value1 < value2 else value2
-                    sum1 += value1
-                    sum2 += value2
-            col1 += 1
-            col2 += 1
-
-    return inter, sum1, sum2
-
-
-@njit(cache=True, fastmath=True)
-def _profile_score_co_numba(values1, values2, search_range: int):
-    """Compute the best CO profile similarity score for all offsets."""
-    width1 = values1.shape[1]
-    width2 = values2.shape[1]
-    best_score = -1.0
-    best_offset = np.int32(0)
-
-    for offset in range(-search_range, search_range + 1):
-        start1 = offset if offset > 0 else 0
-        start2 = -offset if offset < 0 else 0
-        remaining = width2 - start2
-        overlap = min(width1 - start1, remaining)
-        if overlap <= 0:
-            continue
-
-        inter, sum1, sum2 = _accumulate_profile_overlap(values1, values2, start1, start2, overlap)
-        score = _profile_score_co_from_totals(inter, sum1, sum2)
-        if score > best_score:
-            best_score = score
-            best_offset = np.int32(offset)
-
-    if best_score < 0.0:
-        return np.float32(0.0), np.int32(0)
-    return np.float32(best_score), best_offset
-
-
-@njit(cache=True, fastmath=True)
-def _profile_score_dice_numba(values1, values2, search_range: int):
-    """Compute the best Dice profile similarity score for all offsets."""
-    width1 = values1.shape[1]
-    width2 = values2.shape[1]
-    best_score = -1.0
-    best_offset = np.int32(0)
-
-    for offset in range(-search_range, search_range + 1):
-        start1 = offset if offset > 0 else 0
-        start2 = -offset if offset < 0 else 0
-        remaining = width2 - start2
-        overlap = min(width1 - start1, remaining)
-        if overlap <= 0:
-            continue
-
-        inter, sum1, sum2 = _accumulate_profile_overlap(values1, values2, start1, start2, overlap)
-        score = _profile_score_dice_from_totals(inter, sum1, sum2)
-        if score > best_score:
-            best_score = score
-            best_offset = np.int32(offset)
-
-    if best_score < 0.0:
-        return np.float32(0.0), np.int32(0)
-    return np.float32(best_score), best_offset
-
-
-def _dispatch_profile_kernel(metric: str):
-    """Resolve one public metric name to the dedicated compiled profile kernel."""
-    if metric == "co":
-        return _profile_score_co_numba
-    if metric == "dice":
-        return _profile_score_dice_numba
-    raise ValueError("metric must be one of: 'co', 'dice'")
-
-
-@njit(cache=True, parallel=True, fastmath=True)
-def _profile_score_orientations_co_numba(
-    values1_unique,
-    left_indices,
-    values2_unique,
-    right_indices,
-    search_range: int,
-):
-    """Compute CO profile similarity for multiple orientation pairs in one call."""
-    n_pairs = left_indices.shape[0]
-    scores = np.zeros(n_pairs, dtype=np.float32)
-    offsets = np.zeros(n_pairs, dtype=np.int32)
-
-    for pair_index in prange(n_pairs):
-        left_index = left_indices[pair_index]
-        right_index = right_indices[pair_index]
-        score, offset = _profile_score_co_numba(values1_unique[left_index], values2_unique[right_index], search_range)
-        scores[pair_index] = score
-        offsets[pair_index] = offset
-
-    return scores, offsets
-
-
-@njit(cache=True, parallel=True, fastmath=True)
-def _profile_score_orientations_dice_numba(
-    values1_unique,
-    left_indices,
-    values2_unique,
-    right_indices,
-    search_range: int,
-):
-    """Compute Dice profile similarity for multiple orientation pairs in one call."""
-    n_pairs = left_indices.shape[0]
-    scores = np.zeros(n_pairs, dtype=np.float32)
-    offsets = np.zeros(n_pairs, dtype=np.int32)
-
-    for pair_index in prange(n_pairs):
-        left_index = left_indices[pair_index]
-        right_index = right_indices[pair_index]
-        score, offset = _profile_score_dice_numba(values1_unique[left_index], values2_unique[right_index], search_range)
-        scores[pair_index] = score
-        offsets[pair_index] = offset
-
-    return scores, offsets
-
-
-def _dispatch_profile_orientation_kernel(metric: str):
-    """Resolve one public metric name to the dedicated compiled orientation kernel."""
-    if metric == "co":
-        return _profile_score_orientations_co_numba
-    if metric == "dice":
-        return _profile_score_orientations_dice_numba
-    raise ValueError("metric must be one of: 'co', 'dice'")
-
-
-def fast_profile_score(profile1, profile2, options: dict):
-    """Compute the best overlap-based similarity score for two dense score batches."""
-    min_value = float(options.get("min_value", 0.0))
-    prepared1 = _prepare_profile_for_scoring(profile1, min_value)
-    prepared2 = _prepare_profile_for_scoring(profile2, min_value)
-    values1 = prepared1["values"]
-    values2 = prepared2["values"]
-
-    if values1.shape[0] != values2.shape[0]:
-        raise ValueError("profile batches must have the same number of rows")
-
-    if values1.shape[1] == 0 or values2.shape[1] == 0:
-        return 0.0, 0
-
-    metric = str(options.get("metric", "co"))
-    score_kernel = _dispatch_profile_kernel(metric)
-    score, offset = score_kernel(values1, values2, _as_int32_scalar(options["search_range"]))
-    return float(score), int(offset)
-
-
-def _score_prepared_profile_orientations(left_bundle: dict, right_bundle: dict, strand_pairs, options: dict):
-    """Compute profile similarity for strand-indexed pairs of prepared profile bundles."""
-    if not strand_pairs:
-        return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.int32)
-
-    left_values = np.ascontiguousarray(left_bundle["values"], dtype=np.float32)
-    right_values = np.ascontiguousarray(right_bundle["values"], dtype=np.float32)
-
-    if left_values.shape[1] != right_values.shape[1]:
-        raise ValueError("profile bundles must have the same number of rows")
-
-    if left_values.shape[2] == 0 or right_values.shape[2] == 0:
-        n_pairs = len(strand_pairs)
-        return np.zeros(n_pairs, dtype=np.float32), np.zeros(n_pairs, dtype=np.int32)
-
-    left_indices = np.asarray([left_index for left_index, _ in strand_pairs], dtype=np.int32)
-    right_indices = np.asarray([right_index for _, right_index in strand_pairs], dtype=np.int32)
-    metric = str(options.get("metric", "co"))
-    orientation_kernel = _dispatch_profile_orientation_kernel(metric)
-    scores, offsets = orientation_kernel(
-        left_values,
-        left_indices,
-        right_values,
-        right_indices,
-        _as_int32_scalar(options["search_range"]),
-    )
-
-    return np.asarray(scores, dtype=np.float32), np.asarray(offsets, dtype=np.int32)
-
-
-def fast_profile_score_orientations(left_bundle: dict, right_bundle: dict, strand_pairs, options: dict):
-    """Compute profile similarity for all strand-indexed orientation pairs in one call."""
-    min_value = float(options.get("min_value", 0.0))
-    prepared_left = _prepare_profile_bundle_for_scoring(left_bundle, min_value)
-    prepared_right = _prepare_profile_bundle_for_scoring(right_bundle, min_value)
-    return _score_prepared_profile_orientations(prepared_left, prepared_right, strand_pairs, options)
+    dots = np.sum(values_x * values_y, axis=1)
+    norms = np.linalg.norm(values_x, axis=1) * np.linalg.norm(values_y, axis=1)
+    out = np.full(values_x.shape[0], np.nan, dtype=np.float32)
+    valid = norms > eps
+    out[valid] = dots[valid] / norms[valid]
+    return out
 
 
 def format_params(params: dict) -> str:

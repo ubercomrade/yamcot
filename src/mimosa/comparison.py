@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
 from typing import Callable, Literal, Optional, TypedDict
 
 import numpy as np
-from numba import get_num_threads, set_num_threads
+from joblib import Parallel, delayed
+from numba import njit
 from scipy.ndimage import convolve1d
 
 from mimosa.batches import (
@@ -21,11 +21,12 @@ from mimosa.batches import (
 )
 from mimosa.cache import ProfileCacheSpec, fingerprint_batch, fingerprint_model, load_profile_cache, store_profile_cache
 from mimosa.functions import (
-    _prepare_profile_bundle_for_scoring,
-    _score_prepared_profile_orientations,
     apply_score_log_tail_table_to_profile_bundle,
-    build_profile_score_options,
     build_score_log_tail_table,
+    calc_co,
+    calc_dice,
+    prepare_profile_bundle,
+    rowwise_cosine,
     scores_to_empirical_log_tail_bundle,
 )
 from mimosa.models import (
@@ -37,6 +38,7 @@ from mimosa.validation import (
     validate_cache_mode,
     validate_kernel_size_range,
     validate_non_negative,
+    validate_non_negative_int,
     validate_optional_thread_count,
     validate_pfm_top_fraction,
     validate_profile_normalization,
@@ -60,10 +62,12 @@ class ComparatorConfig(TypedDict):
     min_kernel_size: int
     max_kernel_size: int
     min_logfpr: Optional[float]
+    window_radius: int
+    realign_window: int
     profile_normalization: str
     cache_mode: str
     cache_dir: str
-    promoters: Optional[SequenceBatch]
+    background: Optional[SequenceBatch]
 
 
 class ComparisonResult(TypedDict, total=False):
@@ -73,6 +77,7 @@ class ComparisonResult(TypedDict, total=False):
     offset: int
     orientation: str
     metric: str
+    n_sites: int
 
 
 ORIENTATION_TIEBREAK = {"++": 0, "+-": 1, "-+": 2, "--": 3}
@@ -83,19 +88,13 @@ SIMILARITY_EPS = 1e-9
 SURROGATE_SMOOTH_FILTER = np.array([0.25, 0.5, 0.25], dtype=np.float32)
 SURROGATE_SIGN_FLIP_PROBABILITY = 0.5
 
-PROFILE_NORMALIZATION_REGISTRY = {
-    "empirical_log_tail": {
-        "fit": build_score_log_tail_table,
-        "apply_bundle": apply_score_log_tail_table_to_profile_bundle,
-        "normalize_bundle": scores_to_empirical_log_tail_bundle,
-    },
-}
 PROFILE_ORIENTATION_PAIRS = (
     ("++", PLUS_STRAND, PLUS_STRAND),
     ("--", MINUS_STRAND, MINUS_STRAND),
     ("+-", PLUS_STRAND, MINUS_STRAND),
     ("-+", MINUS_STRAND, PLUS_STRAND),
 )
+SUPPORTED_PROFILE_NORMALIZATIONS = {"empirical_log_tail"}
 
 registry: dict[str, Callable] = {}
 
@@ -133,20 +132,27 @@ def create_comparator_config(**kwargs) -> ComparatorConfig:
         "min_kernel_size": 3,
         "max_kernel_size": 11,
         "min_logfpr": None,
+        "window_radius": 10,
+        "realign_window": 3,
         "profile_normalization": "empirical_log_tail",
         "cache_mode": "off",
         "cache_dir": ".mimosa-cache",
-        "promoters": None,
+        "background": None,
     }
     config = {**defaults, **kwargs}
+    legacy_background = config.pop("promoters", None)
+    if "background" not in kwargs and legacy_background is not None:
+        config["background"] = legacy_background
     config["metric"] = _validate_metric(config["metric"])
     min_kernel_size, max_kernel_size = validate_kernel_size_range(config["min_kernel_size"], config["max_kernel_size"])
     config["min_kernel_size"] = min_kernel_size
     config["max_kernel_size"] = max_kernel_size
     config["min_logfpr"] = validate_non_negative("min_logfpr", config.get("min_logfpr"))
+    config["window_radius"] = validate_non_negative_int("window_radius", config.get("window_radius", 10))
+    config["realign_window"] = validate_non_negative_int("realign_window", config.get("realign_window", 3))
     config["profile_normalization"] = validate_profile_normalization(
         config.get("profile_normalization", "empirical_log_tail"),
-        PROFILE_NORMALIZATION_REGISTRY,
+        SUPPORTED_PROFILE_NORMALIZATIONS,
     )
     config["numba_threads"] = validate_optional_thread_count("numba_threads", config.get("numba_threads"))
     config["pfm_top_fraction"] = (
@@ -155,22 +161,6 @@ def create_comparator_config(**kwargs) -> ComparatorConfig:
     config["cache_mode"] = validate_cache_mode(config.get("cache_mode", "off"))
     return config
 
-
-@contextmanager
-def _numba_thread_scope(numba_threads: int | None):
-    """Apply one temporary numba thread setting for the current process."""
-    if numba_threads is None:
-        yield
-        return
-
-    previous_threads = get_num_threads()
-    set_num_threads(numba_threads)
-    try:
-        yield
-    finally:
-        set_num_threads(previous_threads)
-
-
 def _select_best_orientation(candidates):
     """Choose the highest-scoring orientation with deterministic tie-breaking."""
     return max(
@@ -178,18 +168,9 @@ def _select_best_orientation(candidates):
     )
 
 
-def _get_profile_calibration_sequences(sequences, cfg: ComparatorConfig):
+def _get_profile_background_sequences(sequences, cfg: ComparatorConfig):
     """Return the sequence collection used to fit profile normalization."""
-    return cfg.get("promoters") if cfg.get("promoters") is not None else sequences
-
-
-def _get_profile_normalization_strategy(name: str) -> dict:
-    """Resolve one registered profile-normalization strategy."""
-    try:
-        return PROFILE_NORMALIZATION_REGISTRY[name]
-    except KeyError as exc:
-        available = ", ".join(sorted(PROFILE_NORMALIZATION_REGISTRY))
-        raise ValueError(f"Unsupported profile normalization: {name}. Available: {available}") from exc
+    return cfg.get("background") if cfg.get("background") is not None else sequences
 
 
 def _cached_batch_fingerprint(runtime_cache: dict, batch, label: str) -> str:
@@ -220,61 +201,54 @@ def _resolve_raw_profile_bundle(model: GenericModel, sequences, runtime_cache: d
 
 
 def _fit_profile_normalizer(
-    model: GenericModel, calibration_sequences, cfg: ComparatorConfig, runtime_cache: dict | None = None
+    model: GenericModel, background_sequences, cfg: ComparatorConfig, runtime_cache: dict | None = None
 ):
     """Fit normalization parameters from the calibration score sample."""
     runtime_cache = {} if runtime_cache is None else runtime_cache
-    calibration_fp = _cached_batch_fingerprint(runtime_cache, calibration_sequences, "calibration")
-    runtime_key = ("profile_normalizer", fingerprint_model(model), cfg["profile_normalization"], calibration_fp)
+    background_fp = _cached_batch_fingerprint(runtime_cache, background_sequences, "background")
+    runtime_key = ("profile_normalizer", fingerprint_model(model), cfg["profile_normalization"], background_fp)
     if runtime_key in runtime_cache:
         return runtime_cache[runtime_key]
 
-    calibration_bundle = _resolve_raw_profile_bundle(model, calibration_sequences, runtime_cache)
-    calibration_sample = flatten_profile_bundle(calibration_bundle)
-    strategy = _get_profile_normalization_strategy(cfg["profile_normalization"])
-    normalizer = (cfg["profile_normalization"], strategy["fit"](calibration_sample))
+    background_bundle = _resolve_raw_profile_bundle(model, background_sequences, runtime_cache)
+    calibration_sample = flatten_profile_bundle(background_bundle)
+    if cfg["profile_normalization"] != "empirical_log_tail":
+        raise ValueError(f"Unsupported profile normalization: {cfg['profile_normalization']}")
+
+    normalizer = build_score_log_tail_table(calibration_sample)
     runtime_cache[runtime_key] = normalizer
     return normalizer
 
 
-def _apply_profile_normalizer(profile_bundle, normalizer):
+def _apply_profile_normalizer(profile_bundle, normalizer, profile_normalization: str):
     """Apply fitted normalization parameters to one raw profile bundle."""
-    strategy_name, params = normalizer
-    strategy = _get_profile_normalization_strategy(strategy_name)
-    return strategy["apply_bundle"](profile_bundle, params)
-
-
-def _build_profile_score_options(cfg: ComparatorConfig) -> dict:
-    """Build one profile-scoring options dictionary from comparator config."""
-    return build_profile_score_options(
-        search_range=cfg["search_range"],
-        min_value=0.0 if cfg["min_logfpr"] is None else float(cfg["min_logfpr"]),
-        metric=cfg["metric"],
-    )
+    if profile_normalization != "empirical_log_tail":
+        raise ValueError(f"Unsupported profile normalization: {profile_normalization}")
+    return apply_score_log_tail_table_to_profile_bundle(profile_bundle, normalizer)
 
 
 def _build_profile_cache_spec(
-    model: GenericModel, sequences, calibration_sequences, cfg: ComparatorConfig, profile_kind: str
+    model: GenericModel, sequences, background_sequences, cfg: ComparatorConfig, profile_kind: str
 ) -> ProfileCacheSpec:
     """Build one cache descriptor for a normalized profile bundle."""
     return {
         "model": model,
         "sequences": sequences,
-        "promoters": calibration_sequences,
+        "background": background_sequences,
         "profile_kind": profile_kind,
         "cache_dir": cfg["cache_dir"],
     }
 
 
 def _resolve_profile_bundle(
-    model: GenericModel, sequences, calibration_sequences, cfg: ComparatorConfig, runtime_cache: dict | None = None
+    model: GenericModel, sequences, background_sequences, cfg: ComparatorConfig, runtime_cache: dict | None = None
 ):
     """Resolve one model to the normalized strand-aware profile bundle used in profile comparisons."""
     runtime_cache = {} if runtime_cache is None else runtime_cache
     profile_kind = cfg["profile_normalization"]
     sequence_fp = _cached_batch_fingerprint(runtime_cache, sequences, "sequences")
-    calibration_fp = _cached_batch_fingerprint(runtime_cache, calibration_sequences, "calibration")
-    runtime_key = (fingerprint_model(model), profile_kind, sequence_fp, calibration_fp)
+    background_fp = _cached_batch_fingerprint(runtime_cache, background_sequences, "background")
+    runtime_key = (fingerprint_model(model), profile_kind, sequence_fp, background_fp)
 
     cached = runtime_cache.get(runtime_key)
     if cached is not None:
@@ -282,7 +256,7 @@ def _resolve_profile_bundle(
 
     cache_spec = None
     if cfg["cache_mode"] == "on":
-        cache_spec = _build_profile_cache_spec(model, sequences, calibration_sequences, cfg, profile_kind)
+        cache_spec = _build_profile_cache_spec(model, sequences, background_sequences, cfg, profile_kind)
         cached = load_profile_cache(cache_spec)
         if cached is not None:
             runtime_cache[runtime_key] = cached
@@ -290,8 +264,8 @@ def _resolve_profile_bundle(
             return cached
 
     raw_bundle = _resolve_raw_profile_bundle(model, sequences, runtime_cache)
-    normalizer = _fit_profile_normalizer(model, calibration_sequences, cfg, runtime_cache)
-    profile_bundle = _apply_profile_normalizer(raw_bundle, normalizer)
+    normalizer = _fit_profile_normalizer(model, background_sequences, cfg, runtime_cache)
+    profile_bundle = _apply_profile_normalizer(raw_bundle, normalizer, profile_kind)
     runtime_cache[runtime_key] = profile_bundle
 
     if cache_spec is not None:
@@ -304,42 +278,450 @@ def _resolve_profile_bundle(
 def _prepare_profile_model(
     model: GenericModel,
     sequences,
-    calibration_sequences,
+    background_sequences,
     cfg: ComparatorConfig,
-    score_options: dict,
     runtime_cache: dict | None = None,
 ):
-    """Resolve normalized and prepared profile bundles for one model."""
-    bundle = _resolve_profile_bundle(model, sequences, calibration_sequences, cfg, runtime_cache)
-    prepared = _prepare_profile_bundle_for_scoring(bundle, float(score_options["min_value"]))
-    return bundle, prepared
+    """Resolve one normalized profile bundle in a contiguous scoring layout."""
+    bundle = _resolve_profile_bundle(model, sequences, background_sequences, cfg, runtime_cache)
+    return prepare_profile_bundle(bundle)
 
 
-def _score_prepared_profile_pair(
-    prepared_query_bundle: dict,
-    prepared_target_bundle: dict,
-    score_options: dict,
-) -> dict:
-    """Score one prepared profile pair and return the best orientation candidate."""
-    orientation_scores, orientation_offsets = _score_prepared_profile_orientations(
-        prepared_query_bundle,
-        prepared_target_bundle,
-        [(query_strand, target_strand) for _, query_strand, target_strand in PROFILE_ORIENTATION_PAIRS],
-        score_options,
+def _build_window_offsets(window_radius: int) -> np.ndarray:
+    """Return symmetric integer offsets for one site-centered window."""
+    radius = int(window_radius)
+    return np.arange(-radius, radius + 1, dtype=np.int32)
+
+
+def _empty_positions() -> tuple[np.ndarray, np.ndarray]:
+    """Return one empty anchor payload."""
+    empty = np.empty(0, dtype=np.int32)
+    return empty, empty
+
+
+@njit(cache=True)
+def _collect_best_anchor_positions_numba(scores: np.ndarray, lengths: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Collect one best anchor per row."""
+    n_rows = scores.shape[0]
+    rows = np.empty(n_rows, dtype=np.int32)
+    positions = np.empty(n_rows, dtype=np.int32)
+    out_index = 0
+
+    for row_index in range(n_rows):
+        length = int(lengths[row_index])
+        if length <= 0:
+            continue
+
+        best_position = 0
+        best_score = scores[row_index, 0]
+        for pos in range(1, length):
+            score = scores[row_index, pos]
+            if score > best_score:
+                best_score = score
+                best_position = pos
+
+        rows[out_index] = row_index
+        positions[out_index] = best_position
+        out_index += 1
+
+    return rows[:out_index], positions[:out_index]
+
+
+@njit(cache=True)
+def _count_threshold_anchor_positions_numba(scores: np.ndarray, lengths: np.ndarray, score_threshold: float) -> int:
+    """Count threshold-selected anchors."""
+    total = 0
+    for row_index in range(scores.shape[0]):
+        length = int(lengths[row_index])
+        for pos in range(length):
+            if scores[row_index, pos] >= score_threshold:
+                total += 1
+    return total
+
+
+@njit(cache=True)
+def _collect_threshold_anchor_positions_numba(
+    scores: np.ndarray,
+    lengths: np.ndarray,
+    score_threshold: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Collect all anchors at or above the configured threshold."""
+    total = _count_threshold_anchor_positions_numba(scores, lengths, score_threshold)
+    rows = np.empty(total, dtype=np.int32)
+    positions = np.empty(total, dtype=np.int32)
+    out_index = 0
+
+    for row_index in range(scores.shape[0]):
+        length = int(lengths[row_index])
+        for pos in range(length):
+            if scores[row_index, pos] >= score_threshold:
+                rows[out_index] = row_index
+                positions[out_index] = pos
+                out_index += 1
+
+    return rows, positions
+
+
+def _collect_anchor_sites(
+    scores: np.ndarray,
+    lengths: np.ndarray,
+    score_threshold: float | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Collect site anchors in best or threshold mode for one strand-specific score matrix."""
+    scores_array = np.ascontiguousarray(scores, dtype=np.float32)
+    lengths_array = np.ascontiguousarray(lengths, dtype=np.int32)
+    if scores_array.shape[0] == 0:
+        return _empty_positions()
+    if score_threshold is None:
+        return _collect_best_anchor_positions_numba(scores_array, lengths_array)
+    return _collect_threshold_anchor_positions_numba(scores_array, lengths_array, float(score_threshold))
+
+
+def _filter_window_positions(
+    rows: np.ndarray,
+    pos1: np.ndarray,
+    pos2: np.ndarray,
+    lengths1: np.ndarray,
+    lengths2: np.ndarray,
+    min_offset: int,
+    max_offset: int,
+) -> np.ndarray:
+    """Return the mask of anchors whose full windows fit in both profiles."""
+    if rows.size == 0:
+        return np.zeros(0, dtype=bool)
+
+    row_lengths1 = lengths1[rows]
+    row_lengths2 = lengths2[rows]
+
+    return (
+        (pos1 + min_offset >= 0)
+        & (pos1 + max_offset < row_lengths1)
+        & (pos2 + min_offset >= 0)
+        & (pos2 + max_offset < row_lengths2)
     )
-    candidates = []
-    for (orientation, _query_strand, target_strand), score, offset in zip(
-        PROFILE_ORIENTATION_PAIRS, orientation_scores, orientation_offsets, strict=False
-    ):
-        candidates.append(
-            {
-                "orientation": orientation,
-                "score": float(score),
-                "offset": int(offset),
-                "target_strand": int(target_strand),
-            }
+
+
+def _empty_candidate_triplets() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return one empty candidate payload."""
+    empty = np.empty(0, dtype=np.int32)
+    return empty, empty, empty
+
+
+def _collect_model1_window_candidates(
+    anchor_rows: np.ndarray,
+    anchor_pos1: np.ndarray,
+    lengths1: np.ndarray,
+    lengths2: np.ndarray,
+    shift: int,
+    min_offset: int,
+    max_offset: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Collect valid windows centered on model1 anchors."""
+    if anchor_rows.size == 0:
+        return _empty_candidate_triplets()
+
+    pos2 = anchor_pos1 + int(shift)
+    valid = _filter_window_positions(anchor_rows, anchor_pos1, pos2, lengths1, lengths2, min_offset, max_offset)
+    if not np.any(valid):
+        return _empty_candidate_triplets()
+
+    return anchor_rows[valid], anchor_pos1[valid], pos2[valid]
+
+
+@njit(cache=True)
+def _collect_model2_window_candidates_numba(
+    scores1: np.ndarray,
+    lengths1: np.ndarray,
+    lengths2: np.ndarray,
+    anchor_rows: np.ndarray,
+    anchor_pos2: np.ndarray,
+    shift: int,
+    realign_window: int,
+    min_offset: int,
+    max_offset: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Collect valid windows centered on model2 anchors and realigned on model1."""
+    size = anchor_rows.shape[0]
+    rows = np.empty(size, dtype=np.int32)
+    pos1 = np.empty(size, dtype=np.int32)
+    pos2 = np.empty(size, dtype=np.int32)
+    out_index = 0
+
+    for candidate_index in range(size):
+        row = int(anchor_rows[candidate_index])
+        row_length1 = int(lengths1[row])
+        row_length2 = int(lengths2[row])
+        if row_length1 <= 0 or row_length2 <= 0:
+            continue
+
+        expected_pos1 = int(anchor_pos2[candidate_index]) - shift
+        left = max(0, expected_pos1 - realign_window)
+        right = min(row_length1 - 1, expected_pos1 + realign_window)
+        if left > right:
+            continue
+
+        best_pos1 = left
+        best_score = scores1[row, left]
+        for pos in range(left + 1, right + 1):
+            score = scores1[row, pos]
+            if score > best_score:
+                best_score = score
+                best_pos1 = pos
+
+        aligned_pos2 = best_pos1 + shift
+        if (
+            best_pos1 + min_offset < 0
+            or best_pos1 + max_offset >= row_length1
+            or aligned_pos2 + min_offset < 0
+            or aligned_pos2 + max_offset >= row_length2
+        ):
+            continue
+
+        rows[out_index] = row
+        pos1[out_index] = best_pos1
+        pos2[out_index] = aligned_pos2
+        out_index += 1
+
+    return rows[:out_index], pos1[:out_index], pos2[:out_index]
+
+
+def _collect_model2_window_candidates(
+    scores1: np.ndarray,
+    lengths1: np.ndarray,
+    lengths2: np.ndarray,
+    anchor_rows: np.ndarray,
+    anchor_pos2: np.ndarray,
+    shift: int,
+    min_offset: int,
+    max_offset: int,
+    realign_window: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Collect valid windows centered on model2 anchors and realigned on model1."""
+    if anchor_rows.size == 0:
+        return _empty_candidate_triplets()
+
+    return _collect_model2_window_candidates_numba(
+        np.ascontiguousarray(scores1, dtype=np.float32),
+        np.ascontiguousarray(lengths1, dtype=np.int32),
+        np.ascontiguousarray(lengths2, dtype=np.int32),
+        np.ascontiguousarray(anchor_rows, dtype=np.int32),
+        np.ascontiguousarray(anchor_pos2, dtype=np.int32),
+        int(shift),
+        int(realign_window),
+        int(min_offset),
+        int(max_offset),
+    )
+
+
+def _merge_window_candidates(
+    candidate_set1: tuple[np.ndarray, np.ndarray, np.ndarray],
+    candidate_set2: tuple[np.ndarray, np.ndarray, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Merge model-derived candidates with OR semantics and deterministic deduplication."""
+    rows1, pos1_1, pos2_1 = candidate_set1
+    rows2, pos1_2, pos2_2 = candidate_set2
+
+    if rows1.size == 0:
+        return rows2, pos1_2, pos2_2
+    if rows2.size == 0:
+        return rows1, pos1_1, pos2_1
+
+    rows = np.concatenate((rows1, rows2))
+    pos1 = np.concatenate((pos1_1, pos1_2))
+    pos2 = np.concatenate((pos2_1, pos2_2))
+
+    order = np.lexsort((pos2, pos1, rows))
+    rows = rows[order]
+    pos1 = pos1[order]
+    pos2 = pos2[order]
+
+    keep = np.ones(rows.size, dtype=bool)
+    keep[1:] = (rows[1:] != rows[:-1]) | (pos1[1:] != pos1[:-1]) | (pos2[1:] != pos2[:-1])
+    return rows[keep], pos1[keep], pos2[keep]
+
+
+def _extract_selected_windows(
+    scores: np.ndarray,
+    rows: np.ndarray,
+    positions: np.ndarray,
+    offsets: np.ndarray,
+) -> np.ndarray:
+    """Extract one dense window matrix from selected rows and positions."""
+    if rows.size == 0:
+        return np.empty((0, offsets.size), dtype=np.float32)
+    cols = positions[:, None] + offsets[None, :]
+    return np.asarray(scores[rows[:, None], cols], dtype=np.float32)
+
+
+def _score_window_collection(metric: str, windows1: np.ndarray, windows2: np.ndarray) -> float:
+    """Score one selected window collection with the requested profile metric."""
+    if windows1.shape != windows2.shape:
+        raise ValueError("Window collections must have identical shapes.")
+    if windows1.size == 0:
+        return 0.0
+    if metric == "co":
+        return calc_co(windows1, windows2)
+    if metric == "dice":
+        return calc_dice(windows1, windows2)
+    if metric != "cosine":
+        raise ValueError("metric must be one of: 'co', 'dice', 'cosine'")
+
+    values = rowwise_cosine(windows1, windows2)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return 0.0
+    return float(np.mean(finite))
+
+
+def _compute_shifted_window_alignment(
+    scores1: np.ndarray,
+    lengths1: np.ndarray,
+    scores2: np.ndarray,
+    lengths2: np.ndarray,
+    shift: int,
+    offsets: np.ndarray,
+    min_offset: int,
+    max_offset: int,
+    query_anchors: tuple[np.ndarray, np.ndarray],
+    target_anchors: tuple[np.ndarray, np.ndarray],
+    realign_window: int,
+    metric: str,
+) -> dict[str, int | float]:
+    """Evaluate one shift for one oriented pair of normalized score profiles."""
+    model1_candidates = _collect_model1_window_candidates(
+        query_anchors[0],
+        query_anchors[1],
+        lengths1,
+        lengths2,
+        shift,
+        min_offset,
+        max_offset,
+    )
+    model2_candidates = _collect_model2_window_candidates(
+        scores1,
+        lengths1,
+        lengths2,
+        target_anchors[0],
+        target_anchors[1],
+        shift,
+        min_offset,
+        max_offset,
+        realign_window,
+    )
+    rows, pos1, pos2 = _merge_window_candidates(model1_candidates, model2_candidates)
+    if rows.size == 0:
+        return {"score": 0.0, "shift": int(shift), "n_sites": 0}
+
+    windows1 = _extract_selected_windows(scores1, rows, pos1, offsets)
+    windows2 = _extract_selected_windows(scores2, rows, pos2, offsets)
+    return {
+        "score": _score_window_collection(metric, windows1, windows2),
+        "shift": int(shift),
+        "n_sites": int(rows.size),
+    }
+
+
+def _score_profile_orientation_pair(
+    query_bundle: dict,
+    target_bundle: dict,
+    query_strand: int,
+    target_strand: int,
+    offsets: np.ndarray,
+    min_offset: int,
+    max_offset: int,
+    query_anchors: tuple[np.ndarray, np.ndarray],
+    target_anchors: tuple[np.ndarray, np.ndarray],
+    cfg: ComparatorConfig,
+) -> dict:
+    """Score one profile orientation across all tested shifts."""
+    query_scores = query_bundle["values"][query_strand]
+    target_scores = target_bundle["values"][target_strand]
+    query_lengths = query_bundle["lengths"]
+    target_lengths = target_bundle["lengths"]
+
+    if query_scores.shape[0] != target_scores.shape[0]:
+        raise ValueError("Profile bundles must have the same number of rows.")
+
+    best = {"score": 0.0, "shift": 0, "n_sites": 0}
+    for shift in range(-int(cfg["search_range"]), int(cfg["search_range"]) + 1):
+        candidate = _compute_shifted_window_alignment(
+            query_scores,
+            query_lengths,
+            target_scores,
+            target_lengths,
+            shift,
+            offsets,
+            min_offset,
+            max_offset,
+            query_anchors,
+            target_anchors,
+            int(cfg["realign_window"]),
+            str(cfg["metric"]),
         )
-    return _select_best_orientation(candidates)
+        if (
+            float(candidate["score"]) > float(best["score"])
+            or (
+                float(candidate["score"]) == float(best["score"])
+                and (
+                    int(candidate["n_sites"]) > int(best["n_sites"])
+                    or (
+                        int(candidate["n_sites"]) == int(best["n_sites"])
+                        and abs(int(candidate["shift"])) < abs(int(best["shift"]))
+                    )
+                )
+            )
+        ):
+            best = candidate
+
+    return {
+        "score": float(best["score"]),
+        "shift": int(best["shift"]),
+        "n_sites": int(best["n_sites"]),
+        "target_strand": int(target_strand),
+    }
+
+
+def _score_profile_candidates(query_bundle: dict, target_bundle: dict, pair_specs, cfg: ComparatorConfig) -> list[dict]:
+    """Score all requested orientation pairs with the window-based profile algorithm."""
+    score_threshold = None if cfg["min_logfpr"] is None else float(cfg["min_logfpr"])
+    offsets = _build_window_offsets(int(cfg["window_radius"]))
+    min_offset = -int(cfg["window_radius"])
+    max_offset = int(cfg["window_radius"])
+    query_strands = {int(query_strand) for _, query_strand, _ in pair_specs}
+    target_strands = {int(target_strand) for _, _, target_strand in pair_specs}
+    query_anchor_cache = {
+        strand_index: _collect_anchor_sites(
+            query_bundle["values"][strand_index],
+            query_bundle["lengths"],
+            score_threshold,
+        )
+        for strand_index in query_strands
+    }
+    target_anchor_cache = {
+        strand_index: _collect_anchor_sites(
+            target_bundle["values"][strand_index],
+            target_bundle["lengths"],
+            score_threshold,
+        )
+        for strand_index in target_strands
+    }
+    candidates = []
+    for orientation, query_strand, target_strand in pair_specs:
+        best = _score_profile_orientation_pair(
+            query_bundle,
+            target_bundle,
+            int(query_strand),
+            int(target_strand),
+            offsets,
+            min_offset,
+            max_offset,
+            query_anchor_cache[int(query_strand)],
+            target_anchor_cache[int(target_strand)],
+            cfg,
+        )
+        best["orientation"] = orientation
+        candidates.append(best)
+    return candidates
 
 
 def _build_profile_result(query_name: str, target_name: str, best: dict, metric: str) -> ComparisonResult:
@@ -348,18 +730,18 @@ def _build_profile_result(query_name: str, target_name: str, best: dict, metric:
         "query": query_name,
         "target": target_name,
         "score": float(best["score"]),
-        "offset": -int(best["offset"]),
+        "offset": -int(best["shift"]),
         "orientation": best["orientation"],
         "metric": metric,
+        "n_sites": int(best["n_sites"]),
     }
 
 
 def _attach_profile_null_statistics(
     result: dict,
-    prepared_query_bundle: dict,
+    query_bundle: dict,
     target_bundle: dict,
     best_target_strand: int,
-    score_options: dict,
     cfg: ComparatorConfig,
 ) -> None:
     """Attach Monte Carlo statistics for one profile comparison result."""
@@ -369,16 +751,16 @@ def _attach_profile_null_statistics(
     obs_score = float(result["score"])
     best_target_profile = profile_view(target_bundle, best_target_strand)
 
+    orientation_pairs = (
+        [("++", PLUS_STRAND, 0), ("-+", MINUS_STRAND, 0)]
+        if best_target_strand == PLUS_STRAND
+        else [("+-", PLUS_STRAND, 0), ("--", MINUS_STRAND, 0)]
+    )
+
     def surrogate_gen(rng):
         surrogate_bundle = _create_surrogate_bundle(best_target_profile, rng, cfg)
-        prepared_surrogate = _prepare_profile_bundle_for_scoring(surrogate_bundle, float(score_options["min_value"]))
-        scores, _ = _score_prepared_profile_orientations(
-            prepared_query_bundle,
-            prepared_surrogate,
-            [(PLUS_STRAND, 0), (MINUS_STRAND, 0)],
-            score_options,
-        )
-        return float(np.max(scores, initial=0.0))
+        candidates = _score_profile_candidates(query_bundle, surrogate_bundle, orientation_pairs, cfg)
+        return float(_select_best_orientation(candidates)["score"])
 
     nulls, null_mean, null_std = run_montecarlo(
         lambda value: value,
@@ -390,7 +772,7 @@ def _attach_profile_null_statistics(
 
 
 def _create_surrogate_bundle(profile, rng: np.random.Generator, cfg: ComparatorConfig):
-    """Generate one surrogate single-profile bundle by row-wise convolution and renormalization."""
+    """Generate one surrogate single-profile bundle by vectorized convolution and renormalization."""
     min_kernel_size = int(cfg["min_kernel_size"])
     max_kernel_size = int(cfg["max_kernel_size"])
     first_odd = min_kernel_size if min_kernel_size % 2 == 1 else min_kernel_size + 1
@@ -410,17 +792,19 @@ def _create_surrogate_bundle(profile, rng: np.random.Generator, cfg: ComparatorC
         final_kernel = -final_kernel
     final_kernel /= np.linalg.norm(final_kernel) + 1e-8
 
-    convolved = np.full(profile["values"].shape, SCORE_PADDING, dtype=np.float32)
-    for row_index, length in enumerate(profile["lengths"]):
-        current_length = int(length)
-        if current_length == 0:
-            continue
-        segment = profile["values"][row_index, :current_length]
-        convolved[row_index, :current_length] = convolve1d(segment, final_kernel, axis=0, mode="constant", cval=0.0)
+    values = np.asarray(profile["values"], dtype=np.float32)
+    convolved = convolve1d(values, final_kernel, axis=1, mode="constant", cval=0.0)
+    mask = np.arange(convolved.shape[1], dtype=np.int32)[None, :] < np.asarray(
+        profile["lengths"],
+        dtype=np.int32,
+    )[:, None]
+    convolved = np.asarray(convolved, dtype=np.float32)
+    convolved[~mask] = SCORE_PADDING
 
-    strategy = _get_profile_normalization_strategy(cfg["profile_normalization"])
     surrogate = pack_profile_bundle(convolved[None, ...], profile["lengths"], SCORE_PADDING)
-    return strategy["normalize_bundle"](surrogate)
+    if cfg["profile_normalization"] != "empirical_log_tail":
+        raise ValueError(f"Unsupported profile normalization: {cfg['profile_normalization']}")
+    return scores_to_empirical_log_tail_bundle(surrogate)
 
 
 def run_montecarlo(obs_score_func: Callable, surrogate_generator_func: Callable, n_permutations: int, seed, *args):
@@ -721,24 +1105,18 @@ def strategy_motif(model1: GenericModel, model2: GenericModel, sequences, cfg: C
 def strategy_profile(
     model1: GenericModel, model2: GenericModel, sequences, cfg: ComparatorConfig
 ) -> ComparisonResult:
-    """Dense masked profile comparison strategy (CO/Dice similarity)."""
+    """Window-based profile comparison strategy (CO/Dice/Cosine similarity)."""
     runtime_cache = {}
-    calibration_sequences = _get_profile_calibration_sequences(sequences, cfg)
-    score_options = _build_profile_score_options(cfg)
-    _query_bundle, prepared_bundle1 = _prepare_profile_model(
-        model1, sequences, calibration_sequences, cfg, score_options, runtime_cache
-    )
-    bundle2, prepared_bundle2 = _prepare_profile_model(
-        model2, sequences, calibration_sequences, cfg, score_options, runtime_cache
-    )
-    best = _score_prepared_profile_pair(prepared_bundle1, prepared_bundle2, score_options)
+    background_sequences = _get_profile_background_sequences(sequences, cfg)
+    bundle1 = _prepare_profile_model(model1, sequences, background_sequences, cfg, runtime_cache)
+    bundle2 = _prepare_profile_model(model2, sequences, background_sequences, cfg, runtime_cache)
+    best = _select_best_orientation(_score_profile_candidates(bundle1, bundle2, PROFILE_ORIENTATION_PAIRS, cfg))
     result = _build_profile_result(model1.name, model2.name, best, cfg["metric"])
     _attach_profile_null_statistics(
         result,
-        prepared_bundle1,
+        bundle1,
         bundle2,
         int(best["target_strand"]),
-        score_options,
         cfg,
     )
     return result
@@ -751,58 +1129,108 @@ def _compare_motif_one_to_many(
     cfg: ComparatorConfig,
 ) -> list[dict]:
     """Compare one motif query against many targets while reusing prepared query state."""
+    target_list = list(target_models)
+    if not target_list:
+        return []
+
     query_cache = {}
-    results = []
-    for target_model in target_models:
-        target_cache = {}
-        use_pfm_mode = cfg["pfm_mode"] or (query_model.type_key != target_model.type_key)
+    use_pfm_modes = {
+        bool(cfg["pfm_mode"] or (query_model.type_key != target_model.type_key))
+        for target_model in target_list
+    }
+    prepared_query_by_mode = {}
+    for use_pfm_mode in use_pfm_modes:
         _query_matrix, prepared_query = _prepare_motif_model(query_model, sequences, cfg, use_pfm_mode, query_cache)
-        target_matrix, prepared_target = _prepare_motif_model(target_model, sequences, cfg, use_pfm_mode, target_cache)
-        best = _score_prepared_motif_pair(prepared_query, prepared_target, cfg["metric"])
-        result = _build_motif_result(query_model.name, target_model.name, best, cfg["metric"])
-        _attach_motif_null_statistics(result, prepared_query, target_matrix, cfg)
-        results.append(result)
-    return results
+        prepared_query_by_mode[use_pfm_mode] = prepared_query
+
+    def _score_target(target_model: GenericModel) -> dict:
+        target_cache = {}
+        try:
+            use_pfm_mode = bool(cfg["pfm_mode"] or (query_model.type_key != target_model.type_key))
+            prepared_query = prepared_query_by_mode[use_pfm_mode]
+            target_matrix, prepared_target = _prepare_motif_model(
+                target_model,
+                sequences,
+                cfg,
+                use_pfm_mode,
+                target_cache,
+            )
+            best = _score_prepared_motif_pair(prepared_query, prepared_target, cfg["metric"])
+            result = _build_motif_result(query_model.name, target_model.name, best, cfg["metric"])
+            _attach_motif_null_statistics(result, prepared_query, target_matrix, cfg)
+            return result
+        finally:
+            target_cache.clear()
+
+    return _run_target_comparisons(target_list, cfg["numba_threads"], _score_target)
 
 
 def _compare_profile_one_to_many(
     query_model: GenericModel, target_models, sequences, cfg: ComparatorConfig
 ) -> list[dict]:
-    """Compare one profile query against many targets while reusing prepared query state."""
+    """Compare one profile query against many targets while reusing normalized query profiles."""
+    target_list = list(target_models)
+    if not target_list:
+        return []
+
     query_cache = {}
-    calibration_sequences = _get_profile_calibration_sequences(sequences, cfg)
-    score_options = _build_profile_score_options(cfg)
-    _query_bundle, prepared_query = _prepare_profile_model(
+    background_sequences = _get_profile_background_sequences(sequences, cfg)
+    query_bundle = _prepare_profile_model(
         query_model,
         sequences,
-        calibration_sequences,
+        background_sequences,
         cfg,
-        score_options,
         query_cache,
     )
-    results = []
-    for target_model in target_models:
+
+    def _score_target(target_model: GenericModel) -> dict:
         target_cache = {}
-        target_bundle, prepared_target = _prepare_profile_model(
-            target_model,
-            sequences,
-            calibration_sequences,
-            cfg,
-            score_options,
-            target_cache,
-        )
-        best = _score_prepared_profile_pair(prepared_query, prepared_target, score_options)
-        result = _build_profile_result(query_model.name, target_model.name, best, cfg["metric"])
-        _attach_profile_null_statistics(
-            result,
-            prepared_query,
-            target_bundle,
-            int(best["target_strand"]),
-            score_options,
-            cfg,
-        )
-        results.append(result)
-    return results
+        try:
+            target_bundle = _prepare_profile_model(
+                target_model,
+                sequences,
+                background_sequences,
+                cfg,
+                target_cache,
+            )
+            best = _select_best_orientation(
+                _score_profile_candidates(query_bundle, target_bundle, PROFILE_ORIENTATION_PAIRS, cfg)
+            )
+            result = _build_profile_result(query_model.name, target_model.name, best, cfg["metric"])
+            _attach_profile_null_statistics(
+                result,
+                query_bundle,
+                target_bundle,
+                int(best["target_strand"]),
+                cfg,
+            )
+            return result
+        finally:
+            target_cache.clear()
+
+    return _run_target_comparisons(target_list, cfg["numba_threads"], _score_target)
+
+
+def _resolve_target_job_count(numba_threads: int | None) -> int:
+    """Resolve one target-level worker count from the compatibility config key."""
+    return -1 if numba_threads is None else int(numba_threads)
+
+
+def _run_target_comparisons(
+    target_models: list[GenericModel], numba_threads: int | None, worker: Callable
+) -> list[dict]:
+    """Execute one worker across targets sequentially or with joblib threads."""
+    if not target_models:
+        return []
+
+    n_jobs = _resolve_target_job_count(numba_threads)
+    if n_jobs == 1 or len(target_models) == 1:
+        return [worker(target_model) for target_model in target_models]
+
+    return Parallel(n_jobs=n_jobs, prefer="threads")(
+        delayed(worker)(target_model)
+        for target_model in target_models
+    )
 
 
 def compare(
@@ -811,7 +1239,7 @@ def compare(
     strategy: str,
     config: ComparatorConfig,
     sequences=None,
-    promoters=None,
+    background=None,
 ) -> dict:
     """Main entry point for motif comparison."""
     try:
@@ -821,10 +1249,9 @@ def compare(
         raise ValueError(f"Strategy '{strategy}' not found. Available: {available}") from exc
 
     effective_config = dict(config)
-    if promoters is not None:
-        effective_config["promoters"] = promoters
-    with _numba_thread_scope(effective_config.get("numba_threads")):
-        return strategy_fn(model1, model2, sequences, effective_config)
+    if background is not None:
+        effective_config["background"] = background
+    return strategy_fn(model1, model2, sequences, effective_config)
 
 
 def compare_one_to_many(
@@ -833,17 +1260,16 @@ def compare_one_to_many(
     strategy: str,
     config: ComparatorConfig,
     sequences=None,
-    promoters=None,
+    background=None,
 ) -> list[dict]:
     """Main entry point for one-vs-many motif comparison."""
     effective_config = dict(config)
-    if promoters is not None:
-        effective_config["promoters"] = promoters
+    if background is not None:
+        effective_config["background"] = background
 
-    with _numba_thread_scope(effective_config.get("numba_threads")):
-        if strategy == "profile":
-            return _compare_profile_one_to_many(query_model, target_models, sequences, effective_config)
-        if strategy == "motif":
-            return _compare_motif_one_to_many(query_model, target_models, sequences, effective_config)
-        available = ", ".join(sorted(registry))
-        raise ValueError(f"Strategy '{strategy}' not found. Available: {available}")
+    if strategy == "profile":
+        return _compare_profile_one_to_many(query_model, target_models, sequences, effective_config)
+    if strategy == "motif":
+        return _compare_motif_one_to_many(query_model, target_models, sequences, effective_config)
+    available = ", ".join(sorted(registry))
+    raise ValueError(f"Strategy '{strategy}' not found. Available: {available}")

@@ -28,12 +28,12 @@ def create_arg_parser() -> argparse.ArgumentParser:
 Examples:
   # Compare precomputed score profiles directly
   mimosa profile scores_1.fasta scores_2.fasta \
-    --model1-type scores --model2-type scores --metric co
+    --model1-type scores --model2-type scores --metric cosine
 
   # Compare motifs through sequence-derived profiles
   mimosa profile model1.meme model2.ihbcp \
     --model1-type pwm --model2-type bamm \
-    --fasta sequences.fa --metric co --min-logfpr 2
+    --fasta sequences.fa --metric co --min-logfpr 2 --window-radius 10
 
   # Direct motif comparison (former tomtom-like mode)
   mimosa motif model1.meme model2.pfm \
@@ -83,12 +83,13 @@ def _add_sequence_generation_arguments(
     fasta_help: str,
     num_sequences_default: int,
     seq_length_default: int,
-    promoters_help: str | None = None,
+    background_help: str | None = None,
 ) -> None:
     """Add FASTA- and random-sequence-related arguments."""
     io_group.add_argument("--fasta", help=fasta_help)
-    if promoters_help is not None:
-        io_group.add_argument("--promoters", help=promoters_help)
+    if background_help is not None:
+        io_group.add_argument("--background", help=background_help)
+        io_group.add_argument("--promoters", dest="background", help=argparse.SUPPRESS)
     io_group.add_argument(
         "--num-sequences",
         type=int,
@@ -165,7 +166,7 @@ def _add_profile_parser(subparsers: argparse._SubParsersAction) -> None:
             "Path to FASTA sequences used to scan motif inputs. "
             "If omitted and motif scanning is required, random sequences are generated."
         ),
-        promoters_help=(
+        background_help=(
             "Optional FASTA sequences used to calibrate profile normalization. "
             "If omitted, normalization is fitted on the comparison sequences."
         ),
@@ -175,9 +176,9 @@ def _add_profile_parser(subparsers: argparse._SubParsersAction) -> None:
     profile_group = parser.add_argument_group("Profile Comparison Options")
     profile_group.add_argument(
         "--metric",
-        choices=["co", "dice"],
+        choices=["co", "dice", "cosine"],
         default="co",
-        help="Profile similarity metric. Choices: co, dice. (default: %(default)s)",
+        help="Window-based profile similarity metric. Choices: co, dice, cosine. (default: %(default)s)",
     )
     profile_group.add_argument(
         "--permutations",
@@ -195,7 +196,22 @@ def _add_profile_parser(subparsers: argparse._SubParsersAction) -> None:
         "--search-range",
         type=int,
         default=10,
-        help="Maximum alignment offset explored between profiles. (default: %(default)s)",
+        help="Maximum site-center shift explored between motifs. (default: %(default)s)",
+    )
+    profile_group.add_argument(
+        "--window-radius",
+        type=int,
+        default=10,
+        help="Radius of the site-centered comparison window in profile positions. (default: %(default)s)",
+    )
+    profile_group.add_argument(
+        "--realign-window",
+        type=int,
+        default=3,
+        help=(
+            "Half-width of the local realignment window used for anchors from the second motif. "
+            "(default: %(default)s)"
+        ),
     )
     profile_group.add_argument(
         "--min-kernel-size",
@@ -213,7 +229,7 @@ def _add_profile_parser(subparsers: argparse._SubParsersAction) -> None:
         "--min-logfpr",
         type=float,
         default=None,
-        help="Ignore aligned positions only when both profile values are below this logFPR threshold.",
+        help="Select all sites at or above this logFPR threshold. If omitted, one best site per sequence is used.",
     )
 
     _add_common_technical_arguments(parser, include_cache=True)
@@ -306,8 +322,8 @@ def validate_inputs(args) -> None:
     ]
     if getattr(args, "fasta", None):
         file_checks.append((args.fasta, "FASTA file"))
-    if getattr(args, "promoters", None):
-        file_checks.append((args.promoters, "Promoter FASTA file"))
+    if getattr(args, "background", None):
+        file_checks.append((args.background, "Background FASTA file"))
 
     try:
         for path, label in file_checks:
@@ -329,6 +345,8 @@ def map_args_to_comparator_kwargs(args) -> Dict[str, Any]:
             "numba_threads": args.jobs,
             "seed": args.seed,
             "search_range": args.search_range,
+            "window_radius": args.window_radius,
+            "realign_window": args.realign_window,
             "min_kernel_size": args.min_kernel_size,
             "max_kernel_size": args.max_kernel_size,
             "min_logfpr": args.min_logfpr,
@@ -356,7 +374,7 @@ def build_comparison_config_from_args(args):
     comparator = create_comparator_config(**comparator_kwargs)
 
     sequences = getattr(args, "fasta", None)
-    promoters = getattr(args, "promoters", None)
+    background = getattr(args, "background", None)
 
     return create_config(
         model1=args.model1,
@@ -365,7 +383,7 @@ def build_comparison_config_from_args(args):
         model2_type=args.model2_type,
         strategy=args.mode,
         sequences=sequences,
-        promoters=promoters,
+        background=background,
         num_sequences=getattr(args, "num_sequences", 1000),
         seq_length=getattr(args, "seq_length", 200),
         seed=getattr(args, "seed", 127),

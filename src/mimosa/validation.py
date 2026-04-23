@@ -49,6 +49,14 @@ def validate_non_negative(name: str, value: Optional[float]) -> Optional[float]:
     return number
 
 
+def validate_non_negative_int(name: str, value: int) -> int:
+    """Validate one non-negative integer parameter."""
+    number = int(value)
+    if number < 0:
+        raise ValueError(f"{name} must be non-negative, got {value}")
+    return number
+
+
 def validate_kernel_size_range(min_kernel_size: int, max_kernel_size: int) -> tuple[int, int]:
     """Validate surrogate-kernel bounds and require at least one odd width."""
     minimum = validate_positive_int("min_kernel_size", min_kernel_size)

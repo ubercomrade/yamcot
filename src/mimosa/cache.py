@@ -20,7 +20,7 @@ CACHE_VERSION = "v8"
 class ProfileCacheSpec(TypedDict):
     model: GenericModel
     sequences: dict | None
-    promoters: dict | None
+    background: dict | None
     profile_kind: str
     cache_dir: str
 
@@ -51,17 +51,6 @@ def fingerprint_batch(batch) -> str | None:
     return hasher.hexdigest()
 
 
-def fingerprint_profile_bundle(bundle) -> str | None:
-    """Return a stable content fingerprint for one 3D profile bundle."""
-    if bundle is None:
-        return None
-
-    hasher = hashlib.blake2b(digest_size=16)
-    hasher.update(_hash_array(np.asarray(bundle["values"])))
-    hasher.update(_hash_array(np.asarray(bundle["lengths"], dtype=np.int64)))
-    return hasher.hexdigest()
-
-
 def fingerprint_model(model: GenericModel) -> str:
     """Return a stable fingerprint for the effective model representation."""
     hasher = hashlib.blake2b(digest_size=16)
@@ -85,9 +74,9 @@ def _profile_cache_path(spec: ProfileCacheSpec) -> Path:
     model_fp = fingerprint_model(spec["model"])
     sequence_fp = fingerprint_batch(spec.get("sequences")) or "no-sequences"
     base = Path(spec["cache_dir"]) / CACHE_VERSION / "profiles" / spec["profile_kind"] / sequence_fp
-    promoter_fp = fingerprint_batch(spec.get("promoters"))
-    if promoter_fp is not None:
-        base = base / promoter_fp
+    background_fp = fingerprint_batch(spec.get("background"))
+    if background_fp is not None:
+        base = base / background_fp
     return base / f"{model_fp}.npz"
 
 

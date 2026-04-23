@@ -8,11 +8,11 @@ import os
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
-from mimosa.batches import make_score_batch, make_sequence_batch, row_values
+from mimosa.batches import make_score_batch, make_sequence_batch
 
 _JSTACS_NUMERIC_RE = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[Ee][-+]?\d+)?")
 _LOG_UNIFORM_BASE = float(np.log(4.0))
@@ -76,29 +76,6 @@ def read_scores(path: str | Path):
         profiles.append(np.asarray(current_values, dtype=np.float32))
 
     return make_score_batch(profiles)
-
-
-def write_fasta(sequences: Union[dict, Iterable[np.ndarray]], path: str) -> None:
-    """Write integer-encoded sequences to a FASTA file."""
-
-    decoder = np.array(["A", "C", "G", "T", "N"], dtype="U1")
-
-    with open(path, "w") as out:
-        if isinstance(sequences, dict) and {"values", "lengths"} <= set(sequences.keys()):
-            for i in range(len(sequences["lengths"])):
-                seq_int = row_values(sequences, i)
-                safe_seq = np.clip(seq_int, 0, 4)
-                chars = decoder[safe_seq]
-                seq_str = "".join(chars)
-                out.write(f">{i}\n")
-                out.write(f"{seq_str}\n")
-        else:
-            for idx, seq_int in enumerate(sequences):
-                safe_seq = np.clip(seq_int, 0, 4)
-                chars = decoder[safe_seq]
-                seq_str = "".join(chars)
-                out.write(f">{idx}\n")
-                out.write(f"{seq_str}\n")
 
 
 def _meme_length_from_header(header_line: str) -> int:

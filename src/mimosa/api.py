@@ -34,7 +34,7 @@ _DEFAULT_METRICS = {
 }
 
 _ALLOWED_METRICS = {
-    "profile": {"co", "dice"},
+    "profile": {"co", "dice", "cosine"},
     "motif": {"pcc", "ed", "cosine"},
 }
 
@@ -46,7 +46,7 @@ class ComparisonConfig(TypedDict):
     model2_type: Optional[str]
     strategy: str
     sequences: Optional[SequenceRef]
-    promoters: Optional[SequenceRef]
+    background: Optional[SequenceRef]
     num_sequences: int
     seq_length: int
     seed: int
@@ -62,7 +62,7 @@ class OneToManyConfig(TypedDict):
     target_type: Optional[str]
     strategy: str
     sequences: Optional[SequenceRef]
-    promoters: Optional[SequenceRef]
+    background: Optional[SequenceRef]
     num_sequences: int
     seq_length: int
     seed: int
@@ -78,7 +78,7 @@ def create_config(
     model2_type: Optional[str] = None,
     strategy: str = "profile",
     sequences: Optional[SequenceRef] = None,
-    promoters: Optional[SequenceRef] = None,
+    background: Optional[SequenceRef] = None,
     num_sequences: int = 1000,
     seq_length: int = 200,
     seed: int = 127,
@@ -105,7 +105,7 @@ def create_config(
         "model2_type": model2_type,
         "strategy": normalized_strategy,
         "sequences": sequences,
-        "promoters": promoters,
+        "background": background,
         "num_sequences": num_sequences,
         "seq_length": seq_length,
         "seed": seed,
@@ -122,7 +122,7 @@ def compare_motifs(
     model2_type: Optional[str] = None,
     strategy: str = "profile",
     sequences: Optional[SequenceRef] = None,
-    promoters: Optional[SequenceRef] = None,
+    background: Optional[SequenceRef] = None,
     num_sequences: int = 1000,
     seq_length: int = 200,
     seed: int = 127,
@@ -139,7 +139,7 @@ def compare_motifs(
         model2_type=model2_type,
         strategy=strategy,
         sequences=sequences,
-        promoters=promoters,
+        background=background,
         num_sequences=num_sequences,
         seq_length=seq_length,
         seed=seed,
@@ -158,7 +158,7 @@ def create_many_config(
     target_type: Optional[str] = None,
     strategy: str = "profile",
     sequences: Optional[SequenceRef] = None,
-    promoters: Optional[SequenceRef] = None,
+    background: Optional[SequenceRef] = None,
     num_sequences: int = 1000,
     seq_length: int = 200,
     seed: int = 127,
@@ -185,7 +185,7 @@ def create_many_config(
         "target_type": target_type,
         "strategy": normalized_strategy,
         "sequences": sequences,
-        "promoters": promoters,
+        "background": background,
         "num_sequences": num_sequences,
         "seq_length": seq_length,
         "seed": seed,
@@ -202,7 +202,7 @@ def compare_one_to_many(
     target_type: Optional[str] = None,
     strategy: str = "profile",
     sequences: Optional[SequenceRef] = None,
-    promoters: Optional[SequenceRef] = None,
+    background: Optional[SequenceRef] = None,
     num_sequences: int = 1000,
     seq_length: int = 200,
     seed: int = 127,
@@ -219,7 +219,7 @@ def compare_one_to_many(
         target_type=target_type,
         strategy=strategy,
         sequences=sequences,
-        promoters=promoters,
+        background=background,
         num_sequences=num_sequences,
         seq_length=seq_length,
         seed=seed,
@@ -239,9 +239,9 @@ def run_comparison(config: ComparisonConfig) -> dict:
     _validate_models_for_strategy(strategy, model1, model2)
     _validate_comparator_for_strategy(strategy, config["comparator"])
 
-    promoters = None
-    if config.get("promoters") is not None:
-        promoters = _resolve_sequences(config["promoters"], config)
+    background = None
+    if config.get("background") is not None:
+        background = _resolve_sequences(config["background"], config)
 
     needs_sequences = _needs_sequences(strategy, config["comparator"], model1, model2)
     sequences = _resolve_sequences(config.get("sequences"), config) if needs_sequences else None
@@ -252,7 +252,7 @@ def run_comparison(config: ComparisonConfig) -> dict:
         strategy=strategy,
         config=config["comparator"],
         sequences=sequences,
-        promoters=promoters,
+        background=background,
     )
 
 
@@ -266,35 +266,30 @@ def run_one_to_many(config: OneToManyConfig) -> List[dict]:
     if not target_refs:
         return []
 
-    promoters = None
-    if config.get("promoters") is not None:
-        promoters = _resolve_sequences(config["promoters"], config)
+    background = None
+    if config.get("background") is not None:
+        background = _resolve_sequences(config["background"], config)
 
-    needs_sequences = _target_refs_need_sequences(
-        strategy,
-        config["comparator"],
-        query_model,
+    target_models = _resolve_target_models(
         target_refs,
         config.get("target_type"),
         config.get("target_kwargs", {}),
+        strategy,
+        query_model,
+    )
+    needs_sequences = any(
+        _needs_sequences(strategy, config["comparator"], query_model, target_model)
+        for target_model in target_models
     )
     sequences = _resolve_sequences(config.get("sequences"), config) if needs_sequences else None
 
-    target_models = _iter_resolved_targets(
-        target_refs,
-        config.get("target_type"),
-        config.get("target_kwargs", {}),
-        strategy,
-        query_model,
-    )
-
     return compare_one_to_many_models(
         query_model=query_model,
-        target_models=target_models,
+        target_models=iter(target_models),
         strategy=strategy,
         config=config["comparator"],
         sequences=sequences,
-        promoters=promoters,
+        background=background,
     )
 
 
@@ -325,18 +320,20 @@ def _normalize_targets(targets) -> List[ModelRef]:
     return list(targets)
 
 
-def _iter_resolved_targets(
+def _resolve_target_models(
     targets: Iterable[ModelRef],
     model_type: Optional[str],
     kwargs: Dict[str, Any],
     strategy: str,
     query_model: GenericModel,
-):
-    """Resolve and validate target models lazily."""
+) -> tuple[GenericModel, ...]:
+    """Resolve and validate target models once for one-vs-many comparison."""
+    resolved_targets: list[GenericModel] = []
     for target in targets:
         target_model = _resolve_model(target, model_type, kwargs)
         _validate_models_for_strategy(strategy, query_model, target_model)
-        yield target_model
+        resolved_targets.append(target_model)
+    return tuple(resolved_targets)
 
 
 def _needs_sequences(strategy: str, comparator: ComparatorConfig, model1: GenericModel, model2: GenericModel) -> bool:
@@ -344,23 +341,6 @@ def _needs_sequences(strategy: str, comparator: ComparatorConfig, model1: Generi
     if strategy == "profile":
         return model1.type_key != "scores" or model2.type_key != "scores"
     return strategy == "motif" and (comparator["pfm_mode"] or model1.type_key != model2.type_key)
-
-
-def _target_refs_need_sequences(
-    strategy: str,
-    comparator: ComparatorConfig,
-    query_model: GenericModel,
-    target_refs: Iterable[ModelRef],
-    target_type: Optional[str],
-    target_kwargs: Dict[str, Any],
-) -> bool:
-    """Return True when any query-target pair requires sequence input."""
-    for target in target_refs:
-        target_model = _resolve_model(target, target_type, target_kwargs)
-        _validate_models_for_strategy(strategy, query_model, target_model)
-        if _needs_sequences(strategy, comparator, query_model, target_model):
-            return True
-    return False
 
 
 def _validate_models_for_strategy(strategy: str, model1: GenericModel, model2: GenericModel) -> None:

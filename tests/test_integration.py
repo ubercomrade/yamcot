@@ -343,7 +343,7 @@ def test_profile_comparison_basic(examples_dir, temp_dir):
     import json
 
     output = json.loads(result.stdout)
-    expected_keys = ["query", "target", "score", "offset", "orientation", "metric"]
+    expected_keys = ["query", "target", "score", "offset", "orientation", "metric", "n_sites"]
     for key in expected_keys:
         assert key in output, f"Missing key '{key}' in output"
 
@@ -373,6 +373,36 @@ def test_profile_comparison_accepts_dice_metric(examples_dir, temp_dir):
     assert "score" in output
 
 
+def test_profile_comparison_accepts_cosine_metric(examples_dir, temp_dir):
+    """Profile CLI should expose the window-averaged cosine metric."""
+    cmd = [
+        "mimosa",
+        "profile",
+        str(examples_dir / "scores_1.fasta"),
+        str(examples_dir / "scores_2.fasta"),
+        "--model1-type",
+        "scores",
+        "--model2-type",
+        "scores",
+        "--metric",
+        "cosine",
+        "--window-radius",
+        "4",
+        "--realign-window",
+        "2",
+    ]
+
+    result = run_cli(cmd)
+    assert result.returncode == 0, f"Command failed with stderr: {result.stderr}"
+
+    import json
+
+    output = json.loads(result.stdout)
+    assert output["metric"] == "cosine"
+    assert "score" in output
+    assert "n_sites" in output
+
+
 def test_profile_comparison_rejects_removed_l1sim_metric(examples_dir, temp_dir):
     """Profile CLI should reject removed metrics before running a comparison."""
     cmd = [
@@ -394,7 +424,7 @@ def test_profile_comparison_rejects_removed_l1sim_metric(examples_dir, temp_dir)
 
 
 def test_profile_comparison_with_empirical_logfpr_thresholding(examples_dir, temp_dir):
-    """Profile mode should apply hard thresholding on empirically normalized profiles."""
+    """Profile mode should use threshold-selected site windows on empirically normalized profiles."""
     cmd = [
         "mimosa",
         "profile",
@@ -410,6 +440,10 @@ def test_profile_comparison_with_empirical_logfpr_thresholding(examples_dir, tem
         "co",
         "--min-logfpr",
         "2",
+        "--window-radius",
+        "6",
+        "--realign-window",
+        "2",
     ]
 
     result = run_cli(cmd)
@@ -420,10 +454,11 @@ def test_profile_comparison_with_empirical_logfpr_thresholding(examples_dir, tem
     output = json.loads(result.stdout)
     assert output["metric"] == "co"
     assert "score" in output
+    assert "n_sites" in output
 
 
-def test_profile_comparison_accepts_promoter_argument(examples_dir, temp_dir):
-    """Profile CLI should accept explicit promoter calibration sequences."""
+def test_profile_comparison_accepts_background_argument(examples_dir, temp_dir):
+    """Profile CLI should accept explicit background calibration sequences."""
     cmd = [
         "mimosa",
         "profile",
@@ -435,7 +470,7 @@ def test_profile_comparison_accepts_promoter_argument(examples_dir, temp_dir):
         "pwm",
         "--fasta",
         str(examples_dir / "foreground.fa"),
-        "--promoters",
+        "--background",
         str(examples_dir / "background.fa"),
     ]
 

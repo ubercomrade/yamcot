@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable, TypeAlias, TypedDict
+from typing import Iterable, TypedDict
 
 import numpy as np
 
@@ -12,7 +12,6 @@ BATCH_NDIM = 2
 PROFILE_BUNDLE_NDIM = 3
 PLUS_STRAND = 0
 MINUS_STRAND = 1
-STRAND_COUNT = 2
 
 
 class SequenceBatch(TypedDict):
@@ -26,9 +25,6 @@ class MaskedBatch(TypedDict):
     mask: np.ndarray
     lengths: np.ndarray
     padding_value: int | float
-
-
-DenseBatch: TypeAlias = SequenceBatch | MaskedBatch
 
 
 class ProfileBundle(TypedDict):
@@ -56,17 +52,6 @@ def empty_masked_batch(dtype, padding_value) -> MaskedBatch:
     return {
         "values": values,
         "mask": mask,
-        "lengths": lengths,
-        "padding_value": np.asarray(padding_value, dtype=dtype).item(),
-    }
-
-
-def empty_profile_bundle(dtype, padding_value, n_profiles: int = STRAND_COUNT) -> ProfileBundle:
-    """Return an empty 3D profile bundle."""
-    values = np.full((n_profiles, 0, 0), padding_value, dtype=dtype)
-    lengths = np.zeros(0, dtype=np.int64)
-    return {
-        "values": values,
         "lengths": lengths,
         "padding_value": np.asarray(padding_value, dtype=dtype).item(),
     }
@@ -198,25 +183,10 @@ def make_strand_bundle(plus_batch: MaskedBatch, minus_batch: MaskedBatch) -> Pro
     )
 
 
-def num_rows(batch) -> int:
-    """Return the number of rows in one batch."""
-    return int(batch["values"].shape[0])
-
-
-def batch_width(batch) -> int:
-    """Return the padded row width."""
-    return int(batch["values"].shape[1])
-
-
 def row_values(batch, row_index: int) -> np.ndarray:
     """Return the valid values of one row."""
     length = int(batch["lengths"][row_index])
     return batch["values"][row_index, :length]
-
-
-def profile_values(bundle, profile_index: int) -> np.ndarray:
-    """Return one 2D profile matrix view from a 3D bundle."""
-    return bundle["values"][profile_index]
 
 
 def profile_view(bundle: ProfileBundle, profile_index: int) -> SequenceBatch:
