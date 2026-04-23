@@ -49,7 +49,7 @@ def build_score_log_tail_table(scores: np.ndarray) -> np.ndarray:
     return np.column_stack([unique_scores, log_tail]).astype(np.float32, copy=False)
 
 
-@njit(cache=True, nogil=True)
+@njit(cache=True, nogil=False)
 def _lower_bound_desc(values, target):
     """Find the first descending-table index whose score is not greater than target."""
     size = values.shape[0]
@@ -69,7 +69,7 @@ def _lower_bound_desc(values, target):
     return lo
 
 
-@njit(cache=True, nogil=True)
+@njit(cache=True, nogil=False)
 def _apply_score_log_tail_table_numba(values, mask, scores_col, log_tail_col, padding_value: float):
     """Map one dense masked score matrix to empirical log-tail values."""
     rows, cols = values.shape
@@ -239,7 +239,7 @@ def _iter_scan_buckets(lengths: np.ndarray, motif_len: int, bucket_step: int = S
         yield sorted_indices[start:stop]
 
 
-@njit(cache=True, fastmath=True, nogil=True)
+@njit(cache=True, fastmath=True, nogil=False)
 def _score_window_forward(seq_row, length: int, model_rows, pos: int, kmer: int, context_len: int, n_terms: int):
     """Score one forward-aligned window."""
     total = np.float32(0.0)
@@ -256,7 +256,7 @@ def _score_window_forward(seq_row, length: int, model_rows, pos: int, kmer: int,
     return total
 
 
-@njit(cache=True, fastmath=True, nogil=True)
+@njit(cache=True, fastmath=True, nogil=False)
 def _score_window_reverse(seq_row, length: int, model_rows, pos: int, kmer: int, window_size: int, n_terms: int):
     """Score one reverse-complement-aligned window."""
     total = np.float32(0.0)
@@ -272,7 +272,7 @@ def _score_window_reverse(seq_row, length: int, model_rows, pos: int, kmer: int,
     return total
 
 
-@njit(cache=True, fastmath=True, nogil=True)
+@njit(cache=True, fastmath=True, nogil=False)
 def _scan_dense_kernel_numba(values, lengths, model_rows, kmer: int, context_len: int, n_terms: int):
     """Score one dense encoded sequence batch for one strand."""
     n_rows, _ = values.shape
@@ -303,7 +303,7 @@ def _scan_dense_kernel_numba(values, lengths, model_rows, kmer: int, context_len
     return scores, mask
 
 
-@njit(cache=True, fastmath=True, nogil=True)
+@njit(cache=True, fastmath=True, nogil=False)
 def _scan_dense_reverse_kernel_numba(values, lengths, model_rows, kmer: int, window_size: int, n_terms: int):
     """Score one dense encoded sequence batch on the reverse-complement strand."""
     n_rows, _ = values.shape
@@ -326,7 +326,7 @@ def _scan_dense_reverse_kernel_numba(values, lengths, model_rows, kmer: int, win
     return scores, mask
 
 
-@njit(cache=True, fastmath=True, nogil=True)
+@njit(cache=True, fastmath=True, nogil=False)
 def _scan_dense_strands_kernel_numba(
     values, lengths, model_rows, kmer: int, context_len: int, window_size: int, n_terms: int
 ):
