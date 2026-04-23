@@ -2035,6 +2035,21 @@ def test_strategy_profile_co_has_no_default_floor():
     assert result["score"] == pytest.approx(1.0)
 
 
+def test_strategy_profile_zero_min_logfpr_uses_best_anchor_mode():
+    """min_logfpr=0 should behave like an omitted threshold."""
+    scores_1 = _score_batch_from_flat(np.array([0.1, 0.9, 0.8, 0.7], dtype=np.float32), np.array([0, 4], dtype=np.int64))
+    scores_2 = _score_batch_from_flat(np.array([0.2, 0.95, 0.1, 0.1], dtype=np.float32), np.array([0, 4], dtype=np.int64))
+    model1 = GenericModel(type_key="scores", name="s1", representation=None, length=0, config={"scores_data": scores_1})
+    model2 = GenericModel(type_key="scores", name="s2", representation=None, length=0, config={"scores_data": scores_2})
+
+    kwargs = {"metric": "co", "window_radius": 0, "search_range": 0, "n_permutations": 0}
+    omitted = strategy_profile(model1, model2, None, create_comparator_config(**kwargs, min_logfpr=None))
+    zero = strategy_profile(model1, model2, None, create_comparator_config(**kwargs, min_logfpr=0))
+
+    assert zero["score"] == pytest.approx(omitted["score"])
+    assert zero["n_sites"] == omitted["n_sites"] == 1
+
+
 @pytest.mark.parametrize("metric", ["co", "dice", "cosine"])
 def test_strategy_profile_handles_all_positions_masked_by_threshold(metric):
     """Threshold site selection should not crash when no sites survive the cutoff."""

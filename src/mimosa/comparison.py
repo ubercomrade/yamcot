@@ -681,7 +681,8 @@ def _score_profile_orientation_pair(
 
 def _score_profile_candidates(query_bundle: dict, target_bundle: dict, pair_specs, cfg: ComparatorConfig) -> list[dict]:
     """Score all requested orientation pairs with the window-based profile algorithm."""
-    score_threshold = None if cfg["min_logfpr"] is None else float(cfg["min_logfpr"])
+    min_logfpr = cfg["min_logfpr"]
+    score_threshold = None if min_logfpr is None or float(min_logfpr) <= 0.0 else float(min_logfpr)
     offsets = _build_window_offsets(int(cfg["window_radius"]))
     min_offset = -int(cfg["window_radius"])
     max_offset = int(cfg["window_radius"])

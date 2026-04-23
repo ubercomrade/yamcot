@@ -228,7 +228,10 @@ def _add_profile_parser(subparsers: argparse._SubParsersAction) -> None:
         "--min-logfpr",
         type=float,
         default=None,
-        help="Select all sites at or above this logFPR threshold. If omitted, one best site per sequence is used.",
+        help=(
+            "Select all sites at or above this logFPR threshold. "
+            "If omitted or set to 0, one best site per sequence is used."
+        ),
     )
 
     _add_common_technical_arguments(parser, include_cache=True)

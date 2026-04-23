@@ -193,7 +193,7 @@ Important arguments:
 | `--realign-window` | local target-anchor realignment half-width, default `3` |
 | `--min-kernel-size` | minimum surrogate kernel size, default `3` |
 | `--max-kernel-size` | maximum surrogate kernel size, default `11` |
-| `--min-logfpr` | select all anchors at or above this empirical log-tail threshold |
+| `--min-logfpr` | select all anchors at or above this empirical log-tail threshold; omitted or `0` uses one best anchor per sequence |
 | `--cache` | `off` or `on` |
 | `--cache-dir` | cache directory, default `.mimosa-cache` |
 | `--seed` | random seed, default `127` |
