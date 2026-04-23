@@ -657,41 +657,87 @@ def prepare_profile_bundle(bundle: dict) -> dict:
     return pack_profile_bundle(values, lengths, SCORE_PADDING)
 
 
+@njit(cache=True, nogil=True, fastmath=True)
+def _overlap_sums_numba(values1: np.ndarray, values2: np.ndarray) -> tuple[float, float, float]:
+    """Return sum(values1), sum(values2), and sum(min(values1, values2)) in one pass."""
+    sum1 = 0.0
+    sum2 = 0.0
+    intersection = 0.0
+
+    for index in range(values1.size):
+        value1 = values1[index]
+        value2 = values2[index]
+        sum1 += value1
+        sum2 += value2
+        intersection += value1 if value1 < value2 else value2
+
+    return sum1, sum2, intersection
+
+
+def _flat_float32_pair(scores1: np.ndarray, scores2: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return contiguous flattened float32 views for pairwise profile metrics."""
+    values1 = np.ascontiguousarray(np.asarray(scores1, dtype=np.float32).ravel())
+    values2 = np.ascontiguousarray(np.asarray(scores2, dtype=np.float32).ravel())
+    if values1.size != values2.size:
+        raise ValueError("scores1 and scores2 must contain the same number of values.")
+    return values1, values2
+
+
 def calc_co(scores1: np.ndarray, scores2: np.ndarray, eps: float = float(PROFILE_EPS)) -> float:
     """Compute the CO score over one selected window collection."""
-    values1 = np.asarray(scores1, dtype=np.float32).ravel()
-    values2 = np.asarray(scores2, dtype=np.float32).ravel()
-    denom = float(min(values1.sum(), values2.sum()))
+    values1, values2 = _flat_float32_pair(scores1, scores2)
+    sum1, sum2, intersection = _overlap_sums_numba(values1, values2)
+    denom = min(sum1, sum2)
     if denom <= eps:
         return 0.0
-    return float(np.minimum(values1, values2).sum() / denom)
+    return float(intersection / denom)
 
 
 def calc_dice(scores1: np.ndarray, scores2: np.ndarray, eps: float = float(PROFILE_EPS)) -> float:
     """Compute the Dice score over one selected window collection."""
-    values1 = np.asarray(scores1, dtype=np.float32).ravel()
-    values2 = np.asarray(scores2, dtype=np.float32).ravel()
-    denom = float(values1.sum() + values2.sum())
+    values1, values2 = _flat_float32_pair(scores1, scores2)
+    sum1, sum2, intersection = _overlap_sums_numba(values1, values2)
+    denom = sum1 + sum2
     if denom <= eps:
         return 0.0
-    return float((2.0 * np.minimum(values1, values2).sum()) / denom)
+    return float((2.0 * intersection) / denom)
+
+
+@njit(cache=True, nogil=True, fastmath=True)
+def _rowwise_cosine_numba(values_x: np.ndarray, values_y: np.ndarray, eps: float) -> np.ndarray:
+    """Compute one cosine value per row without temporary arrays."""
+    n_rows = values_x.shape[0]
+    n_cols = values_x.shape[1]
+    out = np.empty(n_rows, dtype=np.float32)
+
+    for row_index in range(n_rows):
+        dot = 0.0
+        norm_x = 0.0
+        norm_y = 0.0
+
+        for col_index in range(n_cols):
+            value_x = values_x[row_index, col_index]
+            value_y = values_y[row_index, col_index]
+            dot += value_x * value_y
+            norm_x += value_x * value_x
+            norm_y += value_y * value_y
+
+        norm = np.sqrt(norm_x) * np.sqrt(norm_y)
+        out[row_index] = dot / norm if norm > eps else np.nan
+
+    return out
 
 
 def rowwise_cosine(x: np.ndarray, y: np.ndarray, eps: float = float(PROFILE_EPS)) -> np.ndarray:
     """Compute one cosine value per selected window."""
-    values_x = np.asarray(x, dtype=np.float32)
-    values_y = np.asarray(y, dtype=np.float32)
+    values_x = np.ascontiguousarray(np.asarray(x, dtype=np.float32))
+    values_y = np.ascontiguousarray(np.asarray(y, dtype=np.float32))
     if values_x.shape != values_y.shape:
         raise ValueError("x and y must have the same shape.")
     if values_x.ndim != WINDOW_MATRIX_NDIM:
         raise ValueError("x and y must be 2D arrays.")
 
-    dots = np.sum(values_x * values_y, axis=1)
-    norms = np.linalg.norm(values_x, axis=1) * np.linalg.norm(values_y, axis=1)
-    out = np.full(values_x.shape[0], np.nan, dtype=np.float32)
-    valid = norms > eps
-    out[valid] = dots[valid] / norms[valid]
-    return out
+    return _rowwise_cosine_numba(values_x, values_y, float(eps))
 
 
 def format_params(params: dict) -> str:

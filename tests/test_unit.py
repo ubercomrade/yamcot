@@ -51,6 +51,8 @@ from mimosa.functions import (
     batch_all_scores,
     batch_all_scores_strands,
     build_score_log_tail_table,
+    calc_co,
+    calc_dice,
     cut_prc,
     cut_roc,
     format_params,
@@ -1222,12 +1224,28 @@ def test_batch_all_scores_strands_matches_separate_calls(representation, kmer, w
 
 def test_rowwise_cosine_is_averaged_per_window():
     """Profile cosine should be the mean of per-window cosine values."""
-    windows_1 = np.array([[1.0, 0.0], [1.0, 1.0]], dtype=np.float32)
-    windows_2 = np.array([[1.0, 0.0], [1.0, -1.0]], dtype=np.float32)
+    windows_1 = np.array([[1.0, 0.0], [1.0, 1.0], [0.0, 0.0]], dtype=np.float32)
+    windows_2 = np.array([[1.0, 0.0], [1.0, -1.0], [1.0, 0.0]], dtype=np.float32)
     score_window_collection = strategy_profile.__globals__["_score_window_collection"]
 
-    np.testing.assert_allclose(rowwise_cosine(windows_1, windows_2), np.array([1.0, 0.0], dtype=np.float32))
+    np.testing.assert_allclose(
+        rowwise_cosine(windows_1, windows_2),
+        np.array([1.0, 0.0, np.nan], dtype=np.float32),
+        equal_nan=True,
+    )
     assert score_window_collection("cosine", windows_1, windows_2) == pytest.approx(0.5)
+
+
+def test_overlap_profile_metrics_match_reference_formulas():
+    """CO and Dice should use the weighted overlap formulas."""
+    windows_1 = np.array([[1.0, 3.0], [2.0, 0.0]], dtype=np.float32)
+    windows_2 = np.array([[2.0, 1.0], [2.0, 4.0]], dtype=np.float32)
+    intersection = np.minimum(windows_1, windows_2).sum()
+
+    assert calc_co(windows_1, windows_2) == pytest.approx(intersection / min(windows_1.sum(), windows_2.sum()))
+    assert calc_dice(windows_1, windows_2) == pytest.approx(
+        (2.0 * intersection) / (windows_1.sum() + windows_2.sum())
+    )
 
 
 @pytest.mark.parametrize(("metric", "expected"), [("co", 0.5), ("dice", 0.5)])
@@ -2037,8 +2055,14 @@ def test_strategy_profile_co_has_no_default_floor():
 
 def test_strategy_profile_zero_min_logfpr_uses_best_anchor_mode():
     """min_logfpr=0 should behave like an omitted threshold."""
-    scores_1 = _score_batch_from_flat(np.array([0.1, 0.9, 0.8, 0.7], dtype=np.float32), np.array([0, 4], dtype=np.int64))
-    scores_2 = _score_batch_from_flat(np.array([0.2, 0.95, 0.1, 0.1], dtype=np.float32), np.array([0, 4], dtype=np.int64))
+    scores_1 = _score_batch_from_flat(
+        np.array([0.1, 0.9, 0.8, 0.7], dtype=np.float32),
+        np.array([0, 4], dtype=np.int64),
+    )
+    scores_2 = _score_batch_from_flat(
+        np.array([0.2, 0.95, 0.1, 0.1], dtype=np.float32),
+        np.array([0, 4], dtype=np.int64),
+    )
     model1 = GenericModel(type_key="scores", name="s1", representation=None, length=0, config={"scores_data": scores_1})
     model2 = GenericModel(type_key="scores", name="s2", representation=None, length=0, config={"scores_data": scores_2})
 
