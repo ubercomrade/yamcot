@@ -300,7 +300,7 @@ def _empty_positions() -> tuple[np.ndarray, np.ndarray]:
     return empty, empty
 
 
-@njit(cache=True, nogil=False)
+@njit(cache=False, nogil=False)
 def _collect_best_anchor_positions_numba(scores: np.ndarray, lengths: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Collect one best anchor per row."""
     n_rows = scores.shape[0]
@@ -328,7 +328,7 @@ def _collect_best_anchor_positions_numba(scores: np.ndarray, lengths: np.ndarray
     return rows[:out_index], positions[:out_index]
 
 
-@njit(cache=True, nogil=False)
+@njit(cache=False, nogil=False)
 def _count_threshold_anchor_positions_numba(scores: np.ndarray, lengths: np.ndarray, score_threshold: float) -> int:
     """Count threshold-selected anchors."""
     total = 0
@@ -340,7 +340,7 @@ def _count_threshold_anchor_positions_numba(scores: np.ndarray, lengths: np.ndar
     return total
 
 
-@njit(cache=True, nogil=False)
+@njit(cache=False, nogil=False)
 def _collect_threshold_anchor_positions_numba(
     scores: np.ndarray,
     lengths: np.ndarray,
@@ -429,7 +429,7 @@ def _collect_model1_window_candidates(
     return anchor_rows[valid], anchor_pos1[valid], pos2[valid]
 
 
-@njit(cache=True, nogil=False)
+@njit(cache=False, nogil=False)
 def _collect_model2_window_candidates_numba(
     scores1: np.ndarray,
     lengths1: np.ndarray,
