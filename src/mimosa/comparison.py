@@ -53,7 +53,7 @@ class ComparatorConfig(TypedDict):
     metric: MetricName
     n_permutations: int
     seed: Optional[int]
-    numba_threads: Optional[int]
+    n_jobs: Optional[int]
     permute_rows: bool
     pfm_mode: bool
     pfm_top_fraction: float
@@ -123,7 +123,7 @@ def create_comparator_config(**kwargs) -> ComparatorConfig:
         "metric": "pcc",
         "n_permutations": 0,
         "seed": None,
-        "numba_threads": None,
+        "n_jobs": None,
         "permute_rows": False,
         "pfm_mode": False,
         "pfm_top_fraction": 0.05,
@@ -154,12 +154,13 @@ def create_comparator_config(**kwargs) -> ComparatorConfig:
         config.get("profile_normalization", "empirical_log_tail"),
         SUPPORTED_PROFILE_NORMALIZATIONS,
     )
-    config["numba_threads"] = validate_optional_thread_count("numba_threads", config.get("numba_threads"))
+    config["n_jobs"] = validate_optional_thread_count("n_jobs", config.get("n_jobs"))
     config["pfm_top_fraction"] = (
         validate_pfm_top_fraction(config.get("pfm_top_fraction")) or defaults["pfm_top_fraction"]
     )
     config["cache_mode"] = validate_cache_mode(config.get("cache_mode", "off"))
     return config
+
 
 def _select_best_orientation(candidates):
     """Choose the highest-scoring orientation with deterministic tie-breaking."""
@@ -299,7 +300,7 @@ def _empty_positions() -> tuple[np.ndarray, np.ndarray]:
     return empty, empty
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=False)
 def _collect_best_anchor_positions_numba(scores: np.ndarray, lengths: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Collect one best anchor per row."""
     n_rows = scores.shape[0]
@@ -327,7 +328,7 @@ def _collect_best_anchor_positions_numba(scores: np.ndarray, lengths: np.ndarray
     return rows[:out_index], positions[:out_index]
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=False)
 def _count_threshold_anchor_positions_numba(scores: np.ndarray, lengths: np.ndarray, score_threshold: float) -> int:
     """Count threshold-selected anchors."""
     total = 0
@@ -339,7 +340,7 @@ def _count_threshold_anchor_positions_numba(scores: np.ndarray, lengths: np.ndar
     return total
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=False)
 def _collect_threshold_anchor_positions_numba(
     scores: np.ndarray,
     lengths: np.ndarray,
@@ -428,7 +429,7 @@ def _collect_model1_window_candidates(
     return anchor_rows[valid], anchor_pos1[valid], pos2[valid]
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=False)
 def _collect_model2_window_candidates_numba(
     scores1: np.ndarray,
     lengths1: np.ndarray,
@@ -658,16 +659,13 @@ def _score_profile_orientation_pair(
             int(cfg["realign_window"]),
             str(cfg["metric"]),
         )
-        if (
-            float(candidate["score"]) > float(best["score"])
-            or (
-                float(candidate["score"]) == float(best["score"])
-                and (
-                    int(candidate["n_sites"]) > int(best["n_sites"])
-                    or (
-                        int(candidate["n_sites"]) == int(best["n_sites"])
-                        and abs(int(candidate["shift"])) < abs(int(best["shift"]))
-                    )
+        if float(candidate["score"]) > float(best["score"]) or (
+            float(candidate["score"]) == float(best["score"])
+            and (
+                int(candidate["n_sites"]) > int(best["n_sites"])
+                or (
+                    int(candidate["n_sites"]) == int(best["n_sites"])
+                    and abs(int(candidate["shift"])) < abs(int(best["shift"]))
                 )
             )
         ):
@@ -794,10 +792,13 @@ def _create_surrogate_bundle(profile, rng: np.random.Generator, cfg: ComparatorC
 
     values = np.asarray(profile["values"], dtype=np.float32)
     convolved = convolve1d(values, final_kernel, axis=1, mode="constant", cval=0.0)
-    mask = np.arange(convolved.shape[1], dtype=np.int32)[None, :] < np.asarray(
-        profile["lengths"],
-        dtype=np.int32,
-    )[:, None]
+    mask = (
+        np.arange(convolved.shape[1], dtype=np.int32)[None, :]
+        < np.asarray(
+            profile["lengths"],
+            dtype=np.int32,
+        )[:, None]
+    )
     convolved = np.asarray(convolved, dtype=np.float32)
     convolved[~mask] = SCORE_PADDING
 
@@ -1102,9 +1103,7 @@ def strategy_motif(model1: GenericModel, model2: GenericModel, sequences, cfg: C
 
 
 @_register_comparison_strategy("profile")
-def strategy_profile(
-    model1: GenericModel, model2: GenericModel, sequences, cfg: ComparatorConfig
-) -> ComparisonResult:
+def strategy_profile(model1: GenericModel, model2: GenericModel, sequences, cfg: ComparatorConfig) -> ComparisonResult:
     """Window-based profile comparison strategy (CO/Dice/Cosine similarity)."""
     runtime_cache = {}
     background_sequences = _get_profile_background_sequences(sequences, cfg)
@@ -1135,8 +1134,7 @@ def _compare_motif_one_to_many(
 
     query_cache = {}
     use_pfm_modes = {
-        bool(cfg["pfm_mode"] or (query_model.type_key != target_model.type_key))
-        for target_model in target_list
+        bool(cfg["pfm_mode"] or (query_model.type_key != target_model.type_key)) for target_model in target_list
     }
     prepared_query_by_mode = {}
     for use_pfm_mode in use_pfm_modes:
@@ -1162,7 +1160,7 @@ def _compare_motif_one_to_many(
         finally:
             target_cache.clear()
 
-    return _run_target_comparisons(target_list, cfg["numba_threads"], _score_target)
+    return _run_target_comparisons(target_list, cfg["n_jobs"], _score_target)
 
 
 def _compare_profile_one_to_many(
@@ -1208,29 +1206,24 @@ def _compare_profile_one_to_many(
         finally:
             target_cache.clear()
 
-    return _run_target_comparisons(target_list, cfg["numba_threads"], _score_target)
+    return _run_target_comparisons(target_list, cfg["n_jobs"], _score_target)
 
 
-def _resolve_target_job_count(numba_threads: int | None) -> int:
+def _resolve_target_job_count(n_jobs: int | None) -> int:
     """Resolve one target-level worker count from the compatibility config key."""
-    return -1 if numba_threads is None else int(numba_threads)
+    return -1 if n_jobs is None else int(n_jobs)
 
 
-def _run_target_comparisons(
-    target_models: list[GenericModel], numba_threads: int | None, worker: Callable
-) -> list[dict]:
+def _run_target_comparisons(target_models: list[GenericModel], n_jobs: int | None, worker: Callable) -> list[dict]:
     """Execute one worker across targets sequentially or with joblib threads."""
     if not target_models:
         return []
 
-    n_jobs = _resolve_target_job_count(numba_threads)
+    n_jobs = _resolve_target_job_count(n_jobs)
     if n_jobs == 1 or len(target_models) == 1:
         return [worker(target_model) for target_model in target_models]
 
-    return Parallel(n_jobs=n_jobs, prefer="threads")(
-        delayed(worker)(target_model)
-        for target_model in target_models
-    )
+    return Parallel(n_jobs=n_jobs, backend="loky")(delayed(worker)(target_model) for target_model in target_models)
 
 
 def compare(

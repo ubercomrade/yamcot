@@ -209,8 +209,7 @@ def _add_profile_parser(subparsers: argparse._SubParsersAction) -> None:
         type=int,
         default=3,
         help=(
-            "Half-width of the local realignment window used for anchors from the second motif. "
-            "(default: %(default)s)"
+            "Half-width of the local realignment window used for anchors from the second motif. (default: %(default)s)"
         ),
     )
     profile_group.add_argument(
@@ -342,7 +341,7 @@ def map_args_to_comparator_kwargs(args) -> Dict[str, Any]:
             "metric": args.metric,
             "n_permutations": args.permutations,
             "distortion_level": args.distortion,
-            "numba_threads": args.jobs,
+            "n_jobs": args.jobs,
             "seed": args.seed,
             "search_range": args.search_range,
             "window_radius": args.window_radius,
@@ -359,7 +358,7 @@ def map_args_to_comparator_kwargs(args) -> Dict[str, Any]:
             "metric": args.metric,
             "n_permutations": args.permutations,
             "permute_rows": args.permute_rows,
-            "numba_threads": args.jobs,
+            "n_jobs": args.jobs,
             "seed": args.seed,
             "pfm_mode": args.pfm_mode,
             "pfm_top_fraction": args.pfm_top_fraction,

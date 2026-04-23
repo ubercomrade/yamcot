@@ -11,6 +11,7 @@ import re
 import xml.etree.ElementTree as ET
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 
 import joblib
 import numpy as np
@@ -37,6 +38,7 @@ from mimosa.batches import (
     row_values,
 )
 from mimosa.cache import clear_cache
+from mimosa.cli import map_args_to_comparator_kwargs
 from mimosa.comparison import (
     compare,
     create_comparator_config,
@@ -673,7 +675,7 @@ def test_create_comparator_config():
     assert config["seed"] is None
     assert config["pfm_top_fraction"] == pytest.approx(0.05)
     assert config["profile_normalization"] == "empirical_log_tail"
-    assert config["numba_threads"] is None
+    assert config["n_jobs"] is None
 
     # Test factory function with custom parameters
     config = create_comparator_config(metric="co", n_permutations=100, seed=42, pfm_top_fraction=0.2)
@@ -683,25 +685,25 @@ def test_create_comparator_config():
     assert config["pfm_top_fraction"] == pytest.approx(0.2)
 
 
-def test_create_comparator_config_resolves_numba_threads():
-    """Explicit numba_threads should drive the effective parallel setting."""
-    config = create_comparator_config(numba_threads=4)
-    assert config["numba_threads"] == 4
+def test_create_comparator_config_resolves_n_jobs():
+    """Explicit n_jobs should drive the effective parallel setting."""
+    config = create_comparator_config(n_jobs=4)
+    assert config["n_jobs"] == 4
 
 
-@pytest.mark.parametrize("kwargs", [{"numba_threads": 0}, {"numba_threads": -2}])
+@pytest.mark.parametrize("kwargs", [{"n_jobs": 0}, {"n_jobs": -2}])
 def test_create_comparator_config_validates_thread_counts(kwargs):
     """Thread-count settings should accept only positive values or -1."""
     with pytest.raises(ValueError, match="positive or -1"):
         create_comparator_config(**kwargs)
 
 
-def test_compare_passes_numba_threads_to_strategy(monkeypatch):
+def test_compare_passes_n_jobs_to_strategy(monkeypatch):
     """Execution boundary should pass the validated config to the strategy."""
     observed = []
 
     def fake_strategy(model1, model2, sequences, cfg):
-        observed.append(cfg["numba_threads"])
+        observed.append(cfg["n_jobs"])
         return {"score": 1.0}
 
     monkeypatch.setitem(comparison_registry, "thread_test", fake_strategy)
@@ -710,11 +712,37 @@ def test_compare_passes_numba_threads_to_strategy(monkeypatch):
         model1=None,
         model2=None,
         strategy="thread_test",
-        config=create_comparator_config(numba_threads=1),
+        config=create_comparator_config(n_jobs=1),
     )
 
     assert result == {"score": 1.0}
     assert observed == [1]
+
+
+def test_cli_maps_jobs_to_n_jobs_for_profile_config():
+    """CLI --jobs should reach comparator config as n_jobs."""
+    args = SimpleNamespace(
+        mode="profile",
+        metric="co",
+        permutations=7,
+        distortion=0.3,
+        jobs=3,
+        seed=5,
+        search_range=2,
+        window_radius=4,
+        realign_window=1,
+        min_kernel_size=3,
+        max_kernel_size=5,
+        min_logfpr=None,
+        cache="off",
+        cache_dir=".mimosa-cache",
+    )
+
+    kwargs = map_args_to_comparator_kwargs(args)
+    config = create_comparator_config(**kwargs)
+
+    assert kwargs["n_jobs"] == 3
+    assert config["n_jobs"] == 3
 
 
 def test_create_comparator_config_validates_kernel_range():
@@ -1675,7 +1703,7 @@ def test_strategy_profile_permutations_use_batched_surrogate_scoring(monkeypatch
         length=0,
         config={"scores_data": scores_2},
     )
-    cfg = create_comparator_config(metric="co", n_permutations=1, numba_threads=1, search_range=2)
+    cfg = create_comparator_config(metric="co", n_permutations=1, n_jobs=1, search_range=2)
 
     call_sizes = []
     original_candidates = strategy_profile.__globals__["_score_profile_candidates"]
@@ -1738,12 +1766,14 @@ def test_create_config_builds_unified_config():
         strategy="profile",
         metric="co",
         n_permutations=10,
+        n_jobs=2,
         seed=99,
     )
 
     assert config["strategy"] == "profile"
     assert config["comparator"]["metric"] == "co"
     assert config["comparator"]["n_permutations"] == 10
+    assert config["comparator"]["n_jobs"] == 2
     assert config["seed"] == 99
 
 
@@ -1757,12 +1787,14 @@ def test_create_many_config_builds_unified_config():
         strategy="profile",
         metric="co",
         n_permutations=5,
+        n_jobs=3,
         seed=11,
     )
 
     assert config["strategy"] == "profile"
     assert config["comparator"]["metric"] == "co"
     assert config["comparator"]["n_permutations"] == 5
+    assert config["comparator"]["n_jobs"] == 3
     assert config["targets"] == ["target_a.pfm", "target_b.pfm"]
     assert config["seed"] == 11
 
