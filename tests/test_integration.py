@@ -373,6 +373,34 @@ def test_profile_comparison_accepts_dice_metric(examples_dir, temp_dir):
     assert "score" in output
 
 
+def test_profile_comparison_accepts_dice_rowwise_metric(examples_dir, temp_dir):
+    """Profile CLI should expose the window-averaged rowwise Dice metric."""
+    cmd = [
+        "mimosa",
+        "profile",
+        str(examples_dir / "scores_1.fasta"),
+        str(examples_dir / "scores_2.fasta"),
+        "--model1-type",
+        "scores",
+        "--model2-type",
+        "scores",
+        "--metric",
+        "dice_rowwise",
+        "--window-radius",
+        "4",
+    ]
+
+    result = run_cli(cmd)
+    assert result.returncode == 0, f"Command failed with stderr: {result.stderr}"
+
+    import json
+
+    output = json.loads(result.stdout)
+    assert output["metric"] == "dice_rowwise"
+    assert "score" in output
+    assert "n_sites" in output
+
+
 def test_profile_comparison_accepts_cosine_metric(examples_dir, temp_dir):
     """Profile CLI should expose the window-averaged cosine metric."""
     cmd = [

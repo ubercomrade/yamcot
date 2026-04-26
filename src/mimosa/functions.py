@@ -715,8 +715,13 @@ def calc_dice(scores1: np.ndarray, scores2: np.ndarray, eps: float = float(PROFI
 
 
 @njit(cache=False, nogil=True, fastmath=True)
-def _rowwise_co_numba(values_x: np.ndarray, values_y: np.ndarray, eps: float) -> np.ndarray:
-    """Compute one CO value per row without temporary arrays."""
+def _rowwise_overlap_similarity_numba(
+    values_x: np.ndarray,
+    values_y: np.ndarray,
+    eps: float,
+    use_dice_denominator: bool,
+) -> np.ndarray:
+    """Compute one overlap-based similarity value per row without temporary arrays."""
     n_rows = values_x.shape[0]
     n_cols = values_x.shape[1]
     out = np.empty(n_rows, dtype=np.float32)
@@ -733,8 +738,12 @@ def _rowwise_co_numba(values_x: np.ndarray, values_y: np.ndarray, eps: float) ->
             sum_y += value_y
             intersection += value_x if value_x < value_y else value_y
 
-        denom = min(sum_x, sum_y)
-        out[row_index] = intersection / denom if denom > eps else np.nan
+        if use_dice_denominator:
+            denom = sum_x + sum_y
+            out[row_index] = (2.0 * intersection) / denom if denom > eps else np.nan
+        else:
+            denom = min(sum_x, sum_y)
+            out[row_index] = intersection / denom if denom > eps else np.nan
 
     return out
 
@@ -742,7 +751,13 @@ def _rowwise_co_numba(values_x: np.ndarray, values_y: np.ndarray, eps: float) ->
 def rowwise_co(x: np.ndarray, y: np.ndarray, eps: float = float(PROFILE_EPS)) -> np.ndarray:
     """Compute one CO value per selected window."""
     values_x, values_y = _window_float32_pair(x, y)
-    return _rowwise_co_numba(values_x, values_y, float(eps))
+    return _rowwise_overlap_similarity_numba(values_x, values_y, float(eps), False)
+
+
+def rowwise_dice(x: np.ndarray, y: np.ndarray, eps: float = float(PROFILE_EPS)) -> np.ndarray:
+    """Compute one Dice value per selected window."""
+    values_x, values_y = _window_float32_pair(x, y)
+    return _rowwise_overlap_similarity_numba(values_x, values_y, float(eps), True)
 
 
 @njit(cache=False, nogil=True, fastmath=True)

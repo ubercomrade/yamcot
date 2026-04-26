@@ -28,6 +28,7 @@ from mimosa.functions import (
     prepare_profile_bundle,
     rowwise_co,
     rowwise_cosine,
+    rowwise_dice,
     scores_to_empirical_log_tail_bundle,
 )
 from mimosa.models import (
@@ -46,9 +47,9 @@ from mimosa.validation import (
 )
 
 logger = logging.getLogger(__name__)
-SUPPORTED_PROFILE_METRICS = ("co", "co_rowwise", "dice", "cosine")
+SUPPORTED_PROFILE_METRICS = ("co", "co_rowwise", "dice", "dice_rowwise", "cosine")
 SUPPORTED_MOTIF_METRICS = ("pcc", "ed", "cosine")
-MetricName = Literal["co", "co_rowwise", "dice", "pcc", "ed", "cosine"]
+MetricName = Literal["co", "co_rowwise", "dice", "dice_rowwise", "pcc", "ed", "cosine"]
 _ALL_METRICS = frozenset((*SUPPORTED_PROFILE_METRICS, *SUPPORTED_MOTIF_METRICS))
 
 
@@ -569,6 +570,8 @@ def _score_window_collection(metric: str, windows1: np.ndarray, windows2: np.nda
         return _mean_finite_row_scores(rowwise_co(windows1, windows2))
     if metric == "dice":
         return calc_dice(windows1, windows2)
+    if metric == "dice_rowwise":
+        return _mean_finite_row_scores(rowwise_dice(windows1, windows2))
     if metric != "cosine":
         options = ", ".join(repr(metric_name) for metric_name in SUPPORTED_PROFILE_METRICS)
         raise ValueError(f"metric must be one of: {options}")
