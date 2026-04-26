@@ -9,6 +9,8 @@ import numpy as np
 
 from mimosa.batches import SequenceBatch, make_sequence_batch
 from mimosa.comparison import (
+    SUPPORTED_MOTIF_METRICS,
+    SUPPORTED_PROFILE_METRICS,
     ComparatorConfig,
     compare,
     create_comparator_config,
@@ -34,8 +36,8 @@ _DEFAULT_METRICS = {
 }
 
 _ALLOWED_METRICS = {
-    "profile": {"co", "dice", "cosine"},
-    "motif": {"pcc", "ed", "cosine"},
+    "profile": frozenset(SUPPORTED_PROFILE_METRICS),
+    "motif": frozenset(SUPPORTED_MOTIF_METRICS),
 }
 
 

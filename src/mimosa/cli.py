@@ -6,7 +6,7 @@ from typing import Any, Dict
 
 from mimosa.api import create_config, run_comparison
 from mimosa.cache import clear_cache
-from mimosa.comparison import create_comparator_config
+from mimosa.comparison import SUPPORTED_MOTIF_METRICS, SUPPORTED_PROFILE_METRICS, create_comparator_config
 from mimosa.validation import validate_file_exists
 
 PROFILE_MODEL_TYPES = ["scores", "pwm", "bamm", "sitega", "dimont", "slim"]
@@ -176,9 +176,12 @@ def _add_profile_parser(subparsers: argparse._SubParsersAction) -> None:
     profile_group = parser.add_argument_group("Profile Comparison Options")
     profile_group.add_argument(
         "--metric",
-        choices=["co", "dice", "cosine"],
+        choices=list(SUPPORTED_PROFILE_METRICS),
         default="co",
-        help="Window-based profile similarity metric. Choices: co, dice, cosine. (default: %(default)s)",
+        help=(
+            "Window-based profile similarity metric. "
+            f"Choices: {', '.join(SUPPORTED_PROFILE_METRICS)}. (default: %(default)s)"
+        ),
     )
     profile_group.add_argument(
         "--permutations",
@@ -262,9 +265,12 @@ def _add_motif_parser(subparsers: argparse._SubParsersAction) -> None:
     motif_group = parser.add_argument_group("Motif Comparison Options")
     motif_group.add_argument(
         "--metric",
-        choices=["pcc", "ed", "cosine"],
+        choices=list(SUPPORTED_MOTIF_METRICS),
         default="pcc",
-        help="Column-wise comparison metric. Choices: pcc, ed, cosine. (default: %(default)s)",
+        help=(
+            "Column-wise comparison metric. "
+            f"Choices: {', '.join(SUPPORTED_MOTIF_METRICS)}. (default: %(default)s)"
+        ),
     )
     motif_group.add_argument(
         "--permutations",

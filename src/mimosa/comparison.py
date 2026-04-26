@@ -26,6 +26,7 @@ from mimosa.functions import (
     calc_co,
     calc_dice,
     prepare_profile_bundle,
+    rowwise_co,
     rowwise_cosine,
     scores_to_empirical_log_tail_bundle,
 )
@@ -45,8 +46,10 @@ from mimosa.validation import (
 )
 
 logger = logging.getLogger(__name__)
-MetricName = Literal["co", "dice", "pcc", "ed", "cosine"]
-_ALL_METRICS = {"co", "dice", "pcc", "ed", "cosine"}
+SUPPORTED_PROFILE_METRICS = ("co", "co_rowwise", "dice", "cosine")
+SUPPORTED_MOTIF_METRICS = ("pcc", "ed", "cosine")
+MetricName = Literal["co", "co_rowwise", "dice", "pcc", "ed", "cosine"]
+_ALL_METRICS = frozenset((*SUPPORTED_PROFILE_METRICS, *SUPPORTED_MOTIF_METRICS))
 
 
 class ComparatorConfig(TypedDict):
@@ -562,12 +565,18 @@ def _score_window_collection(metric: str, windows1: np.ndarray, windows2: np.nda
         return 0.0
     if metric == "co":
         return calc_co(windows1, windows2)
+    if metric == "co_rowwise":
+        return _mean_finite_row_scores(rowwise_co(windows1, windows2))
     if metric == "dice":
         return calc_dice(windows1, windows2)
     if metric != "cosine":
-        raise ValueError("metric must be one of: 'co', 'dice', 'cosine'")
+        options = ", ".join(repr(metric_name) for metric_name in SUPPORTED_PROFILE_METRICS)
+        raise ValueError(f"metric must be one of: {options}")
+    return _mean_finite_row_scores(rowwise_cosine(windows1, windows2))
 
-    values = rowwise_cosine(windows1, windows2)
+
+def _mean_finite_row_scores(values: np.ndarray) -> float:
+    """Average finite row-wise window scores and treat all-masked inputs as zero."""
     finite = values[np.isfinite(values)]
     if finite.size == 0:
         return 0.0
@@ -1105,7 +1114,7 @@ def strategy_motif(model1: GenericModel, model2: GenericModel, sequences, cfg: C
 
 @_register_comparison_strategy("profile")
 def strategy_profile(model1: GenericModel, model2: GenericModel, sequences, cfg: ComparatorConfig) -> ComparisonResult:
-    """Window-based profile comparison strategy (CO/Dice/Cosine similarity)."""
+    """Window-based profile comparison strategy (CO/rowwise-CO/Dice/Cosine similarity)."""
     runtime_cache = {}
     background_sequences = _get_profile_background_sequences(sequences, cfg)
     bundle1 = _prepare_profile_model(model1, sequences, background_sequences, cfg, runtime_cache)

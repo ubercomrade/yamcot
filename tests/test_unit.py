@@ -61,6 +61,7 @@ from mimosa.functions import (
     pfm_to_pwm,
     precision_recall_curve,
     roc_curve,
+    rowwise_co,
     rowwise_cosine,
     score_seq,
     scores_to_empirical_log_tail,
@@ -1236,6 +1237,20 @@ def test_rowwise_cosine_is_averaged_per_window():
     assert score_window_collection("cosine", windows_1, windows_2) == pytest.approx(0.5)
 
 
+def test_rowwise_co_is_averaged_per_window():
+    """Profile rowwise CO should be the mean of per-window CO values."""
+    windows_1 = np.array([[1.0, 0.0], [1.0, 1.0], [0.0, 0.0]], dtype=np.float32)
+    windows_2 = np.array([[1.0, 0.0], [2.0, 0.0], [1.0, 0.0]], dtype=np.float32)
+    score_window_collection = strategy_profile.__globals__["_score_window_collection"]
+
+    np.testing.assert_allclose(
+        rowwise_co(windows_1, windows_2),
+        np.array([1.0, 0.5, np.nan], dtype=np.float32),
+        equal_nan=True,
+    )
+    assert score_window_collection("co_rowwise", windows_1, windows_2) == pytest.approx(0.75)
+
+
 def test_overlap_profile_metrics_match_reference_formulas():
     """CO and Dice should use the weighted overlap formulas."""
     windows_1 = np.array([[1.0, 3.0], [2.0, 0.0]], dtype=np.float32)
@@ -2074,7 +2089,7 @@ def test_strategy_profile_zero_min_logfpr_uses_best_anchor_mode():
     assert zero["n_sites"] == omitted["n_sites"] == 1
 
 
-@pytest.mark.parametrize("metric", ["co", "dice", "cosine"])
+@pytest.mark.parametrize("metric", ["co", "co_rowwise", "dice", "cosine"])
 def test_strategy_profile_handles_all_positions_masked_by_threshold(metric):
     """Threshold site selection should not crash when no sites survive the cutoff."""
     scores_1 = _score_batch_from_flat(np.array([0.1, 0.2, 0.3], dtype=np.float32), np.array([0, 3], dtype=np.int64))
@@ -2122,6 +2137,26 @@ def test_run_comparison_supports_cosine_for_profile():
     result = run_comparison(config)
 
     assert result["metric"] == "cosine"
+    assert 0.0 <= result["score"] <= 1.0
+
+
+def test_run_comparison_supports_co_rowwise_for_profile():
+    """Unified API should expose the window-averaged rowwise CO profile metric."""
+    model1 = _make_scores_model("s1", [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0]])
+    model2 = _make_scores_model("s2", [[0.0, 1.0, 0.0], [2.0, 0.0, 0.0]])
+
+    config = create_config(
+        model1=model1,
+        model2=model2,
+        strategy="profile",
+        metric="co_rowwise",
+        n_permutations=0,
+        seed=7,
+        window_radius=1,
+    )
+    result = run_comparison(config)
+
+    assert result["metric"] == "co_rowwise"
     assert 0.0 <= result["score"] <= 1.0
 
 

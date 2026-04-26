@@ -403,6 +403,34 @@ def test_profile_comparison_accepts_cosine_metric(examples_dir, temp_dir):
     assert "n_sites" in output
 
 
+def test_profile_comparison_accepts_co_rowwise_metric(examples_dir, temp_dir):
+    """Profile CLI should expose the window-averaged rowwise CO metric."""
+    cmd = [
+        "mimosa",
+        "profile",
+        str(examples_dir / "scores_1.fasta"),
+        str(examples_dir / "scores_2.fasta"),
+        "--model1-type",
+        "scores",
+        "--model2-type",
+        "scores",
+        "--metric",
+        "co_rowwise",
+        "--window-radius",
+        "4",
+    ]
+
+    result = run_cli(cmd)
+    assert result.returncode == 0, f"Command failed with stderr: {result.stderr}"
+
+    import json
+
+    output = json.loads(result.stdout)
+    assert output["metric"] == "co_rowwise"
+    assert "score" in output
+    assert "n_sites" in output
+
+
 def test_profile_comparison_rejects_removed_l1sim_metric(examples_dir, temp_dir):
     """Profile CLI should reject removed metrics before running a comparison."""
     cmd = [
