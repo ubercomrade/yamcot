@@ -47,7 +47,8 @@ This makes scores from different model families more comparable.
 The workflow then selects anchor sites from the first model: either one best-scoring site per sequence, or all sites
 above `--min-logfpr`. For each anchor, MIMOSA extracts a site-centered window, evaluates compatible windows from the
 second model across the requested shift range and strand orientations, scores the aligned windows, and reports the
-best orientation and offset. The four orientation labels are `++`, `+-`, `-+`, and `--`.
+best orientation and offset. The offset is `target_start - query_start` in the oriented alignment, so positive values
+mean the target starts to the right of the query. The four orientation labels are `++`, `+-`, `-+`, and `--`.
 
 ### Motif Matrix/Tensor Comparison
 
@@ -288,6 +289,7 @@ If `--permutations` is greater than `0`, the result may also include:
 - `null_std`
 
 `orientation` is one of `++`, `+-`, `-+`, `--`.
+`offset` is `target_start - query_start` in the selected oriented alignment for both `profile` and `motif` modes.
 
 ## `profile` Mode
 

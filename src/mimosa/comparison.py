@@ -741,7 +741,7 @@ def _build_profile_result(query_name: str, target_name: str, best: dict, metric:
         "query": query_name,
         "target": target_name,
         "score": float(best["score"]),
-        "offset": -int(best["shift"]),
+        "offset": int(best["shift"]),
         "orientation": best["orientation"],
         "metric": metric,
         "n_sites": int(best["n_sites"]),

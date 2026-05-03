@@ -112,6 +112,25 @@ def _make_scores_model(name: str, rows: list[list[float]] | list[np.ndarray]) ->
     return GenericModel(type_key="scores", name=name, representation=None, length=0, config={"scores_data": batch})
 
 
+def _make_shifted_core_pwm_model(
+    name: str,
+    core_offset: int,
+    core: tuple[int, ...] = (0, 1, 2),
+    motif_length: int = 7,
+) -> GenericModel:
+    """Build one PWM with an informative core placed at a requested matrix offset."""
+    pfm = np.full((4, motif_length), 0.25, dtype=np.float32)
+    for column_delta, base_index in enumerate(core):
+        column_index = core_offset + column_delta
+        pfm[:, column_index] = 0.001
+        pfm[base_index, column_index] = 0.997
+        pfm[:, column_index] /= pfm[:, column_index].sum()
+
+    pwm = pfm_to_pwm(pfm)
+    representation = np.concatenate((pwm, np.min(pwm, axis=0, keepdims=True)), axis=0).astype(np.float32)
+    return GenericModel("pwm", name, representation, motif_length, {"kmer": 1, "_source_pfm": pfm})
+
+
 def _xml_numeric_value_reference(elem: ET.Element | None) -> float | None:
     """Extract the last numeric scalar from a Jstacs XML element."""
     if elem is None:
@@ -1319,9 +1338,7 @@ def test_overlap_profile_metrics_match_reference_formulas():
     intersection = np.minimum(windows_1, windows_2).sum()
 
     assert calc_co(windows_1, windows_2) == pytest.approx(intersection / min(windows_1.sum(), windows_2.sum()))
-    assert calc_dice(windows_1, windows_2) == pytest.approx(
-        (2.0 * intersection) / (windows_1.sum() + windows_2.sum())
-    )
+    assert calc_dice(windows_1, windows_2) == pytest.approx((2.0 * intersection) / (windows_1.sum() + windows_2.sum()))
 
 
 @pytest.mark.parametrize(("metric", "expected"), [("co", 0.5), ("dice", 0.5)])
@@ -1430,8 +1447,8 @@ def test_strategy_functions_exist():
     assert callable(strategy_profile)
 
 
-def test_strategy_profile_uses_target_relative_offset_convention():
-    """Profile strategy should keep the external target-relative offset convention."""
+def test_strategy_profile_uses_motif_offset_convention_for_score_tracks():
+    """Profile strategy should report target position minus query position."""
     model1 = _make_scores_model("s1", [[0.0, 0.0, 9.0, 0.0, 0.0, 0.0]])
     model2 = _make_scores_model("s2", [[0.0, 0.0, 0.0, 0.0, 9.0, 0.0]])
     cfg = create_comparator_config(metric="co", search_range=4, window_radius=0, min_logfpr=0.1, n_permutations=0)
@@ -1443,10 +1460,73 @@ def test_strategy_profile_uses_target_relative_offset_convention():
     assert reverse["orientation"] == "++"
     assert forward["score"] == pytest.approx(1.0)
     assert reverse["score"] == pytest.approx(1.0)
-    assert forward["offset"] == -2
-    assert reverse["offset"] == 2
+    assert forward["offset"] == 2
+    assert reverse["offset"] == -2
     assert forward["n_sites"] == 1
     assert reverse["n_sites"] == 1
+
+
+def test_strategy_profile_offset_matches_motif_for_shifted_pwm_core():
+    """Profile and motif strategies should use the same offset sign and value."""
+    query = _make_shifted_core_pwm_model("query", core_offset=1)
+    target = _make_shifted_core_pwm_model("target", core_offset=3)
+    sequences = []
+    embedded_site = _encode_sequence("ACG")
+    for _ in range(64):
+        sequence = np.full(60, _DNA_TO_INT["T"], dtype=np.int8)
+        sequence[25 : 25 + embedded_site.size] = embedded_site
+        sequences.append(sequence)
+    sequence_batch = make_sequence_batch(sequences)
+    motif_cfg = create_comparator_config(metric="cosine", n_permutations=0, pfm_mode=False)
+    profile_cfg = create_comparator_config(
+        metric="co",
+        n_permutations=0,
+        search_range=5,
+        window_radius=0,
+        realign_window=0,
+    )
+
+    motif_result = strategy_motif(query, target, sequence_batch, motif_cfg)
+    profile_result = strategy_profile(query, target, sequence_batch, profile_cfg)
+    motif_reverse = strategy_motif(target, query, sequence_batch, motif_cfg)
+    profile_reverse = strategy_profile(target, query, sequence_batch, profile_cfg)
+
+    assert motif_result["orientation"] == profile_result["orientation"] == "++"
+    assert motif_result["offset"] == profile_result["offset"] == -2
+    assert profile_result["score"] == pytest.approx(1.0)
+    assert motif_reverse["orientation"] == profile_reverse["orientation"] == "++"
+    assert motif_reverse["offset"] == profile_reverse["offset"] == 2
+    assert profile_reverse["score"] == pytest.approx(1.0)
+
+
+def test_strategy_profile_offset_matches_motif_for_reverse_complement_pwm_core():
+    """Offset convention should also match for reverse-complement motif orientation."""
+    core = (0, 1, 2, 3, 1, 0)
+    target_core = tuple(int(base) for base in _reverse_complement_encoded(np.asarray(core, dtype=np.int8)))
+    query = _make_shifted_core_pwm_model("query", core_offset=2, core=core, motif_length=12)
+    target = _make_shifted_core_pwm_model("target", core_offset=3, core=target_core, motif_length=12)
+    sequences = []
+    embedded_site = np.asarray(core, dtype=np.int8)
+    for _ in range(64):
+        sequence = np.full(100, _DNA_TO_INT["A"], dtype=np.int8)
+        sequence[45 : 45 + embedded_site.size] = embedded_site
+        sequences.append(sequence)
+    sequence_batch = make_sequence_batch(sequences)
+    motif_cfg = create_comparator_config(metric="cosine", n_permutations=0, pfm_mode=False)
+    profile_cfg = create_comparator_config(
+        metric="co",
+        n_permutations=0,
+        search_range=8,
+        window_radius=5,
+        realign_window=0,
+    )
+
+    motif_result = strategy_motif(query, target, sequence_batch, motif_cfg)
+    profile_result = strategy_profile(query, target, sequence_batch, profile_cfg)
+
+    assert motif_result["orientation"] == profile_result["orientation"] == "+-"
+    assert motif_result["offset"] == profile_result["offset"] == -1
+    assert profile_result["score"] == pytest.approx(1.0)
 
 
 def test_strategy_profile_empirical_uses_combined_strand_table():
