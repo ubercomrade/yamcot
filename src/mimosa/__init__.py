@@ -14,6 +14,7 @@ from mimosa.cache import clear_cache
 from mimosa.comparison import ComparatorConfig, compare, create_comparator_config
 from mimosa.models import (
     GenericModel,
+    StrandMode,
     get_frequencies,
     get_pfm,
     get_scores,
@@ -28,6 +29,7 @@ __all__ = [
     "ComparisonConfig",
     "OneToManyConfig",
     "GenericModel",
+    "StrandMode",
     "clear_cache",
     "compare",
     "compare_motifs",

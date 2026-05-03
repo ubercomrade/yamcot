@@ -862,6 +862,7 @@ def test_scan_model_strands_returns_strand_bundle():
     )
 
     strand_bundle = scan_model_strands(model, sequences)
+    both_scores = scan_model(model, sequences, "both")
     plus_scores = scan_model(model, sequences, "+")
     minus_scores = scan_model(model, sequences, "-")
 
@@ -869,6 +870,8 @@ def test_scan_model_strands_returns_strand_bundle():
     np.testing.assert_array_equal(strand_bundle["lengths"], plus_scores["lengths"])
     np.testing.assert_allclose(strand_bundle["values"][PLUS_STRAND], plus_scores["values"])
     np.testing.assert_allclose(strand_bundle["values"][MINUS_STRAND], minus_scores["values"])
+    np.testing.assert_allclose(both_scores["values"], strand_bundle["values"])
+    np.testing.assert_array_equal(both_scores["lengths"], strand_bundle["lengths"])
 
 
 def test_get_frequencies():
@@ -913,6 +916,38 @@ def test_calculate_threshold_table_does_not_mutate_model_config():
     assert table.shape[1] == 2
     assert "_threshold_table" not in model.config
     assert "_threshold_tables" not in model.config
+
+
+def test_calculate_threshold_table_both_uses_combined_strand_sample():
+    """strand='both' should fit the threshold table on all + and - predictions."""
+    representation = np.array(
+        [
+            [2.0, 0.0],
+            [0.0, 2.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    model = GenericModel(
+        type_key="pwm",
+        name="threshold_pwm",
+        representation=representation,
+        length=2,
+        config={"kmer": 1},
+    )
+    sequences = make_sequence_batch([_encode_sequence("AC"), _encode_sequence("AT"), _encode_sequence("TG")])
+
+    plus_scores = scan_model(model, sequences, "+")
+    minus_scores = scan_model(model, sequences, "-")
+    expected = build_score_log_tail_table(
+        np.concatenate((flatten_valid(plus_scores), flatten_valid(minus_scores)))
+    ).astype(np.float64)
+
+    table = calculate_threshold_table(model, sequences)
+
+    np.testing.assert_allclose(table, expected)
 
 
 def test_get_pfm_reconstructs_pwm_from_sites_with_single_pseudocount():
@@ -1037,11 +1072,21 @@ def test_get_sites_threshold_uses_current_sequences_by_default():
         [_encode_sequence("AC"), _encode_sequence("AT"), _encode_sequence("TG"), _encode_sequence("TG")]
     )
 
-    default_sites = get_sites(model, sequences, mode="threshold", fpr_threshold=0.5)
-    background_sites = get_sites(model, sequences, mode="threshold", fpr_threshold=0.5, background_sequences=background)
+    best_sites = get_sites(model, sequences, mode="threshold", fpr_threshold=0.5, strand="best")
+    both_sites = get_sites(model, sequences, mode="threshold", fpr_threshold=0.5)
+    background_sites = get_sites(
+        model,
+        sequences,
+        mode="threshold",
+        fpr_threshold=0.5,
+        strand="best",
+        background_sequences=background,
+    )
 
-    assert default_sites["site"].tolist() == ["AC", "AC"]
-    assert background_sites["site"].tolist() == ["AC", "AC", "AT", "AT"]
+    assert best_sites["site"].tolist() == ["AC", "AC"]
+    assert both_sites["site"].tolist() == ["AC", "AC", "AT", "AT"]
+    assert both_sites["strand"].tolist() == ["+", "+", "+", "-"]
+    assert background_sites["site"].tolist() == ["AC", "AC", "AT"]
 
 
 def test_get_pfm_threshold_accepts_external_background_sequences():
@@ -1070,18 +1115,19 @@ def test_get_pfm_threshold_accepts_external_background_sequences():
         [_encode_sequence("AC"), _encode_sequence("AT"), _encode_sequence("TG"), _encode_sequence("TG")]
     )
 
-    default_pfm = get_pfm(model, sequences, mode="threshold", fpr_threshold=0.5, pseudocount=0.25)
+    default_pfm = get_pfm(model, sequences, mode="threshold", fpr_threshold=0.5, strand="best", pseudocount=0.25)
     background_pfm = get_pfm(
         model,
         sequences,
         mode="threshold",
         fpr_threshold=0.5,
+        strand="best",
         background_sequences=background,
         pseudocount=0.25,
     )
 
     expected_default_pcm = np.array([[2.0, 0.0], [0.0, 2.0], [0.0, 0.0], [0.0, 0.0]], dtype=np.float32)
-    expected_background_pcm = np.array([[4.0, 0.0], [0.0, 2.0], [0.0, 0.0], [0.0, 2.0]], dtype=np.float32)
+    expected_background_pcm = np.array([[3.0, 0.0], [0.0, 2.0], [0.0, 0.0], [0.0, 1.0]], dtype=np.float32)
 
     np.testing.assert_allclose(default_pfm, pcm_to_pfm(expected_default_pcm, pseudocount=0.25).astype(np.float32))
     np.testing.assert_allclose(background_pfm, pcm_to_pfm(expected_background_pcm, pseudocount=0.25).astype(np.float32))

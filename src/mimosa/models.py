@@ -15,6 +15,8 @@ from mimosa.batches import (
     MINUS_STRAND,
     PLUS_STRAND,
     SCORE_PADDING,
+    flatten_profile_bundle,
+    flatten_valid,
     make_strand_bundle,
     pack_batch,
     profile_row_values,
@@ -28,6 +30,7 @@ from mimosa.functions import (
     pcm_to_pfm,
     pfm_to_pwm,
     scores_to_empirical_log_tail,
+    scores_to_empirical_log_tail_bundle,
 )
 from mimosa.io import (
     parse_file_content,
@@ -43,10 +46,11 @@ from mimosa.io import (
 )
 from mimosa.validation import validate_site_mode
 
-StrandMode = Literal["best", "+", "-"]
+StrandMode = Literal["best", "+", "-", "both"]
 _SEQ_DECODER = np.array(["A", "C", "G", "T", "N"], dtype="U1")
 _RC_TABLE = np.array([3, 2, 1, 0, 4], dtype=np.int8)
 _NUCLEOTIDE_CARDINALITY = 4
+_STRAND_MODES = frozenset(("best", "+", "-", "both"))
 
 
 @dataclass(eq=False)
@@ -102,10 +106,21 @@ def _get_model_handler(key: str) -> dict:
         raise ValueError(f"Model strategy '{key}' not found. Available: {available}") from exc
 
 
+def _resolve_strand_mode(strand: Optional[StrandMode], default: StrandMode = "best") -> StrandMode:
+    """Normalize and validate one public strand mode."""
+    normalized = str(strand or default).lower()
+    if normalized not in _STRAND_MODES:
+        available = ", ".join(sorted(_STRAND_MODES))
+        raise ValueError(f"strand must be one of: {available}")
+    return normalized  # type: ignore[return-value]
+
+
 def scan_model(model: GenericModel, sequences=None, strand: Optional[StrandMode] = None):
     """Universal scanning function that dispatches to the appropriate handler."""
     handler = _get_model_handler(model.type_key)
-    strand_mode = strand or model.config.get("strand_mode", "best")
+    strand_mode = _resolve_strand_mode(strand, model.config.get("strand_mode", "best"))
+    if strand_mode == "both":
+        return scan_model_strands(model, sequences)
     return handler["scan"](model, sequences, strand_mode)
 
 
@@ -146,20 +161,30 @@ def _score_bounds_from_representation(representation: np.ndarray) -> tuple[float
     return minimum, maximum
 
 
-def calculate_threshold_table(model: GenericModel, sequences, strand: StrandMode = "best") -> np.ndarray:
+def calculate_threshold_table(model: GenericModel, sequences, strand: StrandMode = "both") -> np.ndarray:
     """Calculate a score-to-log-tail lookup table on explicitly provided sequences."""
-    scores = scan_model(model, sequences, strand=strand)
-    return build_score_log_tail_table(scores["values"][scores["mask"]]).astype(np.float64, copy=False)
+    scores = scan_model(model, sequences, strand=_resolve_strand_mode(strand))
+    return build_score_log_tail_table(_flatten_scan_scores(scores)).astype(np.float64, copy=False)
 
 
 def get_frequencies(model: GenericModel, sequences, strand: Optional[StrandMode] = None):
     """Calculate per-position empirical log-tail values."""
-    return scores_to_empirical_log_tail(scan_model(model, sequences, strand))
+    scores = scan_model(model, sequences, strand)
+    if "mask" in scores:
+        return scores_to_empirical_log_tail(scores)
+    return scores_to_empirical_log_tail_bundle(scores)
 
 
 def get_scores(model: GenericModel, sequences, strand: Optional[StrandMode] = None):
     """Calculate motif scores for each position."""
     return scan_model(model, sequences, strand)
+
+
+def _flatten_scan_scores(scores) -> np.ndarray:
+    """Flatten either a masked score batch or a strand-aware profile bundle."""
+    if "mask" in scores:
+        return flatten_valid(scores)
+    return flatten_profile_bundle(scores)
 
 
 def _empty_hit_arrays() -> dict[str, np.ndarray]:
@@ -172,31 +197,65 @@ def _empty_hit_arrays() -> dict[str, np.ndarray]:
     }
 
 
-def _collect_best_hits(sequences, score_bundle) -> dict[str, np.ndarray]:
+def _strand_indices_for_hit_mode(strand: StrandMode) -> tuple[int, ...]:
+    """Return strand indices considered by one hit-collection request."""
+    if strand == "+":
+        return (PLUS_STRAND,)
+    if strand == "-":
+        return (MINUS_STRAND,)
+    return (PLUS_STRAND, MINUS_STRAND)
+
+
+def _empty_score_batch_like(score_batch):
+    """Return an empty score batch with the same shape and row lengths."""
+    score_values = np.asarray(score_batch["values"])
+    values = np.full(score_values.shape, SCORE_PADDING, dtype=score_values.dtype)
+    mask = np.zeros(np.asarray(score_batch["mask"]).shape, dtype=bool)
+    return pack_batch(values, mask, score_batch["lengths"], SCORE_PADDING)
+
+
+def _scan_bundle_for_strand(model: GenericModel, sequences, strand: StrandMode):
+    """Scan the minimum required strand set and expose it as a two-strand bundle."""
+    if strand in {"best", "both"}:
+        return scan_model_strands(model, sequences)
+
+    scores = scan_model(model, sequences, strand=strand)
+    empty_scores = _empty_score_batch_like(scores)
+    if strand == "+":
+        return make_strand_bundle(scores, empty_scores)
+    return make_strand_bundle(empty_scores, scores)
+
+
+def _collect_best_hits(score_bundle, strand: StrandMode) -> dict[str, np.ndarray]:
     """Collect the single best hit per sequence as numeric arrays."""
     seq_indices: list[int] = []
     starts: list[int] = []
     strand_indices: list[int] = []
     scores: list[float] = []
+    candidate_strands = _strand_indices_for_hit_mode(strand)
 
-    for seq_idx in range(len(sequences["lengths"])):
-        s_fwd = profile_row_values(score_bundle, PLUS_STRAND, seq_idx)
-        s_rev = profile_row_values(score_bundle, MINUS_STRAND, seq_idx)
-        f_max = s_fwd.max() if s_fwd.size > 0 else -np.inf
-        r_max = s_rev.max() if s_rev.size > 0 else -np.inf
+    for seq_idx in range(len(score_bundle["lengths"])):
+        best_score = -np.inf
+        best_start = -1
+        best_strand = PLUS_STRAND
 
-        if not np.isfinite(f_max) and not np.isfinite(r_max):
+        for strand_idx in candidate_strands:
+            strand_scores = profile_row_values(score_bundle, strand_idx, seq_idx)
+            if strand_scores.size == 0:
+                continue
+            strand_start = int(np.argmax(strand_scores))
+            strand_score = float(strand_scores[strand_start])
+            if strand_score > best_score:
+                best_score = strand_score
+                best_start = strand_start
+                best_strand = int(strand_idx)
+
+        if best_start < 0 or not np.isfinite(best_score):
             continue
-
         seq_indices.append(seq_idx)
-        if f_max >= r_max:
-            starts.append(int(np.argmax(s_fwd)))
-            strand_indices.append(0)
-            scores.append(float(f_max))
-        else:
-            starts.append(int(np.argmax(s_rev)))
-            strand_indices.append(1)
-            scores.append(float(r_max))
+        starts.append(best_start)
+        strand_indices.append(best_strand)
+        scores.append(best_score)
 
     if not seq_indices:
         return _empty_hit_arrays()
@@ -209,30 +268,25 @@ def _collect_best_hits(sequences, score_bundle) -> dict[str, np.ndarray]:
     }
 
 
-def _collect_threshold_hits(score_bundle, score_threshold: float) -> dict[str, np.ndarray]:
-    """Collect all hits above threshold as numeric arrays."""
+def _collect_threshold_hits_for_strands(
+    score_bundle, score_threshold: float, strand_indices: tuple[int, ...]
+) -> dict[str, np.ndarray]:
+    """Collect all strand-specific hits above threshold as numeric arrays."""
     seq_indices_parts = []
     start_parts = []
     strand_parts = []
     score_parts = []
 
     for seq_idx in range(len(score_bundle["lengths"])):
-        s_fwd = profile_row_values(score_bundle, PLUS_STRAND, seq_idx)
-        s_rev = profile_row_values(score_bundle, MINUS_STRAND, seq_idx)
-
-        f_pos = np.flatnonzero(s_fwd >= score_threshold)
-        if f_pos.size > 0:
-            seq_indices_parts.append(np.full(f_pos.size, seq_idx, dtype=np.int64))
-            start_parts.append(f_pos.astype(np.int64, copy=False))
-            strand_parts.append(np.full(f_pos.size, PLUS_STRAND, dtype=np.int8))
-            score_parts.append(s_fwd[f_pos].astype(np.float32, copy=False))
-
-        r_pos = np.flatnonzero(s_rev >= score_threshold)
-        if r_pos.size > 0:
-            seq_indices_parts.append(np.full(r_pos.size, seq_idx, dtype=np.int64))
-            start_parts.append(r_pos.astype(np.int64, copy=False))
-            strand_parts.append(np.full(r_pos.size, MINUS_STRAND, dtype=np.int8))
-            score_parts.append(s_rev[r_pos].astype(np.float32, copy=False))
+        for strand_idx in strand_indices:
+            strand_scores = profile_row_values(score_bundle, strand_idx, seq_idx)
+            strand_positions = np.flatnonzero(strand_scores >= score_threshold)
+            if strand_positions.size == 0:
+                continue
+            seq_indices_parts.append(np.full(strand_positions.size, seq_idx, dtype=np.int64))
+            start_parts.append(strand_positions.astype(np.int64, copy=False))
+            strand_parts.append(np.full(strand_positions.size, strand_idx, dtype=np.int8))
+            score_parts.append(strand_scores[strand_positions].astype(np.float32, copy=False))
 
     if not seq_indices_parts:
         return _empty_hit_arrays()
@@ -245,12 +299,60 @@ def _collect_threshold_hits(score_bundle, score_threshold: float) -> dict[str, n
     }
 
 
-def _collect_hits(model: GenericModel, sequences, mode: str, score_threshold: Optional[float]) -> dict[str, np.ndarray]:
+def _collect_best_strand_threshold_hits(score_bundle, score_threshold: float) -> dict[str, np.ndarray]:
+    """Collect above-threshold hits after collapsing both strands by per-position maximum."""
+    seq_indices_parts = []
+    start_parts = []
+    strand_parts = []
+    score_parts = []
+
+    for seq_idx in range(len(score_bundle["lengths"])):
+        plus_scores = profile_row_values(score_bundle, PLUS_STRAND, seq_idx)
+        minus_scores = profile_row_values(score_bundle, MINUS_STRAND, seq_idx)
+        if plus_scores.size == 0:
+            continue
+
+        best_scores = np.maximum(plus_scores, minus_scores)
+        positions = np.flatnonzero(best_scores >= score_threshold)
+        if positions.size == 0:
+            continue
+
+        seq_indices_parts.append(np.full(positions.size, seq_idx, dtype=np.int64))
+        start_parts.append(positions.astype(np.int64, copy=False))
+        strand_parts.append(
+            np.where(plus_scores[positions] >= minus_scores[positions], PLUS_STRAND, MINUS_STRAND).astype(
+                np.int8,
+                copy=False,
+            )
+        )
+        score_parts.append(best_scores[positions].astype(np.float32, copy=False))
+
+    if not seq_indices_parts:
+        return _empty_hit_arrays()
+
+    return {
+        "seq_index": np.concatenate(seq_indices_parts),
+        "start": np.concatenate(start_parts),
+        "strand_idx": np.concatenate(strand_parts),
+        "score": np.concatenate(score_parts),
+    }
+
+
+def _collect_threshold_hits(score_bundle, score_threshold: float, strand: StrandMode) -> dict[str, np.ndarray]:
+    """Collect threshold hits using the requested strand semantics."""
+    if strand == "best":
+        return _collect_best_strand_threshold_hits(score_bundle, score_threshold)
+    return _collect_threshold_hits_for_strands(score_bundle, score_threshold, _strand_indices_for_hit_mode(strand))
+
+
+def _collect_hits(
+    model: GenericModel, sequences, mode: str, score_threshold: Optional[float], strand: StrandMode
+) -> dict[str, np.ndarray]:
     """Collect motif hits as numeric arrays."""
-    score_bundle = scan_model_strands(model, sequences)
+    score_bundle = _scan_bundle_for_strand(model, sequences, strand)
     if mode == "best":
-        return _collect_best_hits(sequences, score_bundle)
-    return _collect_threshold_hits(score_bundle, float(score_threshold))
+        return _collect_best_hits(score_bundle, strand)
+    return _collect_threshold_hits(score_bundle, float(score_threshold), strand)
 
 
 def _scores_to_log_tail_array(scores: np.ndarray, threshold_table: np.ndarray) -> np.ndarray:
@@ -265,18 +367,21 @@ def _scores_to_log_tail_array(scores: np.ndarray, threshold_table: np.ndarray) -
     return log_tail_col[idx]
 
 
-def _resolve_hit_threshold_table(model: GenericModel, sequences, background_sequences, threshold_table) -> np.ndarray:
+def _resolve_hit_threshold_table(
+    model: GenericModel, sequences, background_sequences, threshold_table, strand: StrandMode
+) -> np.ndarray:
     """Resolve the explicit log-tail table used for hit extraction and annotation."""
     if threshold_table is not None:
         return np.asarray(threshold_table, dtype=np.float64)
 
     calibration_sequences = background_sequences if background_sequences is not None else sequences
-    return calculate_threshold_table(model, calibration_sequences, strand="best")
+    return calculate_threshold_table(model, calibration_sequences, strand=strand)
 
 
 def _resolve_hits(model: GenericModel, sequences, selection: dict, *, include_threshold_table: bool) -> dict:
     """Resolve hit arrays and optional threshold metadata for one request."""
     mode = validate_site_mode(selection.get("mode", "best"), selection.get("fpr_threshold"))
+    strand = _resolve_strand_mode(selection.get("strand"), "both")
     threshold_table = None
     score_threshold = None
 
@@ -286,6 +391,7 @@ def _resolve_hits(model: GenericModel, sequences, selection: dict, *, include_th
             sequences,
             selection.get("background_sequences"),
             selection.get("threshold_table"),
+            strand,
         )
 
     if mode == "threshold":
@@ -294,11 +400,12 @@ def _resolve_hits(model: GenericModel, sequences, selection: dict, *, include_th
             "FPR threshold: %s -> score threshold: %.4f", selection["fpr_threshold"], score_threshold
         )
 
-    hit_arrays = _sort_hit_arrays(_collect_hits(model, sequences, mode, score_threshold))
+    hit_arrays = _sort_hit_arrays(_collect_hits(model, sequences, mode, score_threshold, strand))
     return {
         "hit_arrays": hit_arrays,
         "threshold_table": threshold_table,
         "score_threshold": score_threshold,
+        "strand": strand,
     }
 
 
@@ -347,7 +454,14 @@ def _sort_hit_arrays(hit_arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]
     """Sort hits by sequence index ascending and score descending."""
     if hit_arrays["score"].size == 0:
         return hit_arrays
-    order = np.lexsort((-hit_arrays["score"], hit_arrays["seq_index"]))
+    order = np.lexsort(
+        (
+            hit_arrays["strand_idx"],
+            hit_arrays["start"],
+            -hit_arrays["score"],
+            hit_arrays["seq_index"],
+        )
+    )
     return {key: values[order] for key, values in hit_arrays.items()}
 
 
@@ -429,6 +543,7 @@ def get_sites(
     sequences,
     mode: str = "best",
     fpr_threshold: Optional[float] = None,
+    strand: StrandMode = "both",
     background_sequences=None,
     threshold_table: Optional[np.ndarray] = None,
 ) -> pd.DataFrame:
@@ -439,6 +554,7 @@ def get_sites(
         {
             "mode": mode,
             "fpr_threshold": fpr_threshold,
+            "strand": strand,
             "background_sequences": background_sequences,
             "threshold_table": threshold_table,
         },
@@ -454,6 +570,7 @@ def get_pfm(
     sequences,
     mode: str = "best",
     fpr_threshold: Optional[float] = None,
+    strand: StrandMode = "both",
     background_sequences=None,
     threshold_table: Optional[np.ndarray] = None,
     top_fraction: Optional[float] = None,
@@ -468,6 +585,7 @@ def get_pfm(
         {
             "mode": mode,
             "fpr_threshold": fpr_threshold,
+            "strand": strand,
             "background_sequences": background_sequences,
             "threshold_table": threshold_table,
         },
@@ -493,6 +611,9 @@ def _scan_with_batch_kernel(model: GenericModel, sequences, strand: StrandMode, 
         values = np.full(sf["values"].shape, SCORE_PADDING, dtype=np.float32)
         values[sf["mask"]] = np.maximum(sf["values"][sf["mask"]], sr["values"][sr["mask"]])
         return pack_batch(values, sf["mask"], sf["lengths"], SCORE_PADDING)
+    if strand == "both":
+        sf, sr = batch_all_scores_strands(sequences, representation, kmer=kmer, with_context=with_context)
+        return make_strand_bundle(sf, sr)
     raise ValueError(f"Invalid strand mode: {strand}")
 
 
@@ -658,7 +779,10 @@ def _load_slim(path: str, _kwargs: dict) -> GenericModel:
 
 
 def _scan_scores(model: GenericModel, _sequences=None, _strand: StrandMode = "best"):
-    return model.config["scores_data"]
+    scores = model.config["scores_data"]
+    if _resolve_strand_mode(_strand) == "both":
+        return make_strand_bundle(scores, scores)
+    return scores
 
 
 def _scan_scores_both(model: GenericModel, _sequences=None):

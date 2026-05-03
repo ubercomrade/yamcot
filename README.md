@@ -443,9 +443,15 @@ Model and scanning helpers:
 - `get_pfm(...)`
 - `register_model_handler(...)`
 
+Strand-aware scanning and site helpers accept `strand="best"`, `"+"`, `"-"`, or `"both"`.
+`"best"` collapses the two strands by taking the best score per position, while `"both"` keeps `+` and `-`
+predictions as separate observations for threshold calibration and site extraction. Threshold-table calibration and
+site/PFM reconstruction use `"both"` by default.
+
 Types and utility exports:
 
 - `GenericModel`
+- `StrandMode`
 - `ComparisonConfig`
 - `OneToManyConfig`
 - `ComparatorConfig`
@@ -496,8 +502,8 @@ from mimosa.io import read_fasta
 model = read_model("examples/pif4.meme", "pwm")
 sequences = read_fasta("examples/foreground.fa")
 
-sites = get_sites(model, sequences, mode="best")
-pfm = get_pfm(model, sequences, mode="best", top_fraction=0.05)
+sites = get_sites(model, sequences, mode="best", strand="both")
+pfm = get_pfm(model, sequences, mode="best", strand="both", top_fraction=0.05)
 ```
 
 ## Extension Hooks
